@@ -89,11 +89,16 @@ if MODULES_AVAILABLE['model_manager']:
 # ===== MODULE 6: Generation =====
 if MODULES_AVAILABLE['generation']:
     from src.core.generation import (
-        generation_step,
-        generation_loop,
+        prepare_generation_context,
+        check_interrupt,
+        clear_context,
+        encode_all_batches,
+        upscale_all_batches,
+        decode_all_batches,
         load_text_embeddings,
         calculate_optimal_batch_params,
-        prepare_video_transforms
+        prepare_video_transforms,
+        cut_videos
     )
 
 # ===== MODULE 7: Video Transforms =====
@@ -133,8 +138,9 @@ __all__ = [
     
     # Core Model & Generation & Infer
     'configure_runner', 'load_quantized_state_dict', 'configure_dit_model_inference', 'configure_vae_model_inference',
-    'generation_step', 'generation_loop', 'load_text_embeddings', 'calculate_optimal_batch_params',
-    'prepare_video_transforms', 'VideoDiffusionInfer',
+    'prepare_generation_context', 'check_interrupt', 'clear_context', 'encode_all_batches', 'upscale_all_batches',
+    'decode_all_batches', 'load_text_embeddings', 'calculate_optimal_batch_params', 'prepare_video_transforms',
+    'cut_videos', 'VideoDiffusionInfer',
     
     # ComfyUI Interface
     'SeedVR2', 'NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'format_execution_results',

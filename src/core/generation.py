@@ -1,18 +1,21 @@
 """
 Generation Logic Module for SeedVR2
 
-This module handles the main generation pipeline including:
-- Single generation steps with adaptive dtype handling
-- Complete generation loop with temporal awareness
-- Context-aware batch processing with overlapping
-- Video preprocessing and post-processing
-- Optimized memory management during generation
+This module implements a three-phase batch processing pipeline for video upscaling:
+- Phase 1: Batch VAE encoding of all input frames
+- Phase 2: Batch DiT upscaling of all encoded latents
+- Phase 3: Batch VAE decoding of all upscaled latents
+
+This architecture minimizes model swapping overhead by completing each phase
+for all batches before moving to the next phase, significantly improving
+performance especially when using model offloading.
 
 Key Features:
+- Three-phase pipeline (encode-all → upscale-all → decode-all) for efficiency
 - Native FP8 pipeline support for 2x speedup and 50% VRAM reduction
-- Context-aware generation with temporal overlap for smooth transitions
+- Temporal overlap support for smooth transitions between batches
 - Adaptive dtype detection and optimal autocast configuration
-- Intelligent batch processing with memory optimization
+- Memory-efficient pre-allocated batch processing
 - Advanced video format handling (4n+1 constraint)
 """
 
@@ -24,9 +27,16 @@ from src.common.distributed import get_device
 
 
 # Import required modules
-from src.optimization.memory_manager import clear_memory, release_text_embeddings, manage_model_device
+from src.core.model_manager import configure_runner
+from src.optimization.memory_manager import (
+    clear_memory, 
+    release_text_embeddings, 
+    manage_model_device, 
+    complete_cleanup
+)
 from src.optimization.performance import (
-    optimized_video_rearrange, optimized_single_video_rearrange, 
+    optimized_video_rearrange, 
+    optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
 from src.common.seed import set_seed
@@ -157,111 +167,6 @@ def calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap):
     }
 
 
-def generation_step(runner, text_embeds_dict, preserve_vram, cond_latents, temporal_overlap, debug,
-                   compute_dtype, autocast_dtype):
-    """
-    Execute a single generation step with adaptive dtype handling
-    
-    Args:
-        runner: VideoDiffusionInfer instance
-        text_embeds_dict (dict): Text embeddings for positive and negative prompts
-        preserve_vram (bool): Whether to enable VRAM optimization
-        cond_latents (list): Conditional latents for generation
-        temporal_overlap (int): Number of frames for temporal overlap
-        
-    Returns:
-        tuple: (samples, last_latents) for potential temporal continuation
-        
-    Features:
-        - Adaptive dtype detection (FP8/FP16/BFloat16)
-        - Optimal autocast configuration for each model type
-        - Memory-efficient noise generation and reuse
-        - Automatic device placement with dtype preservation
-        - Advanced inference optimization
-    """
-    # Check if debug instance is available
-    if debug is None:
-        raise ValueError("Debug instance must be provided to generation_step")
-
-    device = get_device()
-    dtype = compute_dtype
-
-    def _move_to_cuda(x):
-        """Move tensors to CUDA with adaptive optimal dtype"""
-        return [i.to(device, dtype=dtype) for i in x]
-    
-    # Memory optimization: Generate noise once and reuse to save VRAM
-    if torch.mps.is_available():
-        base_noise = torch.randn_like(cond_latents[0], dtype=dtype)
-        noises = [base_noise]
-        aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
-    else:
-        with torch.cuda.device(device):
-            base_noise = torch.randn_like(cond_latents[0], dtype=dtype)
-            noises = [base_noise]
-            aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
-    
-    # Move tensors with adaptive dtype (optimized for FP8/FP16/BFloat16)
-    noises, aug_noises, cond_latents = _move_to_cuda(noises), _move_to_cuda(aug_noises), _move_to_cuda(cond_latents)
-    
-    cond_noise_scale = 0.0
-
-    def _add_noise(x, aug_noise):
-        # Early return if no noise is being added
-        if cond_noise_scale == 0.0:
-            return x
-            
-        # Use adaptive optimal dtype
-        t = (
-            torch.tensor([1000.0], device=device, dtype=dtype)
-            * cond_noise_scale
-        )
-        shape = torch.tensor(x.shape[1:], device=device)[None]
-        t = runner.timestep_transform(t, shape)
-        x = runner.schedule.forward(x, aug_noise, t)
-        
-        # Explicit cleanup of intermediate tensors
-        del t, shape
-        
-        return x
-
-    # Generate conditions with memory optimization
-    condition = runner.get_condition(
-        noises[0],
-        task="sr",
-        latent_blur=_add_noise(cond_latents[0], aug_noises[0]),
-    )
-    conditions = [condition]
-    
-    # Check if BlockSwap is active
-    use_blockswap = hasattr(runner, "_blockswap_active") and runner._blockswap_active
-
-    # Use adaptive autocast for optimal performance
-    with torch.no_grad():
-        with torch.autocast(str(get_device()), autocast_dtype, enabled=True):
-            video_tensors = runner.inference(
-                noises=noises,
-                conditions=conditions,
-                preserve_vram=preserve_vram,  # Memory offload optimization
-                temporal_overlap=temporal_overlap,
-                use_blockswap=use_blockswap,
-                **text_embeds_dict,
-            )
-    
-    # Process samples with advanced optimization
-    samples = optimized_video_rearrange(video_tensors)
-    
-    # Clean up temporary tensors
-    del noises[0], noises
-    del aug_noises[0], aug_noises  
-    del cond_latents[0], cond_latents
-    del conditions[0], conditions
-    del condition
-    del video_tensors
-    
-    return samples #, last_latents
-
-
 def cut_videos(videos):
     """
     Correct video cutting respecting the constraint: frames % 4 == 1
@@ -292,368 +197,693 @@ def cut_videos(videos):
     return result
 
 
-def generation_loop(runner, images, cfg_scale=1.0, seed=666, res_w=720, batch_size=90, 
-                   preserve_vram=False, temporal_overlap=0, debug=None, 
-                   progress_callback=None):
+def check_interrupt(ctx):
+    """Single interrupt check to avoid redundant imports"""
+    if ctx['comfyui_available']:
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+
+def prepare_generation_context(device, debug=None):
     """
-    Main generation loop with context-aware temporal processing
+    Create a generation context for shared state.
+    Precision will be lazily initialized when first needed.
     
     Args:
-        runner: VideoDiffusionInfer instance
-        images (torch.Tensor): Input images for upscaling
-        cfg_scale (float): Classifier-free guidance scale
-        seed (int): Random seed for reproducibility
-        res_w (int): Target resolution width
-        batch_size (int): Batch size for processing
-        preserve_vram (str/bool): VRAM preservation mode
-        temporal_overlap (int): Frames for temporal continuity
-        debug (bool): Debug mode
-        progress_callback (callable): Optional callback for progress reporting
-        
-    Returns:
-        torch.Tensor: Generated video frames
-        
-    Features:
-        - Context-aware generation with temporal overlap
-        - Adaptive dtype pipeline (FP8/FP16/BFloat16)
-        - Memory-optimized batch processing
-        - Advanced video transformation pipeline
-        - Intelligent VRAM management throughout process
-        - Real-time progress reporting
+        device: Device string (required, e.g., "cuda:0", "cpu")
+        debug: Debug instance for logging
     """
-    # Check if debug instance is available
-    if debug is None:
-        raise ValueError("Debug instance must be provided to generation_loop")
+    if device is None:
+        raise ValueError("Device must be provided to prepare_generation_context")
     
-    device = get_device() if (torch.cuda.is_available() or torch.mps.is_available()) else "cpu"
+    try:
+        import comfy.model_management
+        comfyui_available = True
+    except:
+        comfyui_available = False
+    
+    ctx = {
+        'device': device,
+        'compute_dtype': None,
+        'autocast_dtype': None,
+        'video_transform': None,
+        'text_embeds': None,
+        'all_transformed_videos': [],
+        'all_latents': [],
+        'all_upscaled_latents': [],
+        'batch_samples': [],
+        'final_video': None,
+        'comfyui_available': comfyui_available,
+    }
+    
+    if debug:
+        debug.log("Initialized generation context", category="setup")
+    
+    return ctx
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Step 1: Generation Setup - Precision & Parameters Configuration
-    # ────────────────────────────────────────────────────────────────────────────────
-    debug.log(f"", category="none")
-    debug.log("━━━━━━━━━ Step 1: Generation Setup ━━━━━━━━━", category="none")
-    debug.start_timer("generation_setup")
-    debug.log("Configuring generation parameters and precision settings...", category="setup")
 
-    # Adaptive model dtype detection for maximum performance
-    dit_dtype = None
-    vae_dtype = None
+def _ensure_precision_initialized(ctx, runner, debug=None):
+    """Lazily initialize precision settings if not already done"""
+    if ctx.get('compute_dtype') is not None:
+        return  # Already initialized
+    
     try:
         # Get real dtype of loaded models
         dit_dtype = next(runner.dit.parameters()).dtype
         vae_dtype = next(runner.vae.parameters()).dtype
-        
+
         # Use BFloat16 for all models
         # - FP8 models: BFloat16 required for arithmetic operations
         # - FP16 models: BFloat16 provides better numerical stability and prevents black frames
         # - BFloat16 models: Already optimal
         if dit_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            compute_dtype = torch.bfloat16
-            autocast_dtype = torch.bfloat16
+            ctx['compute_dtype'] = torch.bfloat16
+            ctx['autocast_dtype'] = torch.bfloat16
         elif dit_dtype == torch.float16:
-            compute_dtype = torch.bfloat16
-            autocast_dtype = torch.bfloat16
-        else:  # BFloat16 or others
-            compute_dtype = torch.bfloat16
-            autocast_dtype = torch.bfloat16
-        debug.log(f"Model precision: DiT={dit_dtype}, VAE={vae_dtype}, compute={compute_dtype}, autocast={autocast_dtype}", category="precision")
-            
+            ctx['compute_dtype'] = torch.bfloat16
+            ctx['autocast_dtype'] = torch.bfloat16
+        else:
+            ctx['compute_dtype'] = torch.bfloat16
+            ctx['autocast_dtype'] = torch.bfloat16
+        
+        if debug:
+            debug.log(f"Initialized precision: DiT={dit_dtype}, VAE={vae_dtype}, compute={ctx['compute_dtype']}, autocast={ctx['autocast_dtype']}", category="precision")
     except Exception as e:
-        debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
-        dit_dtype = torch.bfloat16
-        vae_dtype = torch.bfloat16
-        compute_dtype = torch.bfloat16
-        autocast_dtype = torch.bfloat16
+        # Fallback to safe defaults
+        ctx['compute_dtype'] = torch.bfloat16
+        ctx['autocast_dtype'] = torch.bfloat16
+        
+        if debug:
+            debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
 
-    # Configure classifier-free guidance
-    runner.config.diffusion.cfg.scale = cfg_scale
-    runner.config.diffusion.cfg.rescale = 0.0
-    # Configure sampling steps
-    runner.config.diffusion.timesteps.sampling.steps = 1
-    runner.configure_diffusion(dtype=compute_dtype)
-    # Set random seed
-    set_seed(seed)
-    # Video transformation pipeline configuration
-    debug.log(f"Target resolution: {res_w}px width", category="info")
 
-    # Advanced video transformation pipeline
-    video_transform = prepare_video_transforms(res_w)
-
-    # Initialize generation state
-    batch_samples = []
+def setup_device_environment(device=None, debug=None):
+    """
+    Setup device environment variables before model loading.
+    This must be called before configure_runner.
     
-    # Load text embeddings
-    debug.log(f"Loading text embeddings to {str(device).upper()}", category="general")
-    debug.start_timer("text_embeddings_load")
-    text_embeds = load_text_embeddings(script_directory, device, compute_dtype)
-    debug.end_timer("text_embeddings_load", "Text embeddings loading")
+    Args:
+        device: Device string (e.g., "cuda:0", "none")
+        debug: Debug instance for logging
+        
+    Returns:
+        str: Processed device string
+    """
+    if device is None:
+        device = get_device() if (torch.cuda.is_available() or torch.mps.is_available()) else "cpu"
     
-    # Calculate batch parameters
+    # Set LOCAL_RANK for distributed compatibility
+    if device != "none" and ":" in device:
+        os.environ["LOCAL_RANK"] = device.split(":")[1]
+    else:
+        os.environ["LOCAL_RANK"] = "0"
+    
+    if debug:
+        debug.log(f"Device environment configured: {device}, LOCAL_RANK={os.environ['LOCAL_RANK']}", category="setup")
+    
+    return device
+
+
+def prepare_runner(model_name, model_dir, preserve_vram, debug, 
+                   cache_model=False, block_swap_config=None,
+                   vae_tiling_enabled=False, vae_tile_size=(512, 512), 
+                   vae_tile_overlap=(64, 64), cached_runner=None):
+    """
+    Prepare runner with model state management.
+    Handles model changes and caching logic.
+    
+    Args:
+        model_name: Name of the model to load
+        model_dir: Directory containing models  
+        preserve_vram: Whether to preserve VRAM
+        debug: Debug instance
+        cache_model: Whether to cache model between runs
+        block_swap_config: BlockSwap configuration
+        vae_tiling_enabled: Enable VAE tiling
+        vae_tile_size: VAE tile dimensions
+        vae_tile_overlap: VAE tile overlap
+        cached_runner: Existing runner instance if caching
+        
+    Returns:
+        tuple: (runner, model_changed) - runner instance and whether model changed
+    """    
+    model_changed = False
+    
+    # Check for model change if we have a cached runner
+    if cached_runner is not None:
+        current_model = getattr(cached_runner, '_model_name', None)
+        if current_model != model_name:
+            model_changed = True
+            debug.log(f"Model changed from {current_model} to {model_name}, clearing cache...", category="cache")
+            complete_cleanup(runner=cached_runner, debug=debug, keep_models_in_ram=False)
+            cached_runner = None
+    
+    # Configure runner
+    debug.log("Configuring inference runner...", category="runner")
+    runner = configure_runner(
+        model_name, model_dir, preserve_vram, debug,
+        cache_model=cache_model,
+        block_swap_config=block_swap_config,
+        vae_tiling_enabled=vae_tiling_enabled,
+        vae_tile_size=vae_tile_size,
+        vae_tile_overlap=vae_tile_overlap,
+        cached_runner=cached_runner if cache_model else None
+    )
+    
+    # Store model name for future comparisons
+    runner._model_name = model_name
+    
+    return runner, model_changed
+
+
+def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vram=False, 
+                      debug=None, progress_callback=None, temporal_overlap=0, res_w=1072):
+    """
+    Phase 1: VAE Encoding for all batches with auto-context management.
+    
+    Encodes video frames to latents in batches, handling temporal overlap and 
+    memory optimization. Creates context automatically if not provided.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with loaded models (required)
+        ctx: Generation context from prepare_generation_context (required)
+        images: Input frames tensor [T, H, W, C] in float16, range [0,1]. 
+                Required if ctx doesn't contain 'input_images'
+        batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
+        preserve_vram: If True, offload VAE between operations
+        debug: Debug instance for logging (required)
+        progress_callback: Optional callback(current, total, frames, phase_name)
+        temporal_overlap: Overlapping frames between batches for continuity
+        res_w: Target resolution for shortest edge
+        
+    Returns:
+        dict: Context containing:
+            - all_transformed_videos: List of (video, original_length) tuples
+            - all_latents: List of encoded latents ready for upscaling
+            - Other state for subsequent phases
+            
+    Raises:
+        ValueError: If required inputs are missing or invalid
+        RuntimeError: If encoding fails
+    """
+    if debug is None:
+        raise ValueError("Debug instance must be provided to encode_all_batches")
+    
+    debug.log("", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 1: VAE encoding ━━━━━━━━", category="none", force=True)
+    debug.start_timer("phase1_encoding")
+
+    # Context must be provided
+    if ctx is None:
+        raise ValueError("Generation context must be provided to encode_all_batches")
+    
+    # Ensure precision is initialized
+    _ensure_precision_initialized(ctx, runner, debug)
+    
+    # Validate and store inputs
+    if images is None and 'input_images' not in ctx:
+        raise ValueError("Either images must be provided or ctx must contain 'input_images'")
+    
+    if images is not None:
+        ctx['input_images'] = images
+    else:
+        images = ctx['input_images']
+    
     total_frames = len(images)
-    batch_params = calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap)
-    step = batch_params['step']
-    temporal_overlap = batch_params['temporal_overlap']
-
-    # Optimization tips for users (only shown for GPU/MPS users)
-    if torch.cuda.is_available() or torch.mps.is_available():
+    if total_frames == 0:
+        raise ValueError("No frames to process")
+    
+    # Setup video transformation pipeline if not already done
+    if ctx.get('video_transform') is None:
+        debug.start_timer("video_transform")
+        ctx['video_transform'] = prepare_video_transforms(res_w)
+        debug.log(f"Initialized video transformation pipeline for {res_w}px", category="setup")
+        debug.end_timer("video_transform", "Video transform pipeline initialization")
+    
+    # Display batch optimization tips
+    if total_frames > 0:
+        batch_params = calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap)
         if batch_params['padding_waste'] > 0:
-            debug.log(f"", category="none", force=True)
-            debug.log(f"Batch processing notice for {total_frames} frames with batch_size={batch_size}:", category="info", force=True)
-            debug.log(f"   Padding waste: {batch_params['padding_waste']} (wasted computation)", category="info", force=True)
+            debug.log("", category="none", force=True)
+            debug.log(f"Padding waste: {batch_params['padding_waste']}", category="info", force=True)
             debug.log(f"   Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True)
             debug.log(f"   Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True)
-            
-        if batch_params['best_batch'] != batch_size:
-            debug.log(f"", category="none", force=True)
-            debug.log(f"TIP: For {total_frames} frames, use batch_size={batch_params['best_batch']} for better efficiency", category="tip", force=True)
-            debug.log(f"", category="none", force=True)
-            debug.log(f"Considerations:", category="info", force=True)
-            debug.log(f"   Smaller batches: More flickering BUT uses less memory", category="info", force=True)
-            debug.log(f"   Larger batches: Better temporal coherence BUT uses more memory", category="info", force=True)
-            debug.log(f"   Padding waste: Increases memory usage and processing time unnecessarily", category="info", force=True)
-            debug.log(f"", category="none")
-
-    debug.end_timer("generation_setup", "Generation setup", show_breakdown=True)
-    debug.log_memory_state("After generation setup", show_tensors=True, detailed_tensors=False)
-
+            debug.log(f"   This increases memory usage and processing time unnecessarily", category="info", force=True)
+        
+        if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
+            debug.log("", category="none", force=True)
+            debug.log(f"For {total_frames} frames, use batch_size={batch_params['best_batch']} for better efficiency", category="tip", force=True)
+            debug.log(f"   Consider larger batches: better temporal coherence BUT uses more memory", category="tip", force=True)
+        
+        if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
+            debug.log("", category="none", force=True)
     
-    # ───────────────────────────────────────────────────────────────
-    # Step 2: Batch Processing
-    # ───────────────────────────────────────────────────────────────
-    debug.log("", category="none")
-    debug.log("━━━━━━━━━ Step 2: Batch Processing ━━━━━━━━━", category="none")
-    debug.start_timer("batch_processing")
+    # Calculate batching parameters
+    step = batch_size - temporal_overlap if temporal_overlap > 0 else batch_size
+    if step <= 0:
+        step = batch_size
+        temporal_overlap = 0
     
-    # Standard processing (non-TileVAE) continues below
+    # Calculate number of batches
+    num_encode_batches = 0
+    for idx in range(0, total_frames, step):
+        end_idx = min(idx + batch_size, total_frames)
+        if idx > 0 and end_idx - idx <= temporal_overlap:
+            break
+        num_encode_batches += 1
     
-    # Calculate total batches for progress reporting
-    total_batches = len(range(0, len(images), step))
+    # Pre-allocate lists for memory efficiency
+    ctx['all_transformed_videos'] = [None] * num_encode_batches
+    ctx['all_latents'] = [None] * num_encode_batches
     
-    # Move images to CPU for memory efficiency
-    #t = time.time()
-    #images = images.to("cpu")
-    #print(f"🔄 Images to CPU time: {time.time() - t} seconds")
+    vae_moved_to_gpu = False
+    encode_idx = 0
     
     try:
-        # Main processing loop with context awareness
-        for batch_count, batch_idx in enumerate(range(0, len(images), step)):
-            # Calculate batch indices with overlap
-            if COMFYUI_AVAILABLE:
-                comfy.model_management.throw_exception_if_processing_interrupted()
-            if batch_idx == 0:
-                # First batch: no overlap
-                start_idx = 0
-                end_idx = min(batch_size, len(images))
-                effective_batch_size = end_idx - start_idx
-                is_first_batch = True
-            else:
-                # Subsequent batches: temporal overlap
-                start_idx = batch_idx 
-                end_idx = min(start_idx + batch_size, len(images))
-                effective_batch_size = end_idx - start_idx
-                is_first_batch = False
-                if effective_batch_size <= temporal_overlap:
-                    break  # Not enough new frames, stop
+        # Move VAE to GPU once for all encoding
+        manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
+                          model_name="VAE", preserve_vram=False, debug=debug)
+        vae_moved_to_gpu = True
+        
+        for batch_idx in range(0, total_frames, step):
+            check_interrupt(ctx)
             
-            batch_number = (batch_idx // step + 1) if step > 0 else 1
+            # Calculate indices with temporal overlap
+            if batch_idx == 0:
+                start_idx = 0
+                end_idx = min(batch_size, total_frames)
+            else:
+                start_idx = batch_idx
+                end_idx = min(start_idx + batch_size, total_frames)
+                if end_idx - start_idx <= temporal_overlap:
+                    break
+            
             current_frames = end_idx - start_idx
-            debug.log("", category="none", force=True) 
-            debug.log(f"━━━ Batch {batch_number}/{total_batches}: frames {start_idx}-{end_idx-1} ━━━", category="none", force=True)
-            debug.log_memory_state(f"Before batch {batch_number} processing", detailed_tensors=False)
+            
+            debug.log(f"Encoding batch {encode_idx+1}/{num_encode_batches}", category="vae", force=True)
+            debug.start_timer(f"encode_batch_{encode_idx+1}")
+            
+            # Process current batch
+            video = images[start_idx:end_idx]
+            video = video.permute(0, 3, 1, 2).to(ctx['device'], dtype=ctx['compute_dtype'])
+            
+            # Apply transformations
+            transformed_video = ctx['video_transform'](video)
 
-            # Use timer context for this batch - all timers within will be namespaced
-            with debug.timer_context(f"batch_{batch_number}"):
-                debug.start_timer("batch")  # This becomes "batch_1_batch" internally
-                
-                # Process current batch
-                video = images[start_idx:end_idx]
-                debug.log(f"Video compute dtype: {compute_dtype}", category="precision")
-                # Use adaptive computation dtype 
-                video = video.permute(0, 3, 1, 2).to(device, dtype=compute_dtype)
-                
-                # Apply video transformations with memory optimization
-                transformed_video = video_transform(video)
-                ori_lengths = [transformed_video.size(1)]
-                
-                # Handle correct format: frames % 4 == 1
-                t = transformed_video.size(1)
-                debug.log(f"Sequence of {t} frames", category="video", force=True)
-                
-                
-                if len(images) >= 5 and t % 4 != 1:
-                    debug.log(f"Video frames before padding: {transformed_video.shape[1]} frames (shape: {transformed_video.shape})", category="video")
-                    debug.log("Applying frame padding to satisfy model constraint (frames % 4 == 1)", category="info")
-                    transformed_video = cut_videos(transformed_video)
-                    debug.log(f"Video frames after padding: {transformed_video.shape[1]} frames (shape: {transformed_video.shape})", category="video")
-                
-                # Context-aware temporal strategy
-                # First batch: standard complete diffusion
+            del video
 
-                # Move VAE to GPU if needed for encoding
-                manage_model_device(model=runner.vae, target_device=str(device), model_name="VAE", preserve_vram=False, debug=debug)
+            ori_length = transformed_video.size(1)
+            
+            # Log sequence info
+            t = transformed_video.size(1)
+            debug.log(f"Sequence of {t} frames", category="video", force=True)
 
-                debug.log("Encoding video to latents...", category="vae")
-                debug.log(f"Original batch shape: {video.shape[1:]} frames @ {images[0].shape[0]}x{images[0].shape[1]}", category="info")
-                debug.log(f"Transformed video shape: {transformed_video.shape}", category="info")
-                del video
-                debug.start_timer("vae_encoding")
-                # VAE will use its configured dtype from model_manager
-                cond_latents = runner.vae_encode([transformed_video])
-                debug.end_timer("vae_encoding", "VAE encoding")
-                
-                # Move VAE back to CPU after encoding if preserve_vram is enabled
-                if preserve_vram:
-                    manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", preserve_vram=preserve_vram, debug=debug)
-                
-                debug.log_memory_state("After VAE encode", show_tensors=False, detailed_tensors=False)
+            # Handle 4n+1 constraint
+            if t % 4 != 1:
+                target = ((t-1)//4+1)*4+1
+                padding_frames = target - t
+                debug.log(f"Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
+                transformed_video = cut_videos(transformed_video)
+            
+            # Store transformed video (by index for pre-allocation)
+            ctx['all_transformed_videos'][encode_idx] = (transformed_video, ori_length)
+            
+            # Encode to latents
+            cond_latents = runner.vae_encode([transformed_video])
+            ctx['all_latents'][encode_idx] = cond_latents[0]  # Store first element
+            
+            del cond_latents
+            
+            debug.end_timer(f"encode_batch_{encode_idx+1}", f"Encoded batch {encode_idx+1}")
+            
+            if progress_callback:
+                progress_callback(encode_idx+1, num_encode_batches, 
+                                current_frames, "Phase 1: Encoding")
+            
+            encode_idx += 1
+            
+    except Exception as e:
+        debug.log(f"Error in Phase 1 (Encoding): {e}", level="ERROR", category="error", force=True)
+        raise
+    finally:
+        # Always move VAE back if needed
+        if vae_moved_to_gpu and preserve_vram:
+            manage_model_device(model=runner.vae, target_device='cpu', 
+                              model_name="VAE", preserve_vram=preserve_vram, debug=debug)
+    
+    debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
+    debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
+    
+    return ctx
 
-                debug.log("Starting inference upscale...", category="generation")
 
-                # Normal generation
-                samples = generation_step(runner, text_embeds, preserve_vram, 
-                                        cond_latents=cond_latents, 
-                                        temporal_overlap=temporal_overlap, 
-                                        debug=debug,
-                                        compute_dtype=compute_dtype,
-                                        autocast_dtype=autocast_dtype)
+def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None, 
+                       progress_callback=None, cfg_scale=1.0, seed=100):
+    """
+    Phase 2: DiT Upscaling for all encoded batches.
+    
+    Processes all encoded latents through the diffusion model for upscaling.
+    Requires context from encode_all_batches with encoded latents.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with loaded models (required)
+        ctx: Context from encode_all_batches containing latents (required)
+        preserve_vram: If True, offload DiT between operations
+        debug: Debug instance for logging (required)
+        progress_callback: Optional callback(current, total, frames, phase_name)
+        cfg_scale: Classifier-free guidance scale (default: 1.0)
+        seed: Random seed for noise generation
+        
+    Returns:
+        dict: Updated context containing:
+            - all_upscaled_latents: List of upscaled latents ready for decoding
+            - Preserved state from encoding phase
+            
+    Raises:
+        ValueError: If context is missing or has no encoded latents
+        RuntimeError: If upscaling fails
+    """
+    if debug is None:
+        raise ValueError("Debug instance must be provided to upscale_all_batches")
+    
+    if ctx is None:
+        raise ValueError("Context is required for upscale_all_batches. Run encode_all_batches first.")
+    
+    # Ensure precision is initialized
+    _ensure_precision_initialized(ctx, runner, debug)
+    
+    # Validate we have encoded latents
+    if 'all_latents' not in ctx or not ctx['all_latents']:
+        raise ValueError("No encoded latents found. Run encode_all_batches first.")
+    
+    debug.log("", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 2: DiT upscaling ━━━━━━━━", category="none", force=True)
+    debug.start_timer("phase2_upscaling")
+    
+    # Load text embeddings if not already loaded
+    if ctx.get('text_embeds') is None:
+        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['device'], ctx['compute_dtype'])
+        debug.log("Loaded text embeddings for DiT", category="dit")
+    
+    # Configure diffusion parameters
+    runner.config.diffusion.cfg.scale = cfg_scale
+    runner.config.diffusion.cfg.rescale = 0.0
+    runner.config.diffusion.timesteps.sampling.steps = 1
+    runner.configure_diffusion(dtype=ctx['compute_dtype'])
+    
+    # Set seed for generation
+    set_seed(seed)
+    
+    cond_noise_scale = 0.0
+    
+    # Count valid latents
+    num_valid_latents = len([l for l in ctx['all_latents'] if l is not None])
 
-                del cond_latents
+    # Safety check for empty latents
+    if num_valid_latents == 0:
+        debug.log("No valid latents to upscale", level="WARNING", category="dit", force=True)
+        ctx['all_upscaled_latents'] = []
+        return ctx
+    
+    # Pre-allocate list for upscaled latents
+    ctx['all_upscaled_latents'] = [None] * num_valid_latents
+    
+    dit_moved_to_gpu = False
+    upscale_idx = 0
+    
+    try:
+        if preserve_vram:
+            manage_model_device(model=runner.dit, target_device=str(ctx['device']), 
+                              model_name="DiT", preserve_vram=False, debug=debug)
+            dit_moved_to_gpu = True
+        
+        for batch_idx, latent in enumerate(ctx['all_latents']):
+            if latent is None:
+                continue
+            
+            check_interrupt(ctx)
+            
+            debug.log(f"Upscaling batch {upscale_idx+1}/{num_valid_latents}", category="generation", force=True)
+            debug.start_timer(f"upscale_batch_{upscale_idx+1}")
+            
+            # Move latent to device with correct dtype
+            latent = latent.to(ctx['device'], dtype=ctx['compute_dtype'])
+            
+            # Generate noise
+            if torch.mps.is_available():
+                base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
+            else:
+                with torch.cuda.device(ctx['device']):
+                    base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
+            
+            noises = [base_noise]
+            aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
+            
+            def _add_noise(x, aug_noise):
+                if cond_noise_scale == 0.0:
+                    return x
+                t = torch.tensor([1000.0], device=ctx['device'], dtype=ctx['compute_dtype']) * cond_noise_scale
+                shape = torch.tensor(x.shape[1:], device=ctx['device'])[None]
+                t = runner.timestep_transform(t, shape)
+                x = runner.schedule.forward(x, aug_noise, t)
+                del t, shape
+                return x
+            
+            # Generate condition
+            condition = runner.get_condition(
+                noises[0],
+                task="sr",
+                latent_blur=_add_noise(latent, aug_noises[0]),
+            )
+            conditions = [condition]
+            
+            # Run inference
+            debug.start_timer(f"dit_inference_{upscale_idx+1}")
+            with torch.no_grad():
+                with torch.autocast(str(ctx['device']), ctx['autocast_dtype'], enabled=True):
+                    upscaled = runner.inference(
+                        noises=noises,
+                        conditions=conditions,
+                        **ctx['text_embeds'],
+                    )
+            debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
+            
+            # Store upscaled result (by index for pre-allocation)
+            ctx['all_upscaled_latents'][upscale_idx] = upscaled[0]
+            
+            # Free original latent
+            ctx['all_latents'][batch_idx] = None
+            
+            del noises, aug_noises, latent, conditions, condition, base_noise, upscaled
+            
+            if preserve_vram and ctx['all_upscaled_latents'][upscale_idx].shape[0] > 1:
+                clear_memory(debug=debug, deep=True, force=True, timer_name="upscale_all_batches")
+            
+            debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
+            
+            if progress_callback:
+                progress_callback(upscale_idx+1, num_valid_latents,
+                                1, "Phase 2: Upscaling")
+            
+            upscale_idx += 1
+            
+    except Exception as e:
+        debug.log(f"Error in Phase 2 (Upscaling): {e}", level="ERROR", category="error", force=True)
+        raise
+    finally:
+        # Always move DiT back if needed
+        if dit_moved_to_gpu and preserve_vram:
+            manage_model_device(model=runner.dit, target_device='cpu', 
+                              model_name="DiT", preserve_vram=preserve_vram, debug=debug)
+    
+    debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
+    debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
+    
+    return ctx
+
+
+def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progress_callback=None):
+    """
+    Phase 3: VAE Decoding and Final Video Assembly.
+    
+    Decodes all upscaled latents back to pixel space and assembles final video.
+    Requires context from upscale_all_batches with upscaled latents.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with loaded models (required)
+        ctx: Context from upscale_all_batches containing upscaled latents (required)
+        preserve_vram: If True, offload VAE between operations
+        debug: Debug instance for logging (required)
+        progress_callback: Optional callback(current, total, frames, phase_name)
+        
+    Returns:
+        dict: Updated context containing:
+            - final_video: Assembled video tensor [T, H, W, C] in float16, range [0,1]
+            - All intermediate storage cleared for memory efficiency
+            
+    Raises:
+        ValueError: If context is missing or has no upscaled latents
+        RuntimeError: If decoding fails
+    """
+    if debug is None:
+        raise ValueError("Debug instance must be provided to decode_all_batches")
+    
+    if ctx is None:
+        raise ValueError("Context is required for decode_all_batches. Run upscale_all_batches first.")
+    
+    # Ensure precision is initialized
+    _ensure_precision_initialized(ctx, runner, debug)
+    
+    # Validate we have upscaled latents
+    if 'all_upscaled_latents' not in ctx or not ctx['all_upscaled_latents']:
+        raise ValueError("No upscaled latents found. Run upscale_all_batches first.")
+    
+    # Validate we have transformed videos for wavelet reconstruction
+    if 'all_transformed_videos' not in ctx or not ctx['all_transformed_videos']:
+        raise ValueError("No transformed videos found for reconstruction. Context corrupted.")
+    
+    debug.log("", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
+    debug.start_timer("phase3_decoding")
+    
+    # Count valid latents
+    num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
+    
+    # Pre-allocate to match transformed videos (which matches original batches)
+    num_batches = len([v for v in ctx['all_transformed_videos'] if v is not None])
+    ctx['batch_samples'] = [None] * num_batches
+    
+    vae_moved_to_gpu = False
+    decode_idx = 0
+    
+    try:
+        manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
+                          model_name="VAE", preserve_vram=False, debug=debug)
+        vae_moved_to_gpu = True
+        
+        for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
+            if upscaled_latent is None:
+                continue
+            
+            check_interrupt(ctx)
+            
+            debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
+            debug.start_timer(f"decode_batch_{decode_idx+1}")
+            
+            # Decode latent
+            debug.start_timer("vae_decode")
+            samples = runner.vae_decode([upscaled_latent], preserve_vram=preserve_vram)
+            debug.end_timer("vae_decode", "VAE decode")
+            
+            # Convert to Float16 for efficiency
+            if samples and len(samples) > 0 and samples[0].dtype != torch.float16:
+                debug.log(f"Converting from {samples[0].dtype} to Float16", category="precision")
+                samples = [sample.to(torch.float16, non_blocking=True) for sample in samples]
+            
+            # Process samples
+            samples = optimized_video_rearrange(samples)
+            
+            # Post-process with wavelet reconstruction
+            for i, sample in enumerate(samples):
+                # Find corresponding transformed video
+                video_idx = min(batch_idx, len(ctx['all_transformed_videos']) - 1)
+                transformed_video, ori_length = ctx['all_transformed_videos'][video_idx]
                 
-                # Post-process samples
-                sample = samples[0]
-                del samples 
-                if ori_lengths[0] < sample.shape[0]:
-                    sample = sample[:ori_lengths[0]]
-                #if temporal_overlap > 0 and not is_first_batch and sample.shape[0] > effective_batch_size - temporal_overlap:
-                #    sample = sample[temporal_overlap:]  # Remove overlap frames from output
+                # Trim if necessary
+                if ori_length < sample.shape[0]:
+                    sample = sample[:ori_length]
                 
-                # Apply color correction if available
-                debug.start_timer("video_to_device")
-                transformed_video = transformed_video.to(device)
-                debug.end_timer("video_to_device", "Transformed video to device")
-                
+                # Apply wavelet reconstruction
+                transformed_video = transformed_video.to(ctx['device'])
                 input_video = [optimized_single_video_rearrange(transformed_video)]
-                del transformed_video
-                #transformed_video = transformed_video.to("cpu")
-                #del transformed_video
                 sample = wavelet_reconstruction(sample, input_video[0][:sample.size(0)], debug)
                 del input_video
-
-                # Convert to final image format
+                ctx['all_transformed_videos'][video_idx] = None
+                del transformed_video
+                
+                # Convert to final format
                 sample = optimized_sample_to_image_format(sample)
                 sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
                 sample_cpu = sample.to(torch.float16).to("cpu")
                 del sample
-                batch_samples.append(sample_cpu)
                 
-                # Aggressive cleanup after each batch
-                # tps = time.time()
-                # Progress callback - batch start
-                if progress_callback:
-                    progress_callback(batch_count+1, total_batches, current_frames, "Processing batch...")
-                #transformed_video = transformed_video.to("cpu")
-                #print(f"🔄 Transformed video to cpu time: {time.time() - tps} seconds")
-                    
-                # Log memory state at the end of each batch
-                debug.end_timer("batch", f"Batch {batch_number} processed", show_breakdown=True)
-                debug.log_memory_state(f"After batch {batch_number} processing", detailed_tensors=False)
-
+                # Store by index for pre-allocation
+                ctx['batch_samples'][decode_idx] = sample_cpu
+            
+            # Free the upscaled latent
+            ctx['all_upscaled_latents'][batch_idx] = None
+            del upscaled_latent, samples
+            
+            debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
+            
+            if progress_callback:
+                progress_callback(decode_idx+1, num_valid_latents,
+                                1, "Phase 3: Decoding")
+            
+            decode_idx += 1
+            
+    except Exception as e:
+        debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
+        raise
     finally:
-        debug.log("", category="none")
-        debug.log(f"━━━ Batch generation cleanup ━━━", category="none")
-        debug.start_timer("generation_cleanup")
+        # Always move VAE back if needed
+        if vae_moved_to_gpu and preserve_vram:
+            manage_model_device(model=runner.vae, target_device='cpu', 
+                              model_name="VAE", preserve_vram=preserve_vram, debug=debug)
         
-        # Clean up text embeddings
-        if 'text_embeds' in locals() and text_embeds is not None:
-            embeddings_to_clean = []
-            names_to_log = []
-            
-            for key, embeds_list in text_embeds.items():
-                if embeds_list:
-                    embeddings_to_clean.extend(embeds_list)
-                    names_to_log.append(key)
-            
-            release_text_embeddings(*embeddings_to_clean, debug=debug, names=names_to_log)
-            del text_embeds
-        
-        # Clean up video transform
-        if 'video_transform' in locals() and video_transform is not None:
-            for transform in video_transform.transforms:
-                if hasattr(transform, '__dict__'):
-                    transform.__dict__.clear()
-            del video_transform
-        
-        debug.end_timer("generation_cleanup", "Batch generation cleanup")
-        debug.log_memory_state("After batch generation cleanup", detailed_tensors=False)
+        # Always clean up intermediate storage
+        if 'all_latents' in ctx:
+            del ctx['all_latents']
+        if 'all_upscaled_latents' in ctx:
+            del ctx['all_upscaled_latents']
+        if 'all_transformed_videos' in ctx:
+            del ctx['all_transformed_videos']
     
-    debug.end_timer("batch_processing", "Batch processing", show_breakdown=True)
-    
-    # ───────────────────────────────────────────────────────────────
-    # Step 3: Final Post-processing & Memory Optimization
-    # ───────────────────────────────────────────────────────────────
     debug.log("", category="none", force=True)
-    debug.log("━━━━━━━━━ Step 3: Final Post-processing ━━━━━━━━━", category="none")
-    debug.start_timer("post_processing")
-    
-    # OPTIMISATION ULTIME : Pré-allocation et copie directe (évite les torch.cat multiples)
-    debug.log(f"Processing {len(batch_samples)} batch_samples with memory-optimized pre-allocation", category="video")
-    
-    # 1. Calculer la taille totale finale
-    total_frames = sum(batch.shape[0] for batch in batch_samples)
-    if len(batch_samples) > 0:
-        sample_shape = batch_samples[0].shape
-        H, W, C = sample_shape[1], sample_shape[2], sample_shape[3]
-        debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info", force=True)
-        
-        # 2. Pré-allouer le tensor final directement sur CPU (évite concatenations)
-        final_video_images = torch.empty((total_frames, H, W, C), dtype=torch.float16)
-        
-        # 3. Merge batch results into final tensor (in groups to manage memory)
-        batch_merge_size = 500  # Number of batch results to merge at once
-        current_idx = 0
+    debug.log("Assembling final video from decoded batches...", category="video")
 
-        for merge_start in range(0, len(batch_samples), batch_merge_size):
-            merge_end = min(merge_start + batch_merge_size, len(batch_samples))
-            merge_group = merge_start // batch_merge_size + 1
-            total_merge_groups = (len(batch_samples) + batch_merge_size - 1) // batch_merge_size
-
-            if total_merge_groups == 1:
-                # All batches fit in one merge operation
-                debug.log(f"Merging all {len(batch_samples)} batch results in single operation", category="video")
-            else:
-                # Multiple merge operations needed
-                batch_start_display = merge_start + 1  # Convert to 1-based for display
-                batch_end_display = min(merge_end, len(batch_samples))  # Ensure we don't go past actual count
-                debug.log(f"Merging batch results {merge_group}/{total_merge_groups}: batches {batch_start_display}-{batch_end_display}", category="video")
-            
-            batch_group = []
-            for i in range(merge_start, merge_end):
-                batch_group.append(batch_samples[i])
-            
-            merged_result = torch.cat(batch_group, dim=0)
-            merged_frames = merged_result.shape[0]
-            final_video_images[current_idx:current_idx + merged_frames] = merged_result
-            current_idx += merged_frames
-            
-            # Clean up merged batch memory
-            del batch_group, merged_result
+    # Merge all batch results into final video
+    if ctx['batch_samples'] and any(s is not None for s in ctx['batch_samples']):
+        valid_samples = [s for s in ctx['batch_samples'] if s is not None]
+        total_frames = sum(batch.shape[0] for batch in valid_samples)
         
-        # Clean up batch_samples list completely
-        for batch in batch_samples:
-            if torch.is_tensor(batch):
-                if batch.is_cuda:
-                    batch.cpu()
-                del batch
-        batch_samples.clear()
-        del batch_samples
+        if total_frames > 0:
+            sample_shape = valid_samples[0].shape
+            H, W, C = sample_shape[1], sample_shape[2], sample_shape[3]
             
-        debug.log(f"Memory pre-allocation completed for output tensor: {final_video_images.shape}", category="success")
-        debug.log("Pre-allocation ensures contiguous memory for final video output", category="info")
+            debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info")
+            
+            # Pre-allocate final tensor
+            ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=torch.float16)
+            
+            # Copy batch results into final tensor
+            current_idx = 0
+            for batch in valid_samples:
+                batch_frames = batch.shape[0]
+                ctx['final_video'][current_idx:current_idx + batch_frames] = batch
+                current_idx += batch_frames
+            
+            final_shape = ctx['final_video'].shape
+            Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
+
+            debug.log(f"Final video assembled: Total frames: {total_frames}, shape per frame: {Hf}x{Wf}x{Cf}", category="video", force=True)
+        else:
+            ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
+            debug.log("No frame to assemble", level="WARNING", category="video", force=True)
     else:
-        debug.log(f"No batch_samples to process", level="WARNING", category="video", force=True)
-        final_video_images = torch.empty((0, 0, 0, 0), dtype=torch.float16)
-                    
-    debug.end_timer("post_processing", "Post-processing", show_breakdown=True)
-    debug.log_memory_state("After post-processing", detailed_tensors=False)
+        ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
+        debug.log("No samples to assemble", level="WARNING", category="video", force=True)
     
-    return final_video_images
+    # Clean up batch samples
+    ctx['batch_samples'].clear()
+    
+    # Clean up video transform
+    if ctx.get('video_transform'):
+        for transform in ctx['video_transform'].transforms:
+            if hasattr(transform, '__dict__'):
+                transform.__dict__.clear()
+        ctx['video_transform'] = None
+    
+    debug.end_timer("phase3_decoding", "Phase 3: VAE decoding complete", show_breakdown=True)
+    debug.log_memory_state("After phase 3 (VAE decoding)", show_tensors=False)
+    
+    return ctx

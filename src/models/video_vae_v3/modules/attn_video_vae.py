@@ -11,7 +11,6 @@
 
 
 from contextlib import nullcontext
-import time
 from typing import Literal, Optional, Tuple, Union
 import diffusers
 import torch

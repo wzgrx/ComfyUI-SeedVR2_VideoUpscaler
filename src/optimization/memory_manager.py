@@ -141,7 +141,8 @@ def get_ram_usage(debug: Optional[Any] = None) -> Tuple[float, float, float, flo
 _os_memory_lib = None
 
 
-def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = True) -> None:
+def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = True, 
+                timer_name: Optional[str] = None) -> None:
     """
     Clear memory caches with two-tier approach for optimal performance.
     
@@ -150,6 +151,7 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
         force: If True, always clear. If False, only clear when <15% free
         deep: If True, perform deep cleanup including GC and OS operations.
               If False (default), only perform minimal GPU cache clearing.
+        timer_name: Optional suffix for timer names to make them unique per invocation
     
     Two-tier approach:
         - Minimal mode (deep=False): GPU cache operations (~1-5ms)
@@ -159,9 +161,23 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
     """
     global _os_memory_lib
     
+    # Create unique timer names if suffix provided
+    if timer_name:
+        main_timer = f"memory_clear_{timer_name}"
+        gpu_timer = f"gpu_cache_clear_{timer_name}"
+        gc_timer = f"garbage_collection_{timer_name}"
+        os_timer = f"os_memory_release_{timer_name}"
+        completion_msg = f"clear_memory() completion ({timer_name})"
+    else:
+        main_timer = "memory_clear"
+        gpu_timer = "gpu_cache_clear"
+        gc_timer = "garbage_collection"
+        os_timer = "os_memory_release"
+        completion_msg = "clear_memory() completion"
+    
     # Start timer for entire operation
     if debug:
-        debug.start_timer("memory_clear")
+        debug.start_timer(main_timer)
 
     # Check if we should clear based on memory pressure
     if not force:
@@ -198,7 +214,7 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
     # ===== MINIMAL OPERATIONS (Always performed) =====
     # Step 1: Clear GPU caches - Fast operations (~1-5ms)
     if debug:
-        debug.start_timer("gpu_cache_clear")
+        debug.start_timer(gpu_timer)
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -207,22 +223,22 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
         torch.mps.empty_cache()
     
     if debug:
-        debug.end_timer("gpu_cache_clear", "GPU cache clearing")
+        debug.end_timer(gpu_timer, "GPU cache clearing")
 
     # ===== DEEP OPERATIONS (Only when deep=True) =====
     if deep:
         # Step 2: Deep garbage collection (expensive ~5-20ms)
         if debug:
-            debug.start_timer("garbage_collection")
+            debug.start_timer(gc_timer)
 
         gc.collect(2)
 
         if debug:
-            debug.end_timer("garbage_collection", "Garbage collection")
+            debug.end_timer(gc_timer, "Garbage collection")
 
         # Step 3: Return memory to OS (platform-specific, ~5-30ms)
         if debug:
-            debug.start_timer("os_memory_release")
+            debug.start_timer(os_timer)
 
         try:
             if sys.platform == 'linux':
@@ -256,11 +272,11 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
                 debug.log(f"Failed to perform OS memory operations: {e}", level="WARNING", category="memory", force=True)
 
         if debug:
-            debug.end_timer("os_memory_release", "OS memory release")
+            debug.end_timer(os_timer, "OS memory release")
     
     # End overall timer
     if debug:
-        debug.end_timer("memory_clear", "clear_memory() completion")
+        debug.end_timer(main_timer, completion_msg)
 
 
 def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
@@ -289,7 +305,7 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
             debug.log(f"Clearing memory and retrying", category="info", force=True)
         
         # Clear memory
-        clear_memory(debug=debug, deep=True, force=True)
+        clear_memory(debug=debug, deep=True, force=True, timer_name=operation_name)
         # Let memory settle
         time.sleep(0.5)
         debug.log_memory_state("After memory clearing", show_tensors=True, detailed_tensors=False)
@@ -767,7 +783,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
                 setattr(runner, component, None)
     
     # 4. Final memory cleanup
-    clear_memory(debug=debug, deep=True, force=True)
+    clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
 
     # 5. Clearing cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None

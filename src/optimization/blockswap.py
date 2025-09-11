@@ -278,7 +278,7 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
                 )
 
             # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=True, force=False)
+            clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_block_forward")
         else:
             output = original_forward(*args, **kwargs)
 
@@ -343,7 +343,7 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
             )
 
         # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=True, force=False)
+        clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_io_forward")
 
         return output
     

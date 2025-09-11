@@ -284,36 +284,62 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     import torch  # local import inside subprocess
-    from src.core.model_manager import configure_runner
-    from src.core.generation import generation_loop
+    from src.core.generation import (
+        setup_device_environment, prepare_generation_context, prepare_runner,
+        encode_all_batches, upscale_all_batches, decode_all_batches
+    )
     
     # Create debug instance for this worker process
     worker_debug = Debug(enabled=shared_args["debug"])
     
+    # Setup device environment
+    device = setup_device_environment(f"cuda:{device_id}", worker_debug)
+
+    # Create generation context with the configured device
+    ctx = prepare_generation_context(device=device, debug=worker_debug)
+
     # Reconstruct frames tensor
     frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
 
     # Prepare runner
     model_dir = shared_args["model_dir"]
     model_name = shared_args["model"]
-    # ensure model weights present (each process checks but very fast if already downloaded)
-    worker_debug.log(f"Configuring runner for device {device_id}", category="setup")
-    runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], worker_debug, block_swap_config=shared_args["block_swap_config"], vae_tiling_enabled=shared_args["vae_tiling_enabled"], vae_tile_size=shared_args["vae_tile_size"], vae_tile_overlap=shared_args["vae_tile_overlap"])
 
-    # Run generation
-    result_tensor = generation_loop(
-        runner=runner,
-        images=frames_tensor,
-        cfg_scale=shared_args["cfg_scale"],
-        seed=shared_args["seed"],
-        res_w=shared_args["res_w"],
-        batch_size=shared_args["batch_size"],
-        preserve_vram=shared_args["preserve_vram"],
-        temporal_overlap=shared_args["temporal_overlap"],
-        debug=worker_debug,
-        block_swap_config=shared_args["block_swap_config"]
-
+    runner, _ = prepare_runner(
+        model_name, model_dir, shared_args["preserve_vram"], worker_debug,
+        block_swap_config=shared_args["block_swap_config"],
+        vae_tiling_enabled=shared_args["vae_tiling_enabled"],
+        vae_tile_size=shared_args["vae_tile_size"],
+        vae_tile_overlap=shared_args["vae_tile_overlap"],
+        cached_runner=None  # No caching in worker processes
     )
+
+    # Phase 1: Encode all batches
+    ctx = encode_all_batches(
+        runner, ctx, frames_tensor,
+        shared_args["batch_size"], 
+        shared_args["preserve_vram"], 
+        worker_debug, None,
+        shared_args["temporal_overlap"],
+        res_w=shared_args["res_w"]
+    )
+    
+    # Phase 2: Upscale all batches
+    ctx = upscale_all_batches(
+        runner, ctx, shared_args["preserve_vram"], 
+        worker_debug, None,
+        cfg_scale=shared_args["cfg_scale"],
+        seed=shared_args["seed"]
+    )
+
+    # Phase 3: Decode all batches
+    ctx = decode_all_batches(
+        runner, ctx, shared_args["preserve_vram"], 
+        worker_debug, None
+    )
+
+    # Get final result
+    result_tensor = ctx['final_video']
 
     # Send back result as numpy array to avoid CUDA transfers
     return_queue.put((proc_idx, result_tensor.cpu().numpy()))

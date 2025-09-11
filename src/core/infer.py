@@ -17,8 +17,6 @@ import torch
 from einops import rearrange
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
-from src.optimization.memory_manager import clear_memory, manage_model_device
-
 from src.common.diffusion import (
     classifier_free_guidance_dispatcher,
     create_sampler_from_config,
@@ -28,9 +26,6 @@ from src.common.diffusion import (
 from src.common.distributed import (
     get_device,
 )
-
-# from common.fs import download
-
 from src.models.dit_v2 import na
 
 
@@ -278,9 +273,6 @@ class VideoDiffusionInfer():
         texts_pos: Union[List[str], List[Tensor], List[Tuple[Tensor]]],
         texts_neg: Union[List[str], List[Tensor], List[Tuple[Tensor]]],
         cfg_scale: Optional[float] = None,
-        preserve_vram: bool = False,
-        temporal_overlap: int = 0,
-        use_blockswap: bool = False,
     ) -> List[Tensor]:
         assert len(noises) == len(conditions) == len(texts_pos) == len(texts_neg)
         batch_size = len(noises)
@@ -317,20 +309,6 @@ class VideoDiffusionInfer():
         latents, latents_shapes = na.flatten(noises)
         latents_cond, _ = na.flatten(conditions)
         
-        if preserve_vram:
-            # Move model to GPU for inference
-            manage_model_device(
-                model=self.dit,
-                target_device=str(get_device()),
-                model_name="DiT",
-                preserve_vram=preserve_vram,
-                debug=self.debug,
-                reason="inference requirement",
-                runner=self
-            )
-
-        self.debug.start_timer("dit_inference")
-        
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
@@ -357,50 +335,15 @@ class VideoDiffusionInfer():
                 rescale=self.config.diffusion.cfg.rescale,
             ),
         )
-        
-        self.debug.end_timer("dit_inference", "DiT inference")
 
         latents = na.unflatten(latents, latents_shapes)
-        
-        if preserve_vram:
-            # Move DiT back to CPU (preserve_vram)
-            manage_model_device(
-                model=self.dit,
-                target_device="cpu",
-                model_name="DiT",
-                preserve_vram=preserve_vram,
-                debug=self.debug,
-                reason="preserve_vram",
-                runner=self
-            )
-            # Move tensors to CPU as well to free VRAM
-            latents_cond = latents_cond.to("cpu")
-            latents_shapes = latents_shapes.to("cpu")
-            # Clear memory for larger batches
-            if latents[0].shape[0] > 1:
-                clear_memory(debug=self.debug, deep=True, force=True)
-        
-        self.debug.log_memory_state("After inference upscale", show_tensors=False, detailed_tensors=False)
 
-        # Move VAE to GPU if needed for decoding
-        manage_model_device(model=self.vae, target_device=str(get_device()), model_name="VAE", preserve_vram=False, debug=self.debug)
-
-        self.debug.log("Decoding latents to samples...", category="vae")
-        self.debug.start_timer("vae_decode")
-        # VAE will use its configured dtype from model_manager
-        samples = self.vae_decode(latents, preserve_vram=preserve_vram)
-        self.debug.end_timer("vae_decode", "VAE decode")
-        self.debug.log(f"Samples shape: {samples[0].shape}", category="vae")
-        
-        # Move VAE back to CPU after decoding if preserve_vram is enabled
-        if preserve_vram:
-            manage_model_device(model=self.vae, target_device='cpu', model_name="VAE", preserve_vram=preserve_vram, debug=self.debug)
-        
-        self.debug.log_memory_state("After VAE decode", show_tensors=False, detailed_tensors=False)
-        
-        # Converting batch Float16 for ComfyUI (faster)
-        if samples and len(samples) > 0 and samples[0].dtype != torch.float16:
-            self.debug.log(f"Converting {len(samples)} samples from {samples[0].dtype} to Float16", category="precision")
-            samples = [sample.to(torch.float16, non_blocking=True) for sample in samples]
-                
-        return samples
+        # Clean up temporary tensors
+        del latents_cond
+        del latents_shapes
+        del text_pos_embeds
+        del text_neg_embeds
+        del text_pos_shapes
+        del text_neg_shapes
+            
+        return latents

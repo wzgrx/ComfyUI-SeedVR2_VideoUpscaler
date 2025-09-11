@@ -16,12 +16,16 @@ from .model_manager import (
 )
 
 from .generation import (
-    generation_step,
-    generation_loop,
+    prepare_generation_context,
+    check_interrupt,
+    clear_context,
+    encode_all_batches,
+    upscale_all_batches,
+    decode_all_batches,
     cut_videos,
     prepare_video_transforms,
     load_text_embeddings,
-    calculate_optimal_batch_params
+    calculate_optimal_batch_params,
 )
 
 from .infer import VideoDiffusionInfer
@@ -33,9 +37,17 @@ __all__ = [
     'configure_dit_model_inference',
     'configure_vae_model_inference',
     
-    # Generation logic
-    'generation_step',
-    'generation_loop', 
+    # Generation logic - context and helpers
+    'prepare_generation_context',
+    'check_interrupt',
+    'clear_context',
+    
+    # Generation logic - granular functions
+    'encode_all_batches',
+    'upscale_all_batches',
+    'decode_all_batches',
+    
+    # Generation utilities
     'cut_videos',
     'prepare_video_transforms',
     'load_text_embeddings',
@@ -43,5 +55,5 @@ __all__ = [
 
     # Infer
     'VideoDiffusionInfer'
-] 
+]
 '''
