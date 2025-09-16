@@ -396,7 +396,3 @@ Special thanks to our community contributors including [benjaminherb](https://gi
 # 📜 License
 
 - The code in this repository is released under the MIT license as found in the [LICENSE file](LICENSE).
-
-```
-
-```
