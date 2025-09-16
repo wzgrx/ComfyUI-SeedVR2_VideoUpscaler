@@ -5,7 +5,7 @@ Central registry for model definitions, repositories, and metadata
 
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from src.utils.constants import SEEDVR2_MODEL_TYPE, is_supported_model_file, get_base_cache_dir
+from .constants import SEEDVR2_MODEL_TYPE, is_supported_model_file, get_base_cache_dir
 
 @dataclass
 class ModelInfo:

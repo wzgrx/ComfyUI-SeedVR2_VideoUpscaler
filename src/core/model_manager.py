@@ -17,7 +17,6 @@ Key Features:
 
 import os
 import torch
-from src.utils.constants import get_script_directory
 from omegaconf import OmegaConf
 
 # Import SafeTensors with fallback
@@ -28,13 +27,13 @@ except ImportError:
     print("⚠️ SafeTensors not available, recommended install: pip install safetensors")
     SAFETENSORS_AVAILABLE = False
 
-from src.optimization.memory_manager import get_basic_vram_info
-from src.optimization.compatibility import FP8CompatibleDiT
-from src.common.config import load_config, create_object
-from src.core.infer import VideoDiffusionInfer
-from src.optimization.blockswap import apply_block_swap_to_dit
-from src.common.distributed import get_device
-from src.optimization.blockswap import cleanup_blockswap
+from ..utils.constants import get_script_directory
+from ..optimization.memory_manager import get_basic_vram_info
+from ..optimization.compatibility import FP8CompatibleDiT
+from ..common.config import load_config, create_object
+from .infer import VideoDiffusionInfer
+from ..optimization.blockswap import apply_block_swap_to_dit, cleanup_blockswap
+from ..common.distributed import get_device
 
 # Get script directory for config paths
 script_directory = get_script_directory()

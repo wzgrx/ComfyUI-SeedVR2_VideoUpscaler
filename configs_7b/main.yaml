@@ -6,9 +6,9 @@ dit:
   model:
     __object__:
       path:
-        - "custom_nodes.ComfyUI-SeedVR2_VideoUpscaler.src.models.dit.nadit"
-        - "ComfyUI.custom_nodes.ComfyUI-SeedVR2_VideoUpscaler.src.models.dit.nadit"
-        - "src.models.dit.nadit"
+        - "custom_nodes.ComfyUI-SeedVR2_VideoUpscaler.src.models.dit_7b.nadit"
+        - "ComfyUI.custom_nodes.ComfyUI-SeedVR2_VideoUpscaler.src.models.dit_7b.nadit"
+        - "src.models.dit_7b.nadit"
       name: "NaDiT"
       args: "as_params"
     vid_in_channels: 33

@@ -18,9 +18,9 @@ import torch
 import weakref
 
 from typing import Dict, Any, List
-from src.optimization.memory_manager import clear_memory
-from src.optimization.compatibility import call_rope_with_stability
-from src.common.distributed import get_device
+from .memory_manager import clear_memory
+from .compatibility import call_rope_with_stability
+from ..common.distributed import get_device
 
 
 def get_module_memory_mb(module: torch.nn.Module) -> float:

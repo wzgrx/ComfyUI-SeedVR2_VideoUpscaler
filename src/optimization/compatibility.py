@@ -44,7 +44,7 @@ class FP8CompatibleDiT(torch.nn.Module):
         # Only convert if not already done (e.g., when reusing cached weights)
         if not skip_conversion and self.is_fp8_model:
             # Only FP8 models need RoPE frequency conversion
-            model_variant = "7B" if self._is_nadit_model() else "3B" if self._is_nadit_v2_model() else "Unknown"
+            model_variant = self._get_model_variant()
             self.debug.log(f"Detected NaDiT {model_variant} FP8 - Converting RoPE freqs for FP8 compatibility", 
                           category="precision")
             self.debug.start_timer("_convert_rope_freqs")
@@ -74,17 +74,15 @@ class FP8CompatibleDiT(torch.nn.Module):
         except:
             return torch.bfloat16
     
-    def _is_nadit_model(self) -> bool:
-        """Detect if this is a NaDiT model (7B) with precise logic"""
-        # Check module path for dit (not dit_v2) 
+    def _get_model_variant(self) -> str:
+        """Detect model variant from module path"""
         model_module = str(self.dit_model.__class__.__module__).lower()
-        return 'dit.nadit' in model_module and 'dit_v2' not in model_module
-
-    def _is_nadit_v2_model(self) -> bool:
-        """Detect if this is a NaDiT v2 model (3B) with precise logic"""
-        # Check module path for dit_v2
-        model_module = str(self.dit_model.__class__.__module__).lower()
-        return 'dit_v2' in model_module
+        if 'dit_7b' in model_module:
+            return "7B"
+        elif 'dit_3b' in model_module:
+            return "3B"
+        else:
+            return "Unknown"
         
     def _convert_rope_freqs(self) -> None:
         """Convert RoPE frequency buffers from FP8 to BFloat16 for compatibility"""

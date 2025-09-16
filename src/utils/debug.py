@@ -10,7 +10,7 @@ import torch
 import gc
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
-from src.optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
+from ..optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
 from contextlib import contextmanager
 
 

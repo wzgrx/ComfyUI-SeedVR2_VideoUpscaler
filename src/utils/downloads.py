@@ -8,8 +8,8 @@ import urllib.error
 from typing import Optional
 from torchvision.datasets.utils import download_url
 
-from src.utils.model_registry import MODEL_REGISTRY, get_model_repo, DEFAULT_VAE
-from src.utils.constants import get_base_cache_dir
+from .model_registry import MODEL_REGISTRY, get_model_repo, DEFAULT_VAE
+from .constants import get_base_cache_dir
 
 # HuggingFace URL template
 HUGGINGFACE_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"

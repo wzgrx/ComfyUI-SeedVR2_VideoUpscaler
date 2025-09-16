@@ -51,7 +51,7 @@ from .types import (
     _memory_device_t,
     _receptive_field_t,
 )
-from src.optimization.memory_manager import clear_memory, retry_on_oom
+from ....optimization.memory_manager import clear_memory, retry_on_oom
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 

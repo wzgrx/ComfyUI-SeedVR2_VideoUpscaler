@@ -11,8 +11,8 @@ import sys
 import time
 import psutil
 from typing import Tuple, Dict, Any, Optional, List, Union
-from src.common.cache import Cache
-from src.common.distributed import get_device
+from ..common.cache import Cache 
+from ..common.distributed import get_device
     
 
 def get_device_list():
@@ -517,7 +517,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         bool: True if model was moved
     """
     # Import BlockSwap function (avoid circular import)
-    from src.optimization.blockswap import set_blockswap_bypass
+    from .blockswap import set_blockswap_bypass
     
     if target_type == "cpu":
         # Moving to CPU (offload)
@@ -748,7 +748,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
     # 1. Clean BlockSwap if active
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
         # Import here to avoid circular dependency
-        from src.optimization.blockswap import cleanup_blockswap
+        from .blockswap import cleanup_blockswap
         cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
     
     # 2. Clear all runtime caches

@@ -316,26 +316,35 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
 
     # Phase 1: Encode all batches
     ctx = encode_all_batches(
-        runner, ctx, frames_tensor,
-        shared_args["batch_size"], 
-        shared_args["preserve_vram"], 
-        worker_debug, None,
-        shared_args["temporal_overlap"],
+        runner,
+        ctx=ctx,
+        images=frames_tensor,
+        batch_size=shared_args["batch_size"],
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        progress_callback=None,
+        temporal_overlap=shared_args["temporal_overlap"],
         res_w=shared_args["res_w"]
     )
-    
-    # Phase 2: Upscale all batches
+
+    # Phase 2: Upscale all batches  
     ctx = upscale_all_batches(
-        runner, ctx, shared_args["preserve_vram"], 
-        worker_debug, None,
+        runner,
+        ctx=ctx,
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        progress_callback=None,
         cfg_scale=shared_args["cfg_scale"],
         seed=shared_args["seed"]
     )
 
     # Phase 3: Decode all batches
     ctx = decode_all_batches(
-        runner, ctx, shared_args["preserve_vram"], 
-        worker_debug, None
+        runner,
+        ctx=ctx,
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        progress_callback=None
     )
 
     # Get final result

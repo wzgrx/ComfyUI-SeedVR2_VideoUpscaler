@@ -7,13 +7,12 @@ import time
 import torch
 from typing import Tuple, Dict, Any
 
-from src.utils.constants import get_base_cache_dir
-from src.utils.downloads import download_weight
-from src.utils.model_registry import get_available_models, DEFAULT_MODEL
-from src.utils.constants import get_script_directory
-from src.utils.debug import Debug
-from src.core.model_manager import configure_runner
-from src.core.generation import (
+from ..utils.constants import get_base_cache_dir, get_script_directory
+from ..utils.downloads import download_weight
+from ..utils.model_registry import get_available_models, DEFAULT_MODEL
+from ..utils.debug import Debug
+from ..core.model_manager import configure_runner
+from ..core.generation import (
     setup_device_environment,
     prepare_generation_context, 
     prepare_runner,
@@ -21,7 +20,7 @@ from src.core.generation import (
     upscale_all_batches, 
     decode_all_batches, 
 )
-from src.optimization.memory_manager import (
+from ..optimization.memory_manager import (
     release_text_embeddings,
     complete_cleanup, 
     get_device_list
@@ -256,20 +255,35 @@ class SeedVR2:
         
         # Phase 1: Encode all batches
         ctx = encode_all_batches(
-            self.runner, ctx, images, batch_size, preserve_vram, 
-            debug, self._progress_callback, temporal_overlap, res_w=new_resolution
+            self.runner, 
+            ctx=ctx, 
+            images=images, 
+            batch_size=batch_size, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback, 
+            temporal_overlap=temporal_overlap, 
+            res_w=new_resolution
         )
 
         # Phase 2: Upscale all batches
         ctx = upscale_all_batches(
-            self.runner, ctx, preserve_vram, 
-            debug, self._progress_callback, cfg_scale=cfg_scale, seed=seed
+            self.runner, 
+            ctx=ctx, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback, 
+            cfg_scale=cfg_scale, 
+            seed=seed
         )
 
         # Phase 3: Decode all batches
         ctx = decode_all_batches(
-            self.runner, ctx, preserve_vram, 
-            debug, self._progress_callback
+            self.runner, 
+            ctx=ctx, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback
         )
 
         # Get final result

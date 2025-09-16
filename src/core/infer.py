@@ -17,16 +17,16 @@ import torch
 from einops import rearrange
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
-from src.common.diffusion import (
+from ..common.diffusion import (
     classifier_free_guidance_dispatcher,
     create_sampler_from_config,
     create_sampling_timesteps_from_config,
     create_schedule_from_config,
 )
-from src.common.distributed import (
+from ..common.distributed import (
     get_device,
 )
-from src.models.dit_v2 import na
+from ..models.dit_3b import na
 
 
 def optimized_channels_to_last(tensor):

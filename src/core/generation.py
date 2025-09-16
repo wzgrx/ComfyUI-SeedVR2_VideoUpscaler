@@ -21,41 +21,29 @@ Key Features:
 
 import os
 import torch
-from src.utils.constants import get_script_directory
 from torchvision.transforms import Compose, Lambda, Normalize
-from src.common.distributed import get_device
 
-
-# Import required modules
-from src.core.model_manager import configure_runner
-from src.optimization.memory_manager import (
+from ..utils.constants import get_script_directory
+from ..common.distributed import get_device
+from .model_manager import configure_runner
+from ..optimization.memory_manager import (
     clear_memory, 
     release_text_embeddings, 
     manage_model_device, 
     complete_cleanup
 )
-from src.optimization.performance import (
+from ..optimization.performance import (
     optimized_video_rearrange, 
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
-from src.common.seed import set_seed
-try:
-    import comfy.model_management
-    COMFYUI_AVAILABLE = True
-except:
-    COMFYUI_AVAILABLE = False
-    pass
+from ..common.seed import set_seed
+from ..data.image.transforms.divisible_crop import DivisibleCrop
+from ..data.image.transforms.na_resize import NaResize
+from ..utils.color_fix import wavelet_reconstruction
+
 # Get script directory for embeddings
 script_directory = get_script_directory()
-
-# Import transforms and color fix
-
-from src.data.image.transforms.divisible_crop import DivisibleCrop
-from src.data.image.transforms.na_resize import NaResize
-
-from src.utils.color_fix import wavelet_reconstruction
-
 
 def prepare_video_transforms(res_w):
     """
@@ -199,8 +187,8 @@ def cut_videos(videos):
 
 def check_interrupt(ctx):
     """Single interrupt check to avoid redundant imports"""
-    if ctx['comfyui_available']:
-        comfy.model_management.throw_exception_if_processing_interrupted()
+    if ctx.get('interrupt_fn') is not None:
+        ctx['interrupt_fn']()
 
 
 def prepare_generation_context(device, debug=None):
@@ -217,8 +205,10 @@ def prepare_generation_context(device, debug=None):
     
     try:
         import comfy.model_management
+        interrupt_fn = comfy.model_management.throw_exception_if_processing_interrupted
         comfyui_available = True
     except:
+        interrupt_fn = None
         comfyui_available = False
     
     ctx = {
@@ -233,6 +223,7 @@ def prepare_generation_context(device, debug=None):
         'batch_samples': [],
         'final_video': None,
         'comfyui_available': comfyui_available,
+        'interrupt_fn': interrupt_fn,  # Store the function reference
     }
     
     if debug:
