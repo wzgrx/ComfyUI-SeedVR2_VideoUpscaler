@@ -40,7 +40,7 @@ from ..optimization.performance import (
 from ..common.seed import set_seed
 from ..data.image.transforms.divisible_crop import DivisibleCrop
 from ..data.image.transforms.na_resize import NaResize
-from ..utils.color_fix import wavelet_reconstruction
+from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normalization
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
@@ -667,7 +667,7 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
             del noises, aug_noises, latent, conditions, condition, base_noise, upscaled
             
             if preserve_vram and ctx['all_upscaled_latents'][upscale_idx].shape[0] > 1:
-                clear_memory(debug=debug, deep=True, force=True, timer_name="upscale_all_batches")
+                clear_memory(debug=debug, deep=True, force=True, timer_name=f"upscale_all_batches - batch {upscale_idx+1} - deep")
             
             debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
             
@@ -685,6 +685,7 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
         if dit_moved_to_gpu and preserve_vram:
             manage_model_device(model=runner.dit, target_device='cpu', 
                               model_name="DiT", preserve_vram=preserve_vram, debug=debug)
+        clear_memory(debug=debug, deep=False, force=True, timer_name=f"upscale_all_batches - finally - minimal")
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
@@ -692,7 +693,7 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
     return ctx
 
 
-def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progress_callback=None):
+def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progress_callback=None, color_correction="wavelet"):
     """
     Phase 3: VAE Decoding and Final Video Assembly.
     
@@ -705,6 +706,7 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
         preserve_vram: If True, offload VAE between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
+        color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
         
     Returns:
         dict: Updated context containing:
@@ -735,7 +737,7 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decoding")
-    
+
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
     
@@ -783,11 +785,30 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
                 
-                # Apply wavelet reconstruction
-                transformed_video = transformed_video.to(ctx['device'])
-                input_video = [optimized_single_video_rearrange(transformed_video)]
-                sample = wavelet_reconstruction(sample, input_video[0][:sample.size(0)], debug)
-                del input_video
+                # Apply color correction based on selected method
+                if color_correction != "none":
+                    transformed_video = transformed_video.to(ctx['device'])
+                    input_video = [optimized_single_video_rearrange(transformed_video)]
+                    
+                    # Start timing color correction operation
+                    debug.start_timer(f"color_correction_{color_correction}")
+                    
+                    if color_correction == "wavelet":
+                        debug.log("Applying wavelet color reconstruction (frequency-based)", category="video")
+                        sample = wavelet_reconstruction(sample, input_video[0][:sample.size(0)], debug)
+                    elif color_correction == "adain":
+                        debug.log("Applying AdaIN color correction (statistical matching)", category="video")
+                        sample = adaptive_instance_normalization(sample, input_video[0][:sample.size(0)])
+                    else:
+                        debug.log(f"Unknown color correction method: {color_correction}, skipping", level="WARNING", category="video")
+                    
+                    # End timing and log duration
+                    debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction}) completed")
+                    
+                    del input_video
+                else:
+                    debug.log("Color correction disabled (set to none)", category="video")
+
                 ctx['all_transformed_videos'][video_idx] = None
                 del transformed_video
                 

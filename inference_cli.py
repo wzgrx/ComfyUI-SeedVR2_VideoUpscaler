@@ -344,7 +344,8 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         ctx=ctx,
         preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug,
-        progress_callback=None
+        progress_callback=None,
+        color_correction=shared_args.get("color_correction", "wavelet")
     )
 
     # Get final result
@@ -386,6 +387,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "model": args.model,
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
         "preserve_vram": args.preserve_vram,
+        "color_correction": args.color_correction,
         "debug": args.debug,
         "cfg_scale": 1.0,
         "seed": args.seed,
@@ -507,6 +509,9 @@ def parse_arguments():
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
+    parser.add_argument("--color_correction", type=str, default="wavelet", 
+                        choices=["wavelet", "adain", "none"],
+                        help="Color correction method: 'wavelet' (natural, recommended), 'adain' (stylistic), 'none' (no correction)")
     parser.add_argument("--preserve_vram", action="store_true",
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
