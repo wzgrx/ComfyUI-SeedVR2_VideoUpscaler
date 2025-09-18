@@ -69,6 +69,8 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     
     # Check if we can reuse the cached runner
     if cached_runner and cache_model:
+
+        debug.start_timer("cache_reuse")
         # Update all runtime parameters dynamically
         runtime_params = {
             'vae_tiling_enabled': vae_tiling_enabled,
@@ -117,6 +119,8 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
         
         # Store debug instance on runner
         cached_runner.debug = debug
+
+        debug.end_timer("cache_reuse", "Reuse cached runner")
 
         return cached_runner
         

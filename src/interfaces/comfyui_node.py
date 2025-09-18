@@ -118,7 +118,7 @@ class SeedVR2:
         temporal_overlap = 0 
         
         if extra_args is None:
-            tiled_vae = True
+            tiled_vae = False
             vae_tile_size = 512
             vae_tile_overlap = 64
             preserve_vram = False
@@ -491,7 +491,7 @@ class SeedVR2ExtraArgs:
         return {
             "required": {
                 "tiled_vae": ("BOOLEAN", {
-                    "default": True,
+                    "default": False,
                     "tooltip": "Process VAE in tiles to reduce VRAM usage but slower with potential artifacts. Only enable if running out of memory."
                 }),
                 "vae_tile_size": ("INT", {

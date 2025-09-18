@@ -446,14 +446,13 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
     ctx['all_transformed_videos'] = [None] * num_encode_batches
     ctx['all_latents'] = [None] * num_encode_batches
     
-    vae_moved_to_gpu = False
     encode_idx = 0
     
     try:
         # Move VAE to GPU once for all encoding
         manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
-                          model_name="VAE", preserve_vram=False, debug=debug)
-        vae_moved_to_gpu = True
+                          model_name="VAE", preserve_vram=False, debug=debug,
+                          runner=runner)
         
         for batch_idx in range(0, total_frames, step):
             check_interrupt(ctx)
@@ -516,10 +515,11 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
         debug.log(f"Error in Phase 1 (Encoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always move VAE back if needed
-        if vae_moved_to_gpu and preserve_vram:
+        # Always offload VAE if needed
+        if preserve_vram:
             manage_model_device(model=runner.vae, target_device='cpu', 
-                              model_name="VAE", preserve_vram=preserve_vram, debug=debug)
+                              model_name="VAE", preserve_vram=preserve_vram, debug=debug,
+                              runner=runner)
     
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
@@ -598,14 +598,13 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
     # Pre-allocate list for upscaled latents
     ctx['all_upscaled_latents'] = [None] * num_valid_latents
     
-    dit_moved_to_gpu = False
     upscale_idx = 0
     
     try:
-        if preserve_vram:
-            manage_model_device(model=runner.dit, target_device=str(ctx['device']), 
-                              model_name="DiT", preserve_vram=False, debug=debug)
-            dit_moved_to_gpu = True
+        # Move DiT to GPU once for all upscaling
+        manage_model_device(model=runner.dit, target_device=str(ctx['device']), 
+                            model_name="DiT", preserve_vram=False, debug=debug,
+                            runner=runner)
         
         for batch_idx, latent in enumerate(ctx['all_latents']):
             if latent is None:
@@ -681,10 +680,11 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
         debug.log(f"Error in Phase 2 (Upscaling): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always move DiT back if needed
-        if dit_moved_to_gpu and preserve_vram:
+        # Always offload DiT if needed
+        if preserve_vram:
             manage_model_device(model=runner.dit, target_device='cpu', 
-                              model_name="DiT", preserve_vram=preserve_vram, debug=debug)
+                              model_name="DiT", preserve_vram=preserve_vram, debug=debug,
+                              runner=runner)
         clear_memory(debug=debug, deep=False, force=True, timer_name=f"upscale_all_batches - finally - minimal")
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
@@ -745,13 +745,13 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
     num_batches = len([v for v in ctx['all_transformed_videos'] if v is not None])
     ctx['batch_samples'] = [None] * num_batches
     
-    vae_moved_to_gpu = False
     decode_idx = 0
     
     try:
+        # Move VAE to GPU once for all decoding
         manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
-                          model_name="VAE", preserve_vram=False, debug=debug)
-        vae_moved_to_gpu = True
+                          model_name="VAE", preserve_vram=False, debug=debug,
+                          runner=runner)
         
         for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
             if upscaled_latent is None:
@@ -837,10 +837,11 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
         debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always move VAE back if needed
-        if vae_moved_to_gpu and preserve_vram:
+        # Always offload VAE if needed
+        if preserve_vram:
             manage_model_device(model=runner.vae, target_device='cpu', 
-                              model_name="VAE", preserve_vram=preserve_vram, debug=debug)
+                              model_name="VAE", preserve_vram=preserve_vram, debug=debug,
+                              runner=runner)
         
         # Always clean up intermediate storage
         if 'all_latents' in ctx:

@@ -537,8 +537,9 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     debug.log("Starting BlockSwap cleanup", category="cleanup")
 
     if keep_state_for_cache:
-        # Minimal cleanup for caching - just mark as inactive
+        # Minimal cleanup for caching - just mark as inactive and allow offloading
         # Everything else stays intact for fast reactivation
+        set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
         runner._blockswap_active = False
         debug.log("BlockSwap deactivated for caching (configuration preserved)", category="success")
         return
