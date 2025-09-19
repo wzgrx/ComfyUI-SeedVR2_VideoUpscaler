@@ -528,7 +528,7 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
 
 
 def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None, 
-                       progress_callback=None, cfg_scale=1.0, seed=100):
+                       progress_callback=None, cfg_scale=1.0, seed=100, cond_noise_scale=0.0):
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -543,6 +543,8 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
         progress_callback: Optional callback(current, total, frames, phase_name)
         cfg_scale: Classifier-free guidance scale (default: 1.0)
         seed: Random seed for noise generation
+        cond_noise_scale: Conditional noise scale for latent augmentation (0.0-1.0).
+            Controls the amount of noise added to the conditioning latent.
         
     Returns:
         dict: Updated context containing:
@@ -583,8 +585,6 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
     
     # Set seed for generation
     set_seed(seed)
-    
-    cond_noise_scale = 0.0
     
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_latents'] if l is not None])

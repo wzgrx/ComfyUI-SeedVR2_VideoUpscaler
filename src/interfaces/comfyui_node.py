@@ -94,6 +94,13 @@ class SeedVR2:
                     "default": "wavelet",
                     "tooltip": "Color correction method. Wavelet: Frequency-based for natural results (recommended). AdaIN: Statistical matching for stylized effects. None: No color correction."
                 }),
+                "cond_noise_scale": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Conditional noise scale for latent augmentation. Higher values add more noise to the conditioning, affecting sharpness and detail. 0.0 = no noise (crisp), 1.0 = maximum noise (softer)."
+                }),
             },
             "optional": {
                 "block_swap_config": ("block_swap_config", {
@@ -112,7 +119,8 @@ class SeedVR2:
     CATEGORY = "SEEDVR2"
 
     def execute(self, images: torch.Tensor, model: str, seed: int, new_resolution: int, 
-        batch_size: int, color_correction=str, block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
+        batch_size: int, color_correction: str, cond_noise_scale: float, 
+        block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
         """Execute SeedVR2 video upscaling with progress reporting"""
         
         temporal_overlap = 0 
@@ -155,7 +163,8 @@ class SeedVR2:
         cfg_scale = 1.0
         try:
             return self._internal_execute(images, model, seed, new_resolution, cfg_scale, 
-                                        batch_size, color_correction, tiled_vae, vae_tile_size, vae_tile_overlap, 
+                                        batch_size, color_correction, cond_noise_scale, 
+                                        tiled_vae, vae_tile_size, vae_tile_overlap, 
                                         preserve_vram, temporal_overlap, 
                                         cache_model, device, block_swap_config)
         except Exception as e:
@@ -198,7 +207,7 @@ class SeedVR2:
 
 
     def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size, 
-                 color_correction, tiled_vae, vae_tile_size, vae_tile_overlap,
+                 color_correction, cond_noise_scale, tiled_vae, vae_tile_size, vae_tile_overlap,
                  preserve_vram, temporal_overlap, cache_model, device, block_swap_config):
         """Internal execution logic with progress tracking"""
         
@@ -278,7 +287,8 @@ class SeedVR2:
             debug=debug, 
             progress_callback=self._progress_callback, 
             cfg_scale=cfg_scale, 
-            seed=seed
+            seed=seed,
+            cond_noise_scale=cond_noise_scale
         )
 
         # Phase 3: Decode all batches

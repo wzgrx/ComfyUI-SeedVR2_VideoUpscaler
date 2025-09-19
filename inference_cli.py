@@ -335,7 +335,8 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         debug=worker_debug,
         progress_callback=None,
         cfg_scale=shared_args["cfg_scale"],
-        seed=shared_args["seed"]
+        seed=shared_args["seed"],
+        cond_noise_scale=shared_args["cond_noise_scale"]
     )
 
     # Phase 3: Decode all batches
@@ -388,6 +389,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
         "preserve_vram": args.preserve_vram,
         "color_correction": args.color_correction,
+        "cond_noise_scale": args.cond_noise_scale,
         "debug": args.debug,
         "cfg_scale": 1.0,
         "seed": args.seed,
@@ -512,6 +514,8 @@ def parse_arguments():
     parser.add_argument("--color_correction", type=str, default="wavelet", 
                         choices=["wavelet", "adain", "none"],
                         help="Color correction method: 'wavelet' (natural, recommended), 'adain' (stylistic), 'none' (no correction)")
+    parser.add_argument("--cond_noise_scale", type=float, default=0.0,
+                        help="Conditional noise scale (0.0-1.0). Higher values add more noise, affecting sharpness (default: 0.0)")
     parser.add_argument("--preserve_vram", action="store_true",
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
