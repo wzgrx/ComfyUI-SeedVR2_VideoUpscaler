@@ -346,10 +346,11 @@ def prepare_runner(model_name, model_dir, preserve_vram, debug,
     return runner, model_changed
 
 
-def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vram=False, 
-                      debug=None, progress_callback=None, temporal_overlap=0, res_w=1072):
+def encode_all_batches(runner, ctx=None, images=None, batch_size=5, 
+                      preserve_vram=False, debug=None, progress_callback=None, 
+                      temporal_overlap=0, res_w=1072, input_noise_scale=0.0):
     """
-    Phase 1: VAE Encoding for all batches with auto-context management.
+    Phase 1: VAE Encoding for all batches
     
     Encodes video frames to latents in batches, handling temporal overlap and 
     memory optimization. Creates context automatically if not provided.
@@ -365,6 +366,8 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
         progress_callback: Optional callback(current, total, frames, phase_name)
         temporal_overlap: Overlapping frames between batches for continuity
         res_w: Target resolution for shortest edge
+        input_noise_scale: Scale for input noise (0.0-1.0). Adds noise to input images
+                          before VAE encoding to reduce artifacts at high resolutions.
         
     Returns:
         dict: Context containing:
@@ -481,6 +484,24 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
 
             del video
 
+            # Apply input noise if requested (to reduce artifacts at high resolutions)
+            if input_noise_scale > 0:
+                debug.log(f"Applying input noise (scale: {input_noise_scale:.2f})", category="video")
+                
+                # Generate noise matching the video shape
+                noise = torch.randn_like(transformed_video)
+                
+                # Subtle noise amplitude
+                noise = noise * 0.05
+                
+                # Linear blend factor: 0 at scale=0, 0.5 at scale=1
+                blend_factor = input_noise_scale * 0.5
+                
+                # Apply blend
+                transformed_video = transformed_video * (1 - blend_factor) + (transformed_video + noise) * blend_factor
+                
+                del noise
+
             ori_length = transformed_video.size(1)
             
             # Log sequence info
@@ -528,7 +549,7 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=90, preserve_vr
 
 
 def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None, 
-                       progress_callback=None, cfg_scale=1.0, seed=100, cond_noise_scale=0.0):
+                       progress_callback=None, cfg_scale=1.0, seed=100, latent_noise_scale=0.0):
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -543,8 +564,10 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
         progress_callback: Optional callback(current, total, frames, phase_name)
         cfg_scale: Classifier-free guidance scale (default: 1.0)
         seed: Random seed for noise generation
-        cond_noise_scale: Conditional noise scale for latent augmentation (0.0-1.0).
-            Controls the amount of noise added to the conditioning latent.
+        latent_noise_scale: Noise scale for latent space augmentation (0.0-1.0).
+                           Adds noise during diffusion conditioning. Can soften details
+                           but may help with certain artifacts. 0.0 = no noise (crisp),
+                           1.0 = maximum noise (softer)
         
     Returns:
         dict: Updated context containing:
@@ -628,10 +651,14 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
             noises = [base_noise]
             aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
             
+            # Log latent noise application if enabled
+            if latent_noise_scale > 0:
+                debug.log(f"Applying latent noise (scale: {latent_noise_scale:.3f})", category="generation")
+            
             def _add_noise(x, aug_noise):
-                if cond_noise_scale == 0.0:
+                if latent_noise_scale == 0.0:
                     return x
-                t = torch.tensor([1000.0], device=ctx['device'], dtype=ctx['compute_dtype']) * cond_noise_scale
+                t = torch.tensor([1000.0], device=ctx['device'], dtype=ctx['compute_dtype']) * latent_noise_scale
                 shape = torch.tensor(x.shape[1:], device=ctx['device'])[None]
                 t = runner.timestep_transform(t, shape)
                 x = runner.schedule.forward(x, aug_noise, t)

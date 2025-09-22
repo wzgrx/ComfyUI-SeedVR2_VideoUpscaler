@@ -94,12 +94,19 @@ class SeedVR2:
                     "default": "wavelet",
                     "tooltip": "Color correction method. Wavelet: Frequency-based for natural results (recommended). AdaIN: Statistical matching for stylized effects. None: No color correction."
                 }),
-                "cond_noise_scale": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.05,
-                    "tooltip": "Conditional noise scale for latent augmentation. Higher values add more noise to the conditioning, affecting sharpness and detail. 0.0 = no noise (crisp), 1.0 = maximum noise (softer)."
+                "input_noise_scale": ("FLOAT", {
+                    "default": 0.00,
+                    "min": 0.00,
+                    "max": 1.00,
+                    "step": 0.001,
+                    "tooltip": "Input noise to reduce artifacts at high resolutions. Adds subtle noise to images before upscaling."
+                }),
+                "latent_noise_scale": ("FLOAT", {
+                    "default": 0.00,
+                    "min": 0.00,
+                    "max": 1.00,
+                    "step": 0.001,
+                    "tooltip": "Latent space noise during diffusion. Affects the conditioning process and can soften details. Use only if input_noise doesn't help."
                 }),
             },
             "optional": {
@@ -119,7 +126,7 @@ class SeedVR2:
     CATEGORY = "SEEDVR2"
 
     def execute(self, images: torch.Tensor, model: str, seed: int, new_resolution: int, 
-        batch_size: int, color_correction: str, cond_noise_scale: float, 
+        batch_size: int, color_correction: str, input_noise_scale: float, latent_noise_scale: float, 
         block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
         """Execute SeedVR2 video upscaling with progress reporting"""
         
@@ -163,7 +170,7 @@ class SeedVR2:
         cfg_scale = 1.0
         try:
             return self._internal_execute(images, model, seed, new_resolution, cfg_scale, 
-                                        batch_size, color_correction, cond_noise_scale, 
+                                        batch_size, color_correction, input_noise_scale, latent_noise_scale, 
                                         tiled_vae, vae_tile_size, vae_tile_overlap, 
                                         preserve_vram, temporal_overlap, 
                                         cache_model, device, block_swap_config)
@@ -206,9 +213,9 @@ class SeedVR2:
             self.current_model_name = ""
 
 
-    def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size, 
-                 color_correction, cond_noise_scale, tiled_vae, vae_tile_size, vae_tile_overlap,
-                 preserve_vram, temporal_overlap, cache_model, device, block_swap_config):
+    def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size,
+                color_correction, input_noise_scale, latent_noise_scale, tiled_vae, vae_tile_size, vae_tile_overlap,
+                preserve_vram, temporal_overlap, cache_model, device, block_swap_config) -> Tuple[torch.Tensor]:
         """Internal execution logic with progress tracking"""
         
         debug = self.debug
@@ -276,7 +283,8 @@ class SeedVR2:
             debug=debug, 
             progress_callback=self._progress_callback, 
             temporal_overlap=temporal_overlap, 
-            res_w=new_resolution
+            res_w=new_resolution,
+            input_noise_scale=input_noise_scale
         )
 
         # Phase 2: Upscale all batches
@@ -288,7 +296,7 @@ class SeedVR2:
             progress_callback=self._progress_callback, 
             cfg_scale=cfg_scale, 
             seed=seed,
-            cond_noise_scale=cond_noise_scale
+            latent_noise_scale=latent_noise_scale
         )
 
         # Phase 3: Decode all batches
