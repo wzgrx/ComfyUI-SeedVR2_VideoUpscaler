@@ -299,6 +299,9 @@ def configure_model_inference(runner, model_type, device, checkpoint_path, confi
     use_cpu = preserve_vram or blockswap_active
     target_device = "cpu" if use_cpu else device
     
+    # Always use meta initialization for optimal memory usage (avoids double allocation)
+    use_meta_init = True
+
     # Create descriptive reason string for logging
     cpu_reason = ""
     if target_device == "cpu":
@@ -310,8 +313,8 @@ def configure_model_inference(runner, model_type, device, checkpoint_path, confi
         cpu_reason = f" ({', '.join(reasons)})" if reasons else ""
     
     # Create and load model
-    model = _create_model(model_config, target_device, use_cpu, model_type_upper, debug)
-    model = _load_model_weights(model, checkpoint_path, target_device, use_cpu, 
+    model = _create_model(model_config, target_device, use_meta_init, model_type_upper, debug)
+    model = _load_model_weights(model, checkpoint_path, target_device, use_meta_init, 
                                 model_type_upper, cpu_reason, debug, override_dtype)
     
     # Apply model-specific configurations
@@ -364,7 +367,7 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
     """
     Load and apply model weights with appropriate strategy.
     
-    For meta-initialized models, materializes directly to target device.
+    For meta-initialized models, materializes to target device.
     For standard models, loads weights and applies state dict.
     
     Args:
@@ -385,7 +388,7 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
     
     # Load weights from disk
     if used_meta:
-        debug.log(f"Materializing {model_type} weights directly to {target_device.upper()}{cpu_reason}: {checkpoint_path}", 
+        debug.log(f"Materializing {model_type} weights to {target_device.upper()}{cpu_reason}: {checkpoint_path}", 
                  category=model_type_lower, force=True)
     else:
         debug.log(f"Loading {model_type} weights to {target_device.upper()}{cpu_reason}: {checkpoint_path}", 
@@ -411,23 +414,71 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
     debug.log(f"{action_verb} {model_type}: {num_params} parameters, {total_size_mb:.2f}MB total", 
              category=model_type_lower)
     
-    # Apply weights to model
-    if used_meta:
-        # Materialize from meta to real device first
-        debug.start_timer("meta_to_real")
-        model = model.to_empty(device=target_device)
-        debug.end_timer("meta_to_real", f"{model_type} structure moved to real device")
-    
-    # Load state dict
+    # Load state dict - this materializes the model if it's on meta device
     debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=True, assign=True)
+    model.load_state_dict(state, strict=False, assign=True)
+
+    if used_meta:
+        debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
+    else:
+        debug.log(f"{model_type} weights applied", category=model_type_lower)
+
     debug.end_timer(f"{model_type_lower}_state_apply", 
-                   f"{model_type} weights {'materialized' if used_meta else 'applied'}")
+                f"{model_type} weights {'materialized' if used_meta else 'applied'}")
     
     # Clean up state dict to free memory
     del state
     
+    # Initialize non-persistent buffers after meta device materialization
+    if used_meta:
+        debug.start_timer("buffer_init")
+        initialized = _initialize_meta_buffers(model, target_device, debug)
+        if initialized > 0:
+            debug.log(f"Initialized {initialized} non-persistent buffers", category="success")
+        debug.end_timer("buffer_init", "Buffer initialization")
+    
     return model
+
+
+def _initialize_meta_buffers(model, target_device, debug):
+    """
+    Initialize any buffers still on meta device after materialization.
+    
+    Non-persistent buffers aren't included in state_dict and remain on meta
+    device after load_state_dict. This function moves them to the target device.
+    
+    Args:
+        model: Model potentially containing meta device buffers
+        target_device: Target device for initialization
+        debug: Debug instance for logging
+        
+    Returns:
+        Number of buffers initialized
+    """
+    initialized_count = 0
+    
+    # Simply initialize all meta device buffers to zeros on target device
+    for name, buffer in model.named_buffers():
+        if buffer is not None and buffer.device.type == 'meta':
+            # Get the module that owns this buffer
+            module_path = name.rsplit('.', 1)[0] if '.' in name else ''
+            buffer_name = name.rsplit('.', 1)[1] if '.' in name else name
+            
+            # Get the actual module
+            if module_path:
+                module = model
+                for part in module_path.split('.'):
+                    module = getattr(module, part)
+            else:
+                module = model
+            
+            # Create a zero tensor of the same shape on target device
+            # This is safe for all non-persistent buffers (caches, dummy tensors, etc.)
+            initialized_buffer = torch.zeros_like(buffer, device=target_device)
+            module.register_buffer(buffer_name, initialized_buffer, persistent=False)
+            initialized_count += 1
+    
+    return initialized_count
 
 
 def _apply_model_specific_config(model, runner, config, is_dit, debug):
