@@ -82,40 +82,45 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
         
         debug.log(f"Cache hit: Reusing runner for model {model}", category="reuse", force=True)
         
-        # Check if blockswap needs to be applied
-        blockswap_needed = block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
-
-        if blockswap_needed:
-            # Check if BlockSwap is already configured with same settings
-            cached_config = getattr(cached_runner, "_block_swap_config", None)
+        # Normalize configurations for comparison
+        # None represents "BlockSwap disabled"
+        desired_config = None
+        if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
+            desired_config = (
+                block_swap_config.get("blocks_to_swap"),
+                block_swap_config.get("offload_io_components", False)
+            )
+        
+        current_config = None
+        if hasattr(cached_runner, "_block_swap_config"):
+            current_config = (
+                cached_runner._block_swap_config.get("blocks_swapped"),
+                cached_runner._block_swap_config.get("offload_io_components", False)
+            )
+        
+        # Format configs for logging
+        def format_config(cfg):
+            if cfg is None:
+                return "disabled"
+            return f"blocks={cfg[0]}, offload_io={cfg[1]}"
+        
+        # Apply changes only if configurations differ
+        if desired_config != current_config:
+            # Log the change
+            debug.log(f"BlockSwap config changed: {format_config(current_config)} → {format_config(desired_config)}", 
+                     category="blockswap", force=True)
             
-            # Compare only the relevant config fields
-            config_matches = False
-            if cached_config:
-                config_matches = (
-                    cached_config.get("blocks_swapped") == block_swap_config.get("blocks_to_swap") and
-                    cached_config.get("offload_io_components") == block_swap_config.get("offload_io_components", False)
-                )
-            
-            if config_matches:
-                # Just reactivate - everything is already configured
-                cached_runner._blockswap_active = True
-                debug.log("BlockSwap reactivated with existing configuration", category="reuse", force=True)
-            else:
-                # Configuration changed or new - need full setup
-                if cached_config:
-                    debug.log("BlockSwap config changed, reconfiguring", category="blockswap", force=True)
-                    # Clean up old configuration first
-                    cleanup_blockswap(cached_runner, keep_state_for_cache=False)
-                else:
-                    debug.log("Applying BlockSwap to cached runner", category="blockswap", force=True)
-                
-                # Apply new configuration
-                apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
-        elif hasattr(cached_runner, "_blockswap_active") and cached_runner._blockswap_active:
-            # BlockSwap was active but now disabled - clean it up
-            debug.log("BlockSwap disabled, cleaning up", category="blockswap")
+            # Always cleanup existing BlockSwap state when config changes
             cleanup_blockswap(cached_runner, keep_state_for_cache=False)
+            
+            # Apply new configuration only if not disabled
+            if desired_config:
+                apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
+                
+        elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
+            # Config matches but was deactivated - just reactivate
+            cached_runner._blockswap_active = True
+            debug.log(f"BlockSwap reactivated: {format_config(desired_config)}", category="reuse", force=True)
         
         # Store debug instance on runner
         cached_runner.debug = debug

@@ -183,6 +183,11 @@ class SeedVR2:
         """
         Cleanup runner and free memory
         """
+        # Clear progress bar if it exists
+        if hasattr(self, '_pbar') and self._pbar is not None:
+            self._pbar.update_absolute(0, 100)
+            self._pbar = None
+            
         # Get debug from runner if not provided
         if debug is None and self.runner and hasattr(self.runner, 'debug'):
             debug = self.runner.debug

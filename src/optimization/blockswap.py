@@ -530,8 +530,14 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     
     debug = runner.debug
     
-    # Early return if BlockSwap not active
-    if not hasattr(runner, "_blockswap_active") or not runner._blockswap_active:
+    # Check if there's any BlockSwap state to clean up
+    has_blockswap_state = (
+        hasattr(runner, "_blockswap_active") or 
+        hasattr(runner, "_block_swap_config") or
+        hasattr(runner, "_blockswap_bypass_protection")
+    )
+    
+    if not has_blockswap_state:
         return
 
     debug.log("Starting BlockSwap cleanup", category="cleanup")
@@ -539,8 +545,9 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     if keep_state_for_cache:
         # Minimal cleanup for caching - just mark as inactive and allow offloading
         # Everything else stays intact for fast reactivation
-        set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
-        runner._blockswap_active = False
+        if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+            set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
+            runner._blockswap_active = False
         debug.log("BlockSwap deactivated for caching (configuration preserved)", category="success")
         return
 
