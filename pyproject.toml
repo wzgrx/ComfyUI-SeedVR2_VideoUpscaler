@@ -9,6 +9,12 @@ authors = [
 readme = "README.md"
 license = { file = "LICENSE" }
 dependencies = [
+    "torch",
+    "torchvision",
+    "safetensors",
+    "numpy",
+    "tqdm",
+    "psutil",
     "einops",
     "omegaconf>=2.3.0",
     "diffusers>=0.33.1",
