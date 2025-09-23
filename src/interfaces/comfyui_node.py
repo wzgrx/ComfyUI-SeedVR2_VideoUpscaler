@@ -9,7 +9,10 @@ from typing import Tuple, Dict, Any
 
 from ..utils.constants import get_base_cache_dir, get_script_directory
 from ..utils.downloads import download_weight
-from ..utils.model_registry import get_available_models, DEFAULT_MODEL
+from ..utils.model_registry import (
+    get_available_models,
+    DEFAULT_MODEL
+)
 from ..utils.debug import Debug
 from ..core.model_manager import configure_runner
 from ..core.generation import (
@@ -159,7 +162,26 @@ class SeedVR2:
             self.debug = Debug(enabled=enable_debug, show_timestamps=enable_debug)
         else:
             self.debug.enabled = enable_debug
-        
+
+        self.debug.log("", category="none", force=True)
+        self.debug.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
+        self.debug.log(" ║ ███████ ███████ ███████ ██████  ██    ██ ██████  ███████ ║", category="none", force=True)
+        self.debug.log(" ║ ██      ██      ██      ██   ██ ██    ██ ██   ██      ██ ║", category="none", force=True)
+        self.debug.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
+        self.debug.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
+        self.debug.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
+        self.debug.log(" ║                         © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
+        self.debug.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
+        self.debug.log("", category="none", force=True)
+
+        self.debug.start_timer("total_execution", force=True)
+
+        self.debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
+
+        # Initial memory state
+        self.debug.log_memory_state("Before model preparation", show_tensors=True, detailed_tensors=False)
+        self.debug.start_timer("model_preparation")
+
         # Check if download succeeded
         if not download_weight(model, debug=self.debug):
             raise RuntimeError(
@@ -230,24 +252,6 @@ class SeedVR2:
             self._pbar = ProgressBar(100)
         else:
             self._pbar = None
-        
-        debug.start_timer("total_execution", force=True)
-
-        debug.log("", category="none", force=True)
-        debug.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
-        debug.log(" ║ ███████ ███████ ███████ ██████  ██    ██ ██████  ███████ ║", category="none", force=True)
-        debug.log(" ║ ██      ██      ██      ██   ██ ██    ██ ██   ██      ██ ║", category="none", force=True)
-        debug.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
-        debug.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
-        debug.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
-        debug.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
-        debug.log("", category="none", force=True)
-
-        debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
-
-        # Initial memory state
-        debug.log_memory_state("Before model preparation", show_tensors=True, detailed_tensors=False)
-        debug.start_timer("model_preparation")
 
         # Setup device environment
         device = setup_device_environment(device, debug)

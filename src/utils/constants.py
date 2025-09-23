@@ -13,9 +13,17 @@ SEEDVR2_MODEL_TYPE = "seedvr2"   # Model type identifier for ComfyUI
 #SUPPORTED_MODEL_EXTENSIONS = {'.safetensors', '.gguf'}
 SUPPORTED_MODEL_EXTENSIONS = {'.safetensors'}
 
+# Download configuration
+HUGGINGFACE_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
+DOWNLOAD_CHUNK_SIZE = 8192 * 1024  # 8MB chunks for hash calculation
+DOWNLOAD_MAX_RETRIES = 3
+DOWNLOAD_RETRY_DELAY = 2  # seconds
+
+
 def get_script_directory():
     """Get the root script directory path (3 levels up from this file)"""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def get_base_cache_dir():
     """Get or create the model cache directory"""
@@ -28,6 +36,13 @@ def get_base_cache_dir():
     
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
+
+
+def get_validation_cache_path():
+    """Get path to model validation cache file"""
+    cache_dir = get_base_cache_dir()
+    return os.path.join(cache_dir, ".validation_cache.json")
+
 
 def is_supported_model_file(filename: str) -> bool:
     """Check if a file has a supported model extension"""
