@@ -3,9 +3,10 @@ Model Registry for SeedVR2
 Central registry for model definitions, repositories, and metadata
 """
 
+import os
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from .constants import SEEDVR2_MODEL_TYPE, is_supported_model_file, get_base_cache_dir
+from .constants import get_all_model_files
 
 # Model class imports using relative imports
 from ..models.dit_3b.nadit import NaDiT as NaDiT3B
@@ -67,16 +68,17 @@ def get_available_models() -> List[str]:
     model_list = get_default_models()
     
     try:
-        import folder_paths # only works if comfyui is available
-        # Ensure the folder is registered before trying to list files
-        get_base_cache_dir()
-        # Get all models from the SEEDVR2 folder using centralized constant
-        available_models = folder_paths.get_filename_list(SEEDVR2_MODEL_TYPE)
+        # Get all model files from all paths
+        model_files = get_all_model_files()
         
-        # Add any models not in the registry with supported extensions
-        for model in available_models:
-            if is_supported_model_file(model) and model not in MODEL_REGISTRY:
-                model_list.append(model)
+        # Add files not in registry
+        discovered_models = [
+            filename for filename in model_files
+            if filename not in MODEL_REGISTRY
+        ]
+        
+        # Add discovered models to the list
+        model_list.extend(sorted(discovered_models))
     except:
         pass
     

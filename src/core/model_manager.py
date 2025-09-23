@@ -27,7 +27,7 @@ except ImportError:
     print("⚠️ SafeTensors not available, recommended install: pip install safetensors")
     SAFETENSORS_AVAILABLE = False
 
-from ..utils.constants import get_script_directory
+from ..utils.constants import get_script_directory, find_model_file
 from ..optimization.memory_manager import get_basic_vram_info
 from ..optimization.compatibility import FP8CompatibleDiT
 from ..common.config import load_config, create_object
@@ -179,7 +179,7 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     #    device = "mps"
     
     # Configure models
-    dit_checkpoint_path = os.path.join(base_cache_dir, f'./{model}')
+    dit_checkpoint_path = find_model_file(model, base_cache_dir)
     debug.start_timer("dit_model_infer")
     runner = configure_model_inference(runner, "dit", device, dit_checkpoint_path, config,
                                    preserve_vram, debug, block_swap_config)
@@ -195,7 +195,7 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
                     category="precision", force=True)
     
     debug.start_timer("vae_model_infer")
-    vae_checkpoint_path = os.path.join(base_cache_dir, f'./{config.vae.checkpoint}')
+    vae_checkpoint_path = find_model_file(config.vae.checkpoint, base_cache_dir)
     vae_override_dtype = getattr(torch, config.vae.dtype) if torch.mps.is_available() else None
     runner = configure_model_inference(runner, "vae", device, vae_checkpoint_path, config,
                                    preserve_vram, debug=debug, override_dtype=vae_override_dtype)

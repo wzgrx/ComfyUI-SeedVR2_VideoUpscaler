@@ -14,13 +14,13 @@ import time
 from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
 from .constants import (
     get_base_cache_dir,
+    find_model_file,
     get_validation_cache_path,
     HUGGINGFACE_BASE_URL,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_MAX_RETRIES,
     DOWNLOAD_RETRY_DELAY
 )
-
 
 def load_validation_cache():
     """Load validation cache"""
@@ -152,8 +152,16 @@ def download_weight(model: str, model_dir: Optional[str] = None, debug=None) -> 
                 debug.log(f"{filename} not in registry, skipping validation", 
                          level="WARNING", category="setup")
             continue
+        
+        # Check if file exists in any registered path first
+        existing_filepath = find_model_file(filename, fallback_dir=cache_dir)
+        
+        # Use existing file path if it exists, otherwise download to cache_dir
+        if os.path.exists(existing_filepath):
+            filepath = existing_filepath
+        else:
+            filepath = os.path.join(cache_dir, filename)
             
-        filepath = os.path.join(cache_dir, filename)
         expected_hash = model_info.sha256
         repo = model_info.repo
         
