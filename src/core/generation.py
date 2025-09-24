@@ -878,7 +878,6 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
         if 'all_transformed_videos' in ctx:
             del ctx['all_transformed_videos']
     
-    debug.log("", category="none", force=True)
     debug.log("Assembling final video from decoded batches...", category="video")
 
     # Merge all batch results into final video

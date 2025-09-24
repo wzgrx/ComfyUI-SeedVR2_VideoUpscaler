@@ -17,18 +17,34 @@ Key Features:
 
 import os
 import torch
+import numpy as np
 from omegaconf import OmegaConf
+from typing import Dict, Optional, Tuple, Any
 
 # Import SafeTensors with fallback
 try:
     from safetensors.torch import load_file as load_safetensors_file
     SAFETENSORS_AVAILABLE = True
 except ImportError:
-    print("⚠️ SafeTensors not available, recommended install: pip install safetensors")
     SAFETENSORS_AVAILABLE = False
 
+# Import Debug for type annotations
+from ..utils.debug import Debug
+
+# Import GGUF with fallback  
+try:
+    import gguf
+    from gguf import GGMLQuantizationType
+    import warnings
+    import traceback
+    from ..optimization.gguf_dequant import dequantize_tensor
+    GGUF_AVAILABLE = True
+except ImportError:
+    GGUF_AVAILABLE = False
+    GGMLQuantizationType = None
+
 from ..utils.constants import get_script_directory, find_model_file
-from ..optimization.memory_manager import get_basic_vram_info
+from ..optimization.memory_manager import clear_memory
 from ..optimization.compatibility import FP8CompatibleDiT
 from ..common.config import load_config, create_object
 from .infer import VideoDiffusionInfer
@@ -39,9 +55,11 @@ from ..common.distributed import get_device
 script_directory = get_script_directory()
 
 
-def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None, 
-                    cache_model=False, block_swap_config=None, cached_runner=None, vae_tiling_enabled=False,
-                    vae_tile_size=None, vae_tile_overlap=None):
+def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = False, debug: Optional[Debug] = None, 
+                    cache_model: bool = False, block_swap_config: Optional[Dict[str, any]] = None, 
+                    cached_runner: Optional[VideoDiffusionInfer] = None, vae_tiling_enabled: bool = False,
+                    vae_tile_size: Optional[Tuple[int, int]] = None, 
+                    vae_tile_overlap: Optional[Tuple[int, int]] = None) -> VideoDiffusionInfer:
     """
     Configure and create a VideoDiffusionInfer runner for the specified model
     
@@ -143,8 +161,6 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     
     config = load_config(config_path)
     debug.end_timer("config_load", "Config loading")
-    # DiT model configuration is now handled directly in the YAML config files
-    # No need for dynamic path resolution here anymore!
 
     # Load and configure VAE with additional parameters
     vae_config_path = os.path.join(script_directory, 'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
@@ -223,13 +239,14 @@ def configure_runner(model, base_cache_dir, preserve_vram=False, debug=None,
     return runner
 
 
-def load_quantized_state_dict(checkpoint_path, device="cpu"):
+def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: Optional[Debug] = None) -> Dict[str, torch.Tensor]:
     """
     Load model state dictionary with optimal memory management
     
     Args:
         checkpoint_path (str): Path to checkpoint file (.safetensors or .pth)
         device (str/torch.device): Target device for tensor placement
+        debug: Optional Debug instance for logging
         
     Returns:
         dict: State dictionary loaded with appropriate format handler
@@ -240,8 +257,35 @@ def load_quantized_state_dict(checkpoint_path, device="cpu"):
     """
     if checkpoint_path.endswith('.safetensors'):
         if not SAFETENSORS_AVAILABLE:
-            raise ImportError("SafeTensors required to load this model. Install with: pip install safetensors")
+            error_msg = (
+                f"Cannot load {os.path.basename(checkpoint_path)}\n"
+                f"SafeTensors library is required but not installed.\n"
+                f"Please install it with: pip install safetensors"
+            )
+            if debug:
+                debug.log(error_msg, level="ERROR", category="dit", force=True)
+                debug.log("This is a one-time installation that will enable loading of .safetensors files", 
+                         level="INFO", category="info", force=True)
+            raise ImportError(error_msg)
         state = load_safetensors_file(checkpoint_path, device=device)
+    elif checkpoint_path.endswith('.gguf'):
+        if not GGUF_AVAILABLE:
+            error_msg = (
+                f"Cannot load {os.path.basename(checkpoint_path)}\n"
+                f"GGUF library is required but not installed.\n"
+                f"Please install it with: pip install gguf"
+            )
+            if debug:
+                debug.log(error_msg, level="ERROR", category="dit", force=True)
+                debug.log("This is a one-time installation that will enable loading of quantized GGUF models", 
+                         level="INFO", category="info", force=True)
+            raise ImportError(error_msg)
+        state = _load_gguf_state(
+                    checkpoint_path=checkpoint_path, 
+                    device=device, 
+                    debug=debug, 
+                    handle_prefix="model.diffusion_model."
+                )
     elif checkpoint_path.endswith('.pth'):
         state = torch.load(checkpoint_path, map_location=device, mmap=True)
     else:
@@ -250,18 +294,230 @@ def load_quantized_state_dict(checkpoint_path, device="cpu"):
     return state
 
 
-def _propagate_debug_to_modules(module, debug):
-    """Propagate debug to specific modules that need it"""
-    for name, submodule in module.named_modules():
-        class_name = submodule.__class__.__name__
-        # Only target the specific modules that actually use debug
-        if class_name in ('ResnetBlock3D', 'Upsample3D', 'InflatedCausalConv3d', 'GroupNorm'):
-            submodule.debug = debug
+def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
+                    handle_prefix: str = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
+    """
+    Load GGUF state dict
+    """
+    reader = gguf.GGUFReader(checkpoint_path)
+
+    # Filter and strip prefix
+    has_prefix = False
+    if handle_prefix is not None:
+        prefix_len = len(handle_prefix)
+        tensor_names = set(tensor.name for tensor in reader.tensors)
+        has_prefix = any(s.startswith(handle_prefix) for s in tensor_names)
+        
+    tensors = []
+    for tensor in reader.tensors:
+        sd_key = tensor_name = tensor.name
+        if has_prefix:
+            if not tensor_name.startswith(handle_prefix):
+                continue
+            sd_key = tensor_name[prefix_len:]
+        tensors.append((sd_key, tensor))
+
+    state_dict = {}
+    total_tensors = len(reader.tensors)
+    
+    debug.log(f"Loading {total_tensors} tensors to {device}...", category="dit")
+    
+    for i, (sd_key, tensor) in enumerate(tensors):
+        tensor_name = tensor.name
+        
+        # Load tensor data with warnings suppressed
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            # Create tensor on CPU but immediately move to GPU to minimize RAM usage
+            torch_tensor = torch.from_numpy(tensor.data).to(device, non_blocking=True)
+            
+        # Get original shape from metadata or infer from tensor shape
+        shape = _get_tensor_logical_shape(reader, tensor_name)
+        if shape is None:
+            shape = torch.Size(tuple(int(v) for v in reversed(tensor.shape)))
+            
+        # Handle tensors based on quantization type
+        if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+            # For unquantized tensors, just reshape
+            torch_tensor = torch_tensor.view(*shape)
+        else:
+            # For quantized tensors, keep them quantized but track original shape
+            torch_tensor = GGUFTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape, debug=debug)
+            
+        state_dict[sd_key] = torch_tensor
+        
+        # Progress reporting
+        if (i + 1) % 100 == 0:
+            debug.log(f"    Loaded {i+1}/{total_tensors} tensors...", category="dit")
+            clear_memory(debug=debug, deep=False, force=False, timer_name=f"gguf_tensors_load{i+1}")
+
+    debug.log(f"Successfully loaded {len(state_dict)} tensors to {device}", category="success")
+    return state_dict
 
 
-def configure_model_inference(runner, model_type, device, checkpoint_path, config, 
-                             preserve_vram=False, debug=None, block_swap_config=None,
-                             override_dtype=None):
+def _get_tensor_logical_shape(reader: 'gguf.GGUFReader', tensor_name: str) -> Optional[torch.Size]:
+    """
+    Extract the logical (unquantized) shape from GGUF metadata
+    """
+    field_key = f"comfy.gguf.orig_shape.{tensor_name}"
+    field = reader.get_field(field_key)
+    if field is None:
+        return None
+    # Has original shape metadata, so we try to decode it.
+    if len(field.types) != 2 or field.types[0] != gguf.GGUFValueType.ARRAY or field.types[1] != gguf.GGUFValueType.INT32:
+        raise TypeError(f"Bad original shape metadata for {field_key}: Expected ARRAY of INT32, got {field.types}")
+    return torch.Size(tuple(int(field.parts[part_idx][0]) for part_idx in field.data))
+
+
+class GGUFTensor(torch.Tensor):
+    """
+    Tensor wrapper for GGUF quantized tensors that preserves quantization info
+    """
+    def __init__(self, *args, tensor_type, tensor_shape, **kwargs):
+        super().__init__()
+        self.tensor_type = tensor_type
+        self.tensor_shape = tensor_shape
+        
+    def __new__(cls, *args, tensor_type, tensor_shape, debug, **kwargs):
+        # Create tensor with requires_grad=False to avoid gradient issues
+        tensor = super().__new__(cls, *args, **kwargs)
+        tensor.requires_grad_(False)
+        tensor.tensor_type = tensor_type
+        tensor.tensor_shape = tensor_shape
+        tensor.debug = debug
+        return tensor
+    
+    def to(self, *args, **kwargs):
+        new = super().to(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
+        new.debug = getattr(self, "debug", None)
+        new.requires_grad_(False)  # Ensure no gradients
+        return new
+    
+    @property
+    def shape(self):
+        # Always return the logical tensor shape, not the quantized data shape
+        if hasattr(self, "tensor_shape"):
+            return self.tensor_shape
+        else:
+            # Fallback to actual data shape if tensor_shape is not available
+            return self.size()
+        
+    def size(self, *args):
+        # Override size() to also return logical shape
+        if hasattr(self, "tensor_shape") and len(args) == 0:
+            return self.tensor_shape
+        elif hasattr(self, "tensor_shape") and len(args) == 1:
+            return self.tensor_shape[args[0]]
+        else:
+            return super().size(*args)
+        
+    def dequantize(self, device=None, dtype=torch.float16, dequant_dtype=None):
+        """Dequantize this tensor to its original shape"""
+        if device is None:
+            device = self.device
+            
+        # Check if already unquantized
+        if self.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+            # Return regular tensor, not GGUFTensor
+            result = self.to(device, dtype)
+            if isinstance(result, GGUFTensor):
+                # Convert to regular tensor to avoid __torch_function__ calls
+                result = torch.tensor(result.data, dtype=dtype, device=device, requires_grad=False)
+            return result
+        
+        # Try fast dequantization with crash protection
+        try:
+            result = dequantize_tensor(self, dtype, dequant_dtype)
+            final_result = result.to(device)
+            
+            # Ensure we return a regular tensor, not GGUFTensor
+            if isinstance(final_result, GGUFTensor):
+                final_result = torch.tensor(final_result.data, dtype=dtype, device=device, requires_grad=False)
+                
+            return final_result
+        except Exception as e:
+            self.debug.log(f"Fast dequantization failed: {e}", category="warning")
+            self.debug.log(f"Falling back to numpy dequantization", category="model")
+            
+        # Fallback to numpy (slower but reliable)
+        try:
+            numpy_data = self.cpu().numpy()
+            dequantized = gguf.quants.dequantize(numpy_data, self.tensor_type)
+            result = torch.from_numpy(dequantized).to(device, dtype)
+            result.requires_grad_(False)
+            final_result = result.reshape(self.tensor_shape)
+            
+            # Ensure we return a regular tensor
+            if isinstance(final_result, GGUFTensor):
+                final_result = torch.tensor(final_result.data, dtype=dtype, device=device, requires_grad=False)
+                
+            return final_result
+        except Exception as e:
+            self.debug.log(f"Numpy fallback also failed: {e}", category="warning")
+            self.debug.log(f"   Tensor type: {self.tensor_type}")
+            self.debug.log(f"   Shape: {self.shape}")
+            self.debug.log(f"   Target shape: {self.tensor_shape}")
+            traceback.print_exc()
+            
+            # Return regular tensor as last resort
+            result = self.to(device, dtype)
+            if isinstance(result, GGUFTensor):
+                result = torch.tensor(result.data, dtype=dtype, device=device, requires_grad=False)
+            return result
+        
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        """Override torch function calls to automatically dequantize"""
+        if kwargs is None:
+            kwargs = {}
+            
+        # Check if the tensor is fully constructed and still quantized
+        tensor_type = getattr(self, 'tensor_type', None)
+        if tensor_type is None:
+            # Tensor is either being constructed or already dequantized, delegate to parent
+            return super().__torch_function__(func, types, args, kwargs)
+        
+        # Check if tensor is already unquantized (F32/F16)
+        if tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+            # Unquantized, delegate to parent
+            return super().__torch_function__(func, types, args, kwargs)
+        
+        # Check if this is a linear function call
+        if func == torch.nn.functional.linear:
+            # Dequantize the weight (self) before calling linear
+            if len(args) >= 2 and args[1] is self:  # weight is the second argument
+                try:
+                    dequantized_weight = self.dequantize(device=args[0].device, dtype=args[0].dtype)
+                    # Replace the weight with dequantized version
+                    new_args = (args[0], dequantized_weight) + args[2:]
+                    return func(*new_args, **kwargs)
+                except Exception as e:
+                    self.debug.log(f"Error in linear dequantization: {e}", category="warning")
+                    self.debug.log(f"  Function: {func}")
+                    self.debug.log(f"  Args: {[arg.shape if hasattr(arg, 'shape') else type(arg) for arg in args]}")
+                    raise
+                    
+        # For tensor operations that might need dequantization, dequantize first
+        if func in [torch.matmul, torch.mm, torch.bmm, torch.addmm]:
+            try:
+                dequantized_self = self.dequantize()
+                # Replace self with dequantized version in args
+                new_args = tuple(dequantized_self if arg is self else arg for arg in args)
+                return func(*new_args, **kwargs)
+            except Exception as e:
+                self.debug.log(f"Error in {func.__name__} dequantization: {e}", category="warning")
+                raise
+                
+        # For other operations, delegate to parent without dequantization
+        return super().__torch_function__(func, types, args, kwargs)
+
+
+def configure_model_inference(runner: VideoDiffusionInfer, model_type: str, device: str, 
+                             checkpoint_path: str, config: OmegaConf, 
+                             preserve_vram: bool = False, debug: Optional[Debug] = None, 
+                             block_swap_config: Optional[Dict[str, any]] = None,
+                             override_dtype: Optional[torch.dtype] = None) -> VideoDiffusionInfer:
     """
     Configure DiT or VAE model for inference with optimized memory management.
     
@@ -299,8 +555,9 @@ def configure_model_inference(runner, model_type, device, checkpoint_path, confi
     use_cpu = preserve_vram or blockswap_active
     target_device = "cpu" if use_cpu else device
     
-    # Always use meta initialization for optimal memory usage (avoids double allocation)
-    use_meta_init = True
+    # For GGUF models, avoid meta init to prevent shape/device issues
+    # GGUF models need direct creation on target device
+    use_meta_init = not checkpoint_path.endswith('.gguf')
 
     # Create descriptive reason string for logging
     cpu_reason = ""
@@ -323,7 +580,8 @@ def configure_model_inference(runner, model_type, device, checkpoint_path, confi
     return runner
 
 
-def _create_model(model_config, target_device, use_meta_init, model_type, debug):
+def _create_model(model_config: OmegaConf, target_device: str, use_meta_init: bool, 
+                 model_type: str, debug: Debug):
     """
     Create model with optimized initialization strategy.
     
@@ -362,8 +620,9 @@ def _create_model(model_config, target_device, use_meta_init, model_type, debug)
     return model
 
 
-def _load_model_weights(model, checkpoint_path, target_device, used_meta, 
-                       model_type, cpu_reason, debug, override_dtype=None):
+def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: str, 
+                       used_meta: bool, model_type: str, cpu_reason: str, debug: Debug, 
+                       override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """
     Load and apply model weights with appropriate strategy.
     
@@ -395,7 +654,7 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
                  category=model_type_lower, force=True)
     
     debug.start_timer(f"{model_type_lower}_weights_load")
-    state = load_quantized_state_dict(checkpoint_path, target_device)
+    state = load_quantized_state_dict(checkpoint_path, target_device, debug)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
     # Convert dtype if requested
@@ -413,19 +672,168 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
     action_verb = "Materializing" if used_meta else "Applying"
     debug.log(f"{action_verb} {model_type}: {num_params} parameters, {total_size_mb:.2f}MB total", 
              category=model_type_lower)
-    
-    # Load state dict - this materializes the model if it's on meta device
-    debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=False, assign=True)
 
-    if used_meta:
-        debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
+    if checkpoint_path.endswith('.gguf'):
+        debug.log("Loading GGUF model - keeping tensors quantized...", category="dit")
+        
+        # Check for architecture mismatch first
+        model_state = model.state_dict()
+        
+        # Check a few key parameters to detect architecture mismatch
+        key_params_to_check = [
+            "blocks.0.attn.proj_qkv.vid.weight",
+            "blocks.0.attn.proj_qkv.txt.weight", 
+            "blocks.0.mlp.vid.proj_in.weight"
+        ]
+        
+        architecture_mismatch = False
+        for key in key_params_to_check:
+            if key in state and key in model_state:
+                model_shape = model_state[key].shape
+                gguf_param = state[key]
+                
+                # Use tensor_shape if available, otherwise use shape
+                gguf_shape = gguf_param.tensor_shape if hasattr(gguf_param, 'tensor_shape') else gguf_param.shape
+                
+                if model_shape != gguf_shape:
+                    #debug.log(f"Shape mismatch detected!", category="error")
+                    #debug.log(f"   Parameter: {key}")
+                    #debug.log(f"   Model expects: {model_shape}")
+                    #debug.log(f"   GGUF provides: {gguf_shape}")
+                    
+                    # Check if this is a quantization issue rather than architecture mismatch
+                    if hasattr(gguf_param, 'tensor_type') and gguf_param.tensor_type not in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+                        #debug.log(f"   This is a quantized tensor - the shape difference might be due to quantization")
+                        #debug.log(f"   Raw tensor shape: {gguf_param.shape}")
+                        #debug.log(f"   Logical tensor shape: {gguf_shape}")
+                        
+                        # For quantized tensors, we should use the logical shape, not the raw shape
+                        if hasattr(gguf_param, 'tensor_shape') and gguf_param.tensor_shape == model_shape:
+                            #debug.log(f"   ✅ Logical shapes match, continuing with quantized tensor")
+                            continue
+                        
+                    architecture_mismatch = True
+                    break
+                
+        debug.log(f"Architecture check complete. Mismatch: {architecture_mismatch}", category="info")
+        
+        if architecture_mismatch:
+            error_msg = (
+                f"GGUF model architecture mismatch: This GGUF model is incompatible with the current 7B architecture.\n\n"
+                f"Possible solutions:\n"
+                f"1. Use a GGUF model that matches the 7B architecture (3072 dimensions)\n"
+                f"2. The current GGUF model appears to be from a 3B model (1728 dimensions)\n"
+                f"3. Try using a regular FP16 model instead: 'seedvr2_ema_7b_fp16.safetensors'\n"
+                f"4. Check if you have a compatible GGUF model for the 7B architecture\n\n"
+                f"The model configuration is expecting 7B dimensions but the GGUF provides different dimensions."
+            )
+            raise ValueError(error_msg)
+            
+        # If we get here, shapes should match - load without converting
+        loaded_params = set()
+        quantized_params = 0
+        
+        for name, param in state.items():
+            if name in model_state:
+                model_param = model_state[name]
+                
+                # Verify shape match
+                param_shape = param.tensor_shape if hasattr(param, 'tensor_shape') else param.shape
+                if param_shape == model_param.shape:
+                    # Debug output for parameter loading
+                    #if hasattr(param, 'tensor_type') and debug:
+                        #debug.log(f"Loading quantized parameter: {name}", category="info")
+                        #debug.log(f"   Shape: {param_shape}")
+                        #debug.log(f"   Type: {param.tensor_type}")
+                        
+                    # Replace the parameter with quantized version - NO CONVERSION
+                    with torch.no_grad():
+                        if hasattr(param, 'tensor_type'):
+                            # Keep quantized tensor as-is - navigate to the actual parameter
+                            module = model
+                            param_path = name.split('.')
+                            
+                            # Navigate to the parent module
+                            for attr in param_path[:-1]:
+                                module = getattr(module, attr)
+                                
+                            # Replace the parameter directly - preserve GGUFTensor attributes
+                            param_name = param_path[-1]
+                            
+                            # Create a parameter that preserves GGUFTensor attributes
+                            if hasattr(param, 'tensor_type') and hasattr(param, 'tensor_shape'):
+                                # Create a new parameter but preserve the GGUFTensor attributes
+                                # Use the tensor directly, not .data, to avoid triggering dequantization
+                                new_param = torch.nn.Parameter(param, requires_grad=False)
+                                new_param.tensor_type = param.tensor_type
+                                new_param.tensor_shape = param.tensor_shape
+                                
+                                # Add custom dequantize method to the parameter
+                                # We need to capture the original tensor and its methods
+                                original_tensor = param
+                                def gguf_dequantize(device=None, dtype=torch.float16):
+                                    # Use the original GGUFTensor's dequantize method
+                                    if hasattr(original_tensor, 'dequantize'):
+                                        return original_tensor.dequantize(device, dtype)
+                                    else:
+                                        # Fallback: manually dequantize using gguf
+                                        try:
+                                            numpy_data = original_tensor.cpu().numpy()
+                                            dequantized = gguf.quants.dequantize(numpy_data, original_tensor.tensor_type)
+                                            result = torch.from_numpy(dequantized).to(device, dtype)
+                                            result.requires_grad_(False)
+                                            result = result.reshape(original_tensor.tensor_shape)
+                                            return result
+                                        except Exception as e:
+                                            debug.log(f"Warning: Could not dequantize tensor: {e}", category="warning")
+                                            return original_tensor.to(device, dtype)
+                                new_param.gguf_dequantize = gguf_dequantize
+                                
+                                setattr(module, param_name, new_param)
+                            else:
+                                setattr(module, param_name, torch.nn.Parameter(param, requires_grad=False))
+                                
+                            quantized_params += 1
+                        else:
+                            # Regular tensor copy
+                            model_param.copy_(param)
+                    loaded_params.add(name)
+                else:
+                    debug.log(f"Unexpected shape mismatch for {name}: {param_shape} vs {model_param.shape}", category="error")
+                    raise ValueError(f"Shape mismatch for parameter {name}")
+                    
+        debug.log(f"GGUF loading complete: {len(loaded_params)} parameters loaded", category="success")
+        debug.log(f"Quantized parameters: {quantized_params}", category="memory")
+        debug.log(f"VRAM savings: Tensors kept in quantized format", category="memory")
+        
+        # Debug: check for shape mismatches
+        unmatched_params = []
+        for name, param in state.items():
+            if name not in model_state:
+                unmatched_params.append(name)
+        if unmatched_params:
+            debug.log(f"Warning: {len(unmatched_params)} parameters from GGUF not found in model", category="warning")
+            debug.log(f"   First few unmatched: {unmatched_params[:5]}")
+            
+        missing_params = []
+        for name in model_state:
+            if name not in loaded_params:
+                missing_params.append(name)
+        if missing_params:
+            debug.log(f"Warning: {len(missing_params)} model parameters not loaded from GGUF", category="warning")
+            debug.log(f"   First few missing: {missing_params[:5]}")
+
     else:
-        debug.log(f"{model_type} weights applied", category=model_type_lower)
+        # Load state dict - this materializes the model if it's on meta device
+        debug.start_timer(f"{model_type_lower}_state_apply")
+        model.load_state_dict(state, strict=False, assign=True)
+        debug.end_timer(f"{model_type_lower}_state_apply", 
+                    f"{model_type} weights {'materialized' if used_meta else 'applied'}")
+        if used_meta:
+            debug.log(f"{model_type} materialized directly from meta with loaded weights", category=model_type_lower)
+        else:
+            debug.log(f"{model_type} weights applied", category=model_type_lower)
 
-    debug.end_timer(f"{model_type_lower}_state_apply", 
-                f"{model_type} weights {'materialized' if used_meta else 'applied'}")
-    
     # Clean up state dict to free memory
     del state
     
@@ -440,7 +848,7 @@ def _load_model_weights(model, checkpoint_path, target_device, used_meta,
     return model
 
 
-def _initialize_meta_buffers(model, target_device, debug):
+def _initialize_meta_buffers(model: torch.nn.Module, target_device: str, debug: Optional[Debug]) -> int:
     """
     Initialize any buffers still on meta device after materialization.
     
@@ -481,7 +889,9 @@ def _initialize_meta_buffers(model, target_device, debug):
     return initialized_count
 
 
-def _apply_model_specific_config(model, runner, config, is_dit, debug):
+def _apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionInfer, 
+                                config: OmegaConf, is_dit: bool, 
+                                debug: Optional[Debug]) -> torch.nn.Module:
     """
     Apply model-specific configurations and attach to runner.
     
@@ -528,7 +938,7 @@ def _apply_model_specific_config(model, runner, config, is_dit, debug):
     return model
 
 
-def _propagate_debug_to_modules(module, debug):
+def _propagate_debug_to_modules(module: torch.nn.Module, debug: Optional[Debug]) -> None:
     """
     Propagate debug instance to specific submodules that need it.
     

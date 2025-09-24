@@ -9,6 +9,7 @@ import argparse
 import time
 import platform
 import multiprocessing as mp
+from typing import Dict, Any, List, Optional, Tuple
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -49,7 +50,8 @@ from src.utils.debug import Debug
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
 
-def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, prepend_frames=0):
+def extract_frames_from_video(video_path: str, skip_first_frames: int = 0, 
+                            load_cap: Optional[int] = None, prepend_frames: int = 0) -> Tuple[torch.Tensor, float]:
     """
     Extract frames from video and convert to tensor format
     
@@ -143,7 +145,7 @@ def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, pr
     return frames_tensor, fps
 
 
-def save_frames_to_video(frames_tensor, output_path, fps=30.0):
+def save_frames_to_video(frames_tensor: torch.Tensor, output_path: str, fps: float = 30.0) -> None:
     """
     Save frames tensor to video file
     
@@ -185,7 +187,7 @@ def save_frames_to_video(frames_tensor, output_path, fps=30.0):
     debug.log(f"Video saved successfully: {output_path}", category="success")
 
 
-def save_frames_to_png(frames_tensor, output_dir, base_name):
+def save_frames_to_png(frames_tensor: torch.Tensor, output_dir: str, base_name: str) -> None:
     """
     Save frames tensor as sequential PNG images.
 
@@ -216,7 +218,7 @@ def save_frames_to_png(frames_tensor, output_dir, base_name):
     debug.log(f"PNG saving completed: {total} files in '{output_dir}'", category="success")
 
 
-def apply_temporal_overlap_blending(frames_tensor, batch_size, overlap):
+def apply_temporal_overlap_blending(frames_tensor: torch.Tensor, batch_size: int, overlap: int) -> torch.Tensor:
     """
     Blend frames with temporal overlap in pixel space and remove duplicates.
     Args:
@@ -275,7 +277,8 @@ def apply_temporal_overlap_blending(frames_tensor, batch_size, overlap):
     return output
 
 
-def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
+def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray, 
+                   shared_args: Dict[str, Any], return_queue: mp.Queue) -> None:
     """Worker process that performs upscaling on a slice of frames using a dedicated GPU."""
     if platform.system() != "Darwin":
         # 1. Limit CUDA visibility to the chosen GPU BEFORE importing torch-heavy deps
@@ -357,7 +360,8 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
     return_queue.put((proc_idx, result_tensor.cpu().numpy()))
 
 
-def _gpu_processing(frames_tensor, device_list, args):
+def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str], 
+                   args: argparse.Namespace) -> torch.Tensor:
     """Split frames and process them in parallel on multiple GPUs."""
     num_devices = len(device_list)
     total_frames = frames_tensor.shape[0]
@@ -483,7 +487,7 @@ class OneOrTwoValues(argparse.Action):
             parser.error(f"{option_string} arguments must be integers")
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
     
@@ -500,7 +504,22 @@ def parse_arguments():
                             "seedvr2_ema_3b_fp16.safetensors",
                             "seedvr2_ema_3b_fp8_e4m3fn.safetensors", 
                             "seedvr2_ema_7b_fp16.safetensors",
-                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors"
+                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors",
+                            "seedvr2_ema_3b-Q3_K_M.gguf",
+                            "seedvr2_ema_3b-Q4_K_M.gguf",
+                            "seedvr2_ema_3b-Q5_K_M.gguf",
+                            "seedvr2_ema_3b-Q6_K_M.gguf",
+                            "seedvr2_ema_3b-Q8_K_M.gguf",
+                            "seedvr2_ema_7b-Q3_K_M.gguf",
+                            "seedvr2_ema_7b-Q4_K_M.gguf",
+                            "seedvr2_ema_7b-Q5_K_M.gguf",
+                            "seedvr2_ema_7b-Q6_K_M.gguf",
+                            "seedvr2_ema_7b-Q8_K_M.gguf",
+                            "seedvr2_ema_7b_sharp-Q3_K_M.gguf",
+                            "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
+                            "seedvr2_ema_7b_sharp-Q5_K_M.gguf",
+                            "seedvr2_ema_7b_sharp-Q6_K_M.gguf",
+                            "seedvr2_ema_7b_sharp-Q8_K_M.gguf"
                         ],
                         help="Model to use (default: 3B FP8)")
     parser.add_argument("--model_dir", type=str, default="seedvr2_models",
@@ -546,7 +565,7 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     """Main CLI function"""
     debug.log(f"SeedVR2 Video Upscaler CLI started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", category="dit", force=True)
     

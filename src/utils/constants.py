@@ -4,14 +4,20 @@ Only includes constants actually used in the codebase
 """
 
 import os
+from typing import Optional
 
 # Model folder names
 SEEDVR2_FOLDER_NAME = "SEEDVR2"  # Physical folder name on disk
 SEEDVR2_MODEL_TYPE = "seedvr2"   # Model type identifier for ComfyUI
 
 # Supported model file formats
-#SUPPORTED_MODEL_EXTENSIONS = {'.safetensors', '.gguf'}
-SUPPORTED_MODEL_EXTENSIONS = {'.safetensors'}
+SUPPORTED_MODEL_EXTENSIONS = {'.safetensors', '.gguf'}
+
+# GGUF Quantization Constants
+QK_K = 256
+K_SCALE_SIZE = 12
+GGUF_BLOCK_SIZE = 32
+GGUF_TYPE_SIZE = 64
 
 # Download configuration
 HUGGINGFACE_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
@@ -19,12 +25,12 @@ DOWNLOAD_CHUNK_SIZE = 8192 * 1024  # 8MB chunks for hash calculation
 DOWNLOAD_MAX_RETRIES = 3
 DOWNLOAD_RETRY_DELAY = 2  # seconds
 
-def get_script_directory():
+def get_script_directory() -> str:
     """Get the root script directory path (3 levels up from this file)"""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def get_base_cache_dir():
+def get_base_cache_dir() -> str:
     """Get or create the model cache directory"""
     try:
         import folder_paths # only works if comfyui is available
@@ -37,7 +43,7 @@ def get_base_cache_dir():
     return cache_dir
 
 
-def get_all_model_paths():
+def get_all_model_paths() -> list:
     """Get all registered model paths including those from extra_model_paths.yaml"""
     try:
         import folder_paths
@@ -50,7 +56,7 @@ def get_all_model_paths():
         return [get_base_cache_dir()]
 
 
-def get_all_model_files():
+def get_all_model_files() -> dict:
     """
     Get a mapping of all model files to their full paths across all registered directories.
     
@@ -70,7 +76,8 @@ def get_all_model_files():
     
     return model_files
 
-def find_model_file(filename, fallback_dir=None):
+
+def find_model_file(filename: str, fallback_dir: Optional[str] = None) -> str:
     """
     Find a model file in any registered path.
     
@@ -95,7 +102,7 @@ def find_model_file(filename, fallback_dir=None):
         return os.path.join(get_base_cache_dir(), filename)
 
 
-def get_validation_cache_path():
+def get_validation_cache_path() -> str:
     """Get path to model validation cache file"""
     cache_dir = get_base_cache_dir()
     return os.path.join(cache_dir, ".validation_cache.json")
