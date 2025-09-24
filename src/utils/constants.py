@@ -4,6 +4,7 @@ Only includes constants actually used in the codebase
 """
 
 import os
+import warnings
 from typing import Optional
 
 # Model folder names
@@ -111,3 +112,12 @@ def get_validation_cache_path() -> str:
 def is_supported_model_file(filename: str) -> bool:
     """Check if a file has a supported model extension"""
     return any(filename.endswith(ext) for ext in SUPPORTED_MODEL_EXTENSIONS)
+
+
+def suppress_tensor_warnings() -> None:
+    """
+    Suppress common tensor conversion and numpy array warnings that are expected behavior
+    when working with GGUF tensors and numpy arrays.
+    """
+    warnings.filterwarnings("ignore", message="To copy construct from a tensor", category=UserWarning)
+    warnings.filterwarnings("ignore", message="The given NumPy array is not writable", category=UserWarning)

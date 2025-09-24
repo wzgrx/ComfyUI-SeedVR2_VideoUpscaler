@@ -640,23 +640,9 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     if debug:
         debug.start_timer(timer_name)
     
-    # Check if this is a GGUF model that might still be on meta device
-    if hasattr(model, '_is_gguf_model') and model._is_gguf_model:
-        # Check for any meta tensors
-        has_meta = any(p.is_meta for p in model.parameters())
-        if has_meta:
-            debug.log(f"GGUF model has meta tensors, using to_empty for movement", category="warning")
-            # This shouldn't happen if GGUF loading is fixed, but handle it gracefully
-            model = model.to_empty(device=target_device)
-            model.zero_grad(set_to_none=True)
-        else:
-            # Normal movement for properly materialized GGUF
-            model.to(target_device)
-            model.zero_grad(set_to_none=True)
-    else:
-        # Normal movement for non-GGUF models
-        model.to(target_device)
-        model.zero_grad(set_to_none=True)
+    # Move model and clear gradients
+    model.to(target_device)
+    model.zero_grad(set_to_none=True)
     
     # Clear VAE memory buffers when moving to CPU
     if target_type == 'cpu' and model_name == "VAE":

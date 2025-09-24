@@ -5,9 +5,9 @@ Optimized for SeedVR2 with proper debug logging and error handling
 """
 import torch
 import traceback
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from ..utils.debug import Debug
-from ..utils.constants import QK_K, K_SCALE_SIZE
+from ..utils.constants import QK_K, K_SCALE_SIZE, suppress_tensor_warnings
 
 # Import GGUF with fallback
 try:
@@ -47,6 +47,9 @@ def dequantize_tensor(tensor: torch.Tensor, dtype: Optional[torch.dtype] = None,
     """
     qtype = getattr(tensor, "tensor_type", None)
     oshape = getattr(tensor, "tensor_shape", tensor.shape)
+    
+    # Suppress tensor copy warning - we intentionally convert GGUFTensor to regular tensor
+    suppress_tensor_warnings()
 
     if qtype in TORCH_COMPATIBLE_QTYPES:
         result = tensor.to(dtype)
@@ -79,9 +82,24 @@ def dequantize(data: torch.Tensor, qtype: 'gguf.GGMLQuantizationType',
         data: Quantized data to dequantize
         qtype: GGUF quantization type
         oshape: Original shape to restore
-        dtype: Target dtype
+        dtype: Target dtype (default: torch.float16)
         debug: Optional Debug instance for logging
+        
+    Returns:
+        Dequantized tensor in original shape
+        
+    Raises:
+        ValueError: If quantization type is not supported
+        RuntimeError: If dequantization fails
     """
+    if not GGUF_AVAILABLE:
+        raise RuntimeError("GGUF not available but dequantize was called")
+        
+    if dtype is None:
+        dtype = torch.float16
+        
+    if qtype not in dequantize_functions:
+        raise ValueError(f"Unsupported quantization type: {qtype}")
     try:
         if debug:
             debug.start_timer(f"dequant_{qtype.name if hasattr(qtype, 'name') else qtype}")
@@ -98,9 +116,10 @@ def dequantize(data: torch.Tensor, qtype: 'gguf.GGMLQuantizationType',
         # Calculate number of blocks
         n_blocks = rows.numel() // type_size
         if rows.numel() % type_size != 0:
+            error_msg = f"Data size {rows.numel()} not divisible by type_size {type_size}. This usually indicates corrupted GGUF data."
             if debug:
-                debug.log(f"Warning: Data size {rows.numel()} not divisible by type_size {type_size}", 
-                         level="WARNING", category="precision", force=True)
+                debug.log(error_msg, level="ERROR", category="precision", force=True)
+            raise ValueError(error_msg)
         blocks = rows.reshape((n_blocks, type_size))
         
         # Call the dequantization function
@@ -134,13 +153,13 @@ def to_uint32(x: torch.Tensor) -> torch.Tensor:
     return (x[:, 0] | x[:, 1] << 8 | x[:, 2] << 16 | x[:, 3] << 24).unsqueeze(1)
 
 
-def split_block_dims(blocks: torch.Tensor, *args: int) -> list[torch.Tensor]:
+def split_block_dims(blocks: torch.Tensor, *args: int) -> List[torch.Tensor]:
     n_max = blocks.shape[1]
     dims = list(args) + [n_max - sum(args)]
     return torch.split(blocks, dims, dim=1)
 
 
-def get_scale_min(scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def get_scale_min(scales: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     n_blocks = scales.shape[0]
     scales = scales.view(torch.uint8)
     scales = scales.reshape((n_blocks, 3, 4))

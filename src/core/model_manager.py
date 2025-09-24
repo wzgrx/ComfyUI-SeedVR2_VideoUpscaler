@@ -35,7 +35,6 @@ from ..utils.debug import Debug
 try:
     import gguf
     from gguf import GGMLQuantizationType
-    import warnings
     import traceback
     from ..optimization.gguf_dequant import dequantize_tensor
     GGUF_AVAILABLE = True
@@ -43,7 +42,7 @@ except ImportError:
     GGUF_AVAILABLE = False
     GGMLQuantizationType = None
 
-from ..utils.constants import get_script_directory, find_model_file
+from ..utils.constants import get_script_directory, find_model_file, suppress_tensor_warnings
 from ..optimization.memory_manager import clear_memory
 from ..optimization.compatibility import FP8CompatibleDiT
 from ..common.config import load_config, create_object
@@ -56,7 +55,7 @@ script_directory = get_script_directory()
 
 
 def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = False, debug: Optional[Debug] = None, 
-                    cache_model: bool = False, block_swap_config: Optional[Dict[str, any]] = None, 
+                    cache_model: bool = False, block_swap_config: Optional[Dict[str, Any]] = None, 
                     cached_runner: Optional[VideoDiffusionInfer] = None, vae_tiling_enabled: bool = False,
                     vae_tile_size: Optional[Tuple[int, int]] = None, 
                     vae_tile_overlap: Optional[Tuple[int, int]] = None) -> VideoDiffusionInfer:
@@ -322,14 +321,14 @@ def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
     
     debug.log(f"Loading {total_tensors} tensors to {device}...", category="dit")
     
+    # Suppress expected warnings: GGUF tensors are read-only numpy arrays that trigger warnings when converted
+    suppress_tensor_warnings()
+    
     for i, (sd_key, tensor) in enumerate(tensors):
         tensor_name = tensor.name
         
-        # Load tensor data with warnings suppressed
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            # Create tensor on CPU but immediately move to GPU to minimize RAM usage
-            torch_tensor = torch.from_numpy(tensor.data).to(device, non_blocking=True)
+        # Create tensor on CPU but immediately move to GPU to minimize RAM usage
+        torch_tensor = torch.from_numpy(tensor.data).to(device, non_blocking=True)
             
         # Get original shape from metadata or infer from tensor shape
         shape = _get_tensor_logical_shape(reader, tensor_name)
@@ -349,9 +348,17 @@ def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
         # Progress reporting
         if (i + 1) % 100 == 0:
             debug.log(f"    Loaded {i+1}/{total_tensors} tensors...", category="dit")
+            debug.log_memory_state(f"After Loaded {i+1}/{total_tensors} tensors...", detailed_tensors=False)
             clear_memory(debug=debug, deep=False, force=False, timer_name=f"gguf_tensors_load{i+1}")
+            debug.log_memory_state(f"After Loaded {i+1}/{total_tensors} cleanup", detailed_tensors=False)
 
     debug.log(f"Successfully loaded {len(state_dict)} tensors to {device}", category="success")
+
+    debug.log_memory_state(f"After Successfully loaded {len(state_dict)} tensors...", detailed_tensors=False)
+    # Cleanup
+    clear_memory(debug=debug, deep=True, force=True, timer_name="gguf_final_cleanup")
+    debug.log_memory_state(f"After Successfully loaded {len(state_dict)} cleanup", detailed_tensors=False)
+
     return state_dict
 
 
@@ -390,7 +397,7 @@ class GGUFTensor(torch.Tensor):
     def to(self, *args, **kwargs):
         new = super().to(*args, **kwargs)
         new.tensor_type = getattr(self, "tensor_type", None)
-        new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
+        new.tensor_shape = getattr(self, "tensor_shape", self.tensor_shape if hasattr(self, "tensor_shape") else new.shape)
         new.debug = getattr(self, "debug", None)
         new.requires_grad_(False)  # Ensure no gradients
         return new
@@ -418,13 +425,16 @@ class GGUFTensor(torch.Tensor):
         if device is None:
             device = self.device
             
+        # Suppress expected warning when converting from GGUFTensor subclass to regular tensor
+        suppress_tensor_warnings()
+
         # Check if already unquantized
         if self.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             # Return regular tensor, not GGUFTensor
             result = self.to(device, dtype)
             if isinstance(result, GGUFTensor):
                 # Convert to regular tensor to avoid __torch_function__ calls
-                result = torch.tensor(result.data, dtype=dtype, device=device, requires_grad=False)
+                result = torch.tensor(result, dtype=dtype, device=device, requires_grad=False)
             return result
         
         # Try fast dequantization with crash protection
@@ -448,11 +458,7 @@ class GGUFTensor(torch.Tensor):
             result = torch.from_numpy(dequantized).to(device, dtype)
             result.requires_grad_(False)
             final_result = result.reshape(self.tensor_shape)
-            
-            # Ensure we return a regular tensor
-            if isinstance(final_result, GGUFTensor):
-                final_result = torch.tensor(final_result.data, dtype=dtype, device=device, requires_grad=False)
-                
+            # from_numpy already returns a regular tensor, no conversion needed
             return final_result
         except Exception as e:
             self.debug.log(f"Numpy fallback also failed: {e}", category="warning")
@@ -471,52 +477,55 @@ class GGUFTensor(torch.Tensor):
         """Override torch function calls to automatically dequantize"""
         if kwargs is None:
             kwargs = {}
-            
+        
         # Check if the tensor is fully constructed and still quantized
         tensor_type = getattr(self, 'tensor_type', None)
         if tensor_type is None:
-            # Tensor is either being constructed or already dequantized, delegate to parent
+            # Tensor is either being constructed or already dequantized
             return super().__torch_function__(func, types, args, kwargs)
         
         # Check if tensor is already unquantized (F32/F16)
         if tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
-            # Unquantized, delegate to parent
             return super().__torch_function__(func, types, args, kwargs)
         
-        # Check if this is a linear function call
+        # Check if debug exists before using it
+        debug = getattr(self, 'debug', None)
+        
+        # Handle linear operations specially
         if func == torch.nn.functional.linear:
-            # Dequantize the weight (self) before calling linear
             if len(args) >= 2 and args[1] is self:  # weight is the second argument
                 try:
                     dequantized_weight = self.dequantize(device=args[0].device, dtype=args[0].dtype)
-                    # Replace the weight with dequantized version
                     new_args = (args[0], dequantized_weight) + args[2:]
                     return func(*new_args, **kwargs)
                 except Exception as e:
-                    self.debug.log(f"Error in linear dequantization: {e}", category="warning")
-                    self.debug.log(f"  Function: {func}")
-                    self.debug.log(f"  Args: {[arg.shape if hasattr(arg, 'shape') else type(arg) for arg in args]}")
+                    if debug:
+                        debug.log(f"Error in linear dequantization: {e}", category="warning")
+                        debug.log(f"  Function: {func}")
+                        debug.log(f"  Args: {[arg.shape if hasattr(arg, 'shape') else type(arg) for arg in args]}")
                     raise
-                    
-        # For tensor operations that might need dequantization, dequantize first
-        if func in [torch.matmul, torch.mm, torch.bmm, torch.addmm]:
+        
+        # Handle matrix multiplication operations that need dequantization
+        if func in {torch.matmul, torch.mm, torch.bmm, torch.addmm, torch.addmv,
+                    torch.addr, torch.baddbmm, torch.chain_matmul}:
             try:
                 dequantized_self = self.dequantize()
-                # Replace self with dequantized version in args
                 new_args = tuple(dequantized_self if arg is self else arg for arg in args)
                 return func(*new_args, **kwargs)
             except Exception as e:
-                self.debug.log(f"Error in {func.__name__} dequantization: {e}", category="warning")
+                if debug:
+                    debug.log(f"Error in {func.__name__} dequantization: {e}", category="warning")
                 raise
-                
-        # For other operations, delegate to parent without dequantization
+        
+        # For ALL other operations, delegate to parent WITHOUT dequantization
+        # This includes .cpu(), .to(), .device, .dtype, .shape, etc.
         return super().__torch_function__(func, types, args, kwargs)
 
 
 def configure_model_inference(runner: VideoDiffusionInfer, model_type: str, device: str, 
                              checkpoint_path: str, config: OmegaConf, 
                              preserve_vram: bool = False, debug: Optional[Debug] = None, 
-                             block_swap_config: Optional[Dict[str, any]] = None,
+                             block_swap_config: Optional[Dict[str, Any]] = None,
                              override_dtype: Optional[torch.dtype] = None) -> VideoDiffusionInfer:
     """
     Configure DiT or VAE model for inference with optimized memory management.
@@ -696,22 +705,11 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
                 gguf_shape = gguf_param.tensor_shape if hasattr(gguf_param, 'tensor_shape') else gguf_param.shape
                 
                 if model_shape != gguf_shape:
-                    #debug.log(f"Shape mismatch detected!", category="error")
-                    #debug.log(f"   Parameter: {key}")
-                    #debug.log(f"   Model expects: {model_shape}")
-                    #debug.log(f"   GGUF provides: {gguf_shape}")
-                    
                     # Check if this is a quantization issue rather than architecture mismatch
                     if hasattr(gguf_param, 'tensor_type') and gguf_param.tensor_type not in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
-                        #debug.log(f"   This is a quantized tensor - the shape difference might be due to quantization")
-                        #debug.log(f"   Raw tensor shape: {gguf_param.shape}")
-                        #debug.log(f"   Logical tensor shape: {gguf_shape}")
-                        
                         # For quantized tensors, we should use the logical shape, not the raw shape
                         if hasattr(gguf_param, 'tensor_shape') and gguf_param.tensor_shape == model_shape:
-                            #debug.log(f"   ✅ Logical shapes match, continuing with quantized tensor")
                             continue
-                        
                     architecture_mismatch = True
                     break
                 
@@ -719,14 +717,16 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
         
         if architecture_mismatch:
             error_msg = (
-                f"GGUF model architecture mismatch: This GGUF model is incompatible with the current 7B architecture.\n\n"
-                f"Possible solutions:\n"
-                f"1. Use a GGUF model that matches the 7B architecture (3072 dimensions)\n"
-                f"2. The current GGUF model appears to be from a 3B model (1728 dimensions)\n"
-                f"3. Try using a regular FP16 model instead: 'seedvr2_ema_7b_fp16.safetensors'\n"
-                f"4. Check if you have a compatible GGUF model for the 7B architecture\n\n"
-                f"The model configuration is expecting 7B dimensions but the GGUF provides different dimensions."
-            )
+                        f"GGUF model architecture mismatch: This GGUF model is incompatible with the current architecture.\n\n"
+                        f"Detected mismatch:\n"
+                        f"  Parameter: {key}\n"
+                        f"  Expected shape: {model_shape}\n"
+                        f"  GGUF shape: {gguf_shape}\n\n"
+                        f"Possible solutions:\n"
+                        f"1. Use a GGUF model that matches the current architecture\n"
+                        f"2. Try using a regular FP16 model instead\n"
+                        f"3. Verify you're using the correct model variant (3B vs 7B)\n"
+                    )
             raise ValueError(error_msg)
             
         # If we get here, shapes should match - load without converting
@@ -803,8 +803,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
                     raise ValueError(f"Shape mismatch for parameter {name}")
                     
         debug.log(f"GGUF loading complete: {len(loaded_params)} parameters loaded", category="success")
-        debug.log(f"Quantized parameters: {quantized_params}", category="memory")
-        debug.log(f"VRAM savings: Tensors kept in quantized format", category="memory")
+        debug.log(f"Quantized parameters: {quantized_params}", category="info")
         
         # Debug: check for shape mismatches
         unmatched_params = []
@@ -941,15 +940,18 @@ def _apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionI
 def _propagate_debug_to_modules(module: torch.nn.Module, debug: Optional[Debug]) -> None:
     """
     Propagate debug instance to specific submodules that need it.
-    
     Only targets modules that actually use debug to avoid unnecessary memory overhead.
     
     Args:
         module: Parent module to propagate through
         debug: Debug instance to attach
     """
+    if debug is None:
+        return  # Early exit if no debug instance
+        
     target_modules = {'ResnetBlock3D', 'Upsample3D', 'InflatedCausalConv3d', 'GroupNorm'}
     
     for name, submodule in module.named_modules():
         if submodule.__class__.__name__ in target_modules:
-            submodule.debug = debug
+            if not hasattr(submodule, 'debug'):  # Only set if not already present
+                submodule.debug = debug
