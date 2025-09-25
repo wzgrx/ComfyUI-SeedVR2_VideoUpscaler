@@ -6,7 +6,7 @@ Provides runtime quantization support with proper debug logging and memory manag
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Dict, Tuple
 from ..utils.debug import Debug
 
 # Import GGUF with fallback
@@ -88,6 +88,32 @@ class _GGUFQuantizedBase(nn.Module):
             if self.debug:
                 self.debug.end_timer("gguf_dequant", "Weight dequantization completed")
 
+    def get_dequantized_weight_for_compute(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Get dequantized weight optimized for computation.
+        
+        For GGUF models: Dequantizes to FP16 first (original precision), 
+        then converts to compute dtype to preserve maximum precision.
+        
+        Args:
+            input: Input tensor (used to determine device and compute dtype)
+            
+        Returns:
+            Dequantized weight tensor ready for computation
+        """
+        device = input.device
+        compute_dtype = input.dtype
+        
+        # Dequantize GGUF to FP16 first (original precision), then convert to compute dtype
+        # This preserves maximum precision during dequantization
+        dequant_dtype = torch.float16
+        weight = self.dequantize_weight(device, dequant_dtype)
+        
+        # Convert to compute dtype if different
+        if weight.dtype != compute_dtype:
+            weight = weight.to(compute_dtype)
+            
+        return weight
 
 class GGUFQuantizedLinear(_GGUFQuantizedBase):
     """Quantized Linear layer with on-the-fly dequantization"""
@@ -99,22 +125,18 @@ class GGUFQuantizedLinear(_GGUFQuantizedBase):
         self.out_features = out_features
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        device = input.device
-        dtype = input.dtype
-        
-        # Dequantize weight on-the-fly
-        weight = self.dequantize_weight(device, dtype)
+        # Get precision-optimized weight
+        weight = self.get_dequantized_weight_for_compute(input)
         
         # Validate weight shape after dequantization
         expected_shape = (self.out_features, self.in_features)
         if weight.shape != expected_shape:
             if self.debug:
-                self.debug.log(f"Weight shape mismatch: got {weight.shape}, expected {expected_shape}", 
+                self.debug.log(f"Linear weight shape mismatch: got {weight.shape}, expected {expected_shape}", 
                             level="ERROR", category="precision", force=True)
-            raise RuntimeError(f"Dequantized weight has incorrect shape: {weight.shape} vs expected {expected_shape}")
+            raise RuntimeError(f"Dequantized linear weight has incorrect shape: {weight.shape} vs expected {expected_shape}")
         
         return torch.nn.functional.linear(input, weight, self.bias)
-
 
 class GGUFQuantizedConv2d(_GGUFQuantizedBase):
     """Quantized Conv2d layer with on-the-fly dequantization"""
@@ -132,11 +154,21 @@ class GGUFQuantizedConv2d(_GGUFQuantizedBase):
         self.groups = groups
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        device = input.device
-        dtype = input.dtype
+        # Get precision-optimized weight
+        weight = self.get_dequantized_weight_for_compute(input)
         
-        # Dequantize weight on-the-fly
-        weight = self.dequantize_weight(device, dtype)
+        # Validate weight shape after dequantization
+        if isinstance(self.kernel_size, int):
+            kernel_h = kernel_w = self.kernel_size
+        else:
+            kernel_h, kernel_w = self.kernel_size
+            
+        expected_shape = (self.out_channels, self.in_channels // self.groups, kernel_h, kernel_w)
+        if weight.shape != expected_shape:
+            if self.debug:
+                self.debug.log(f"Conv2d weight shape mismatch: got {weight.shape}, expected {expected_shape}", 
+                            level="ERROR", category="precision", force=True)
+            raise RuntimeError(f"Dequantized conv weight has incorrect shape: {weight.shape} vs expected {expected_shape}")
         
         # Standard conv2d operation
         return torch.nn.functional.conv2d(input, weight, self.bias, self.stride, 
@@ -158,15 +190,34 @@ def is_quantized_tensor(tensor: torch.Tensor) -> bool:
     return is_gguf_quantized(tensor) if callable(is_gguf_quantized) else False
 
 
-def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix=""):
-    """Replace Linear and Conv2d layers with quantized versions if they have GGUF quantized weights"""
+def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix="") -> Tuple[int, Dict[str, int]]:
+    """
+    Replace Linear and Conv2d layers with quantized versions if they have GGUF quantized weights
+    
+    Args:
+        module: The module to process
+        debug: Optional Debug instance for logging
+        prefix: Prefix for recursive calls (used internally)
+        
+    Returns:
+        Tuple of (replacements_made, quant_types) where:
+        - replacements_made: Number of layers replaced
+        - quant_types: Dict mapping quantization type names to counts
+    """
     if not GGUF_AVAILABLE:
         return 0
     
     replacements_made = 0
+    quant_types = {}  # Track quantization types found
+    
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
             if is_quantized_tensor(child.weight):
+                # Track quantization type
+                if hasattr(child.weight, 'tensor_type'):
+                    qtype_name = child.weight.tensor_type.name if hasattr(child.weight.tensor_type, 'name') else str(child.weight.tensor_type)
+                    quant_types[qtype_name] = quant_types.get(qtype_name, 0) + 1
+                    
                 # Create quantized linear layer
                 quantized_linear = GGUFQuantizedLinear(
                     child.in_features, 
@@ -180,6 +231,11 @@ def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix=
                 
         elif isinstance(child, nn.Conv2d):
             if is_quantized_tensor(child.weight):
+                # Track quantization type
+                if hasattr(child.weight, 'tensor_type'):
+                    qtype_name = child.weight.tensor_type.name if hasattr(child.weight.tensor_type, 'name') else str(child.weight.tensor_type)
+                    quant_types[qtype_name] = quant_types.get(qtype_name, 0) + 1
+                    
                 # Create quantized conv2d layer
                 quantized_conv = GGUFQuantizedConv2d(
                     child.in_channels,
@@ -198,6 +254,11 @@ def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix=
         else:
             # Recursively replace in child modules
             full_name = f"{prefix}.{name}" if prefix else name
-            replacements_made += replace_linear_with_quantized(child, debug, full_name)
-    
-    return replacements_made
+            child_replacements, child_qtypes = replace_linear_with_quantized(child, debug, full_name)
+            replacements_made += child_replacements
+            # Merge quantization types from child
+            for qtype, count in child_qtypes.items():
+                quant_types[qtype] = quant_types.get(qtype, 0) + count
+
+    # Always return the tuple
+    return replacements_made, quant_types

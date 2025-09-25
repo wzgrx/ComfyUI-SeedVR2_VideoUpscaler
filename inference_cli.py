@@ -46,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
+from src.utils.model_registry import get_available_models, DEFAULT_MODEL
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
@@ -499,28 +500,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
-    parser.add_argument("--model", type=str, default="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-                        choices=[
-                            "seedvr2_ema_3b_fp16.safetensors",
-                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors", 
-                            "seedvr2_ema_7b_fp16.safetensors",
-                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors",
-                            "seedvr2_ema_3b-Q3_K_M.gguf",
-                            "seedvr2_ema_3b-Q4_K_M.gguf",
-                            "seedvr2_ema_3b-Q5_K_M.gguf",
-                            "seedvr2_ema_3b-Q6_K_M.gguf",
-                            "seedvr2_ema_3b-Q8_K_M.gguf",
-                            "seedvr2_ema_7b-Q3_K_M.gguf",
-                            "seedvr2_ema_7b-Q4_K_M.gguf",
-                            "seedvr2_ema_7b-Q5_K_M.gguf",
-                            "seedvr2_ema_7b-Q6_K_M.gguf",
-                            "seedvr2_ema_7b-Q8_K_M.gguf",
-                            "seedvr2_ema_7b_sharp-Q3_K_M.gguf",
-                            "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
-                            "seedvr2_ema_7b_sharp-Q5_K_M.gguf",
-                            "seedvr2_ema_7b_sharp-Q6_K_M.gguf",
-                            "seedvr2_ema_7b_sharp-Q8_K_M.gguf"
-                        ],
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        choices=get_available_models(),
                         help="Model to use (default: 3B FP8)")
     parser.add_argument("--model_dir", type=str, default="seedvr2_models",
                             help="Directory containing the model files (default: use cache directory)")
