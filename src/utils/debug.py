@@ -10,7 +10,7 @@ import torch
 import gc
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
-from src.optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
+from ..optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
 from contextlib import contextmanager
 
 
@@ -106,25 +106,7 @@ class Debug:
             prefix += f" [{level}]"
         
         print(f"{prefix} {message}")
-    
 
-    @contextmanager
-    def timer_context(self, namespace: str):
-        """
-        Context manager for setting a timer namespace temporarily.
-        All timers started within this context will be prefixed with the namespace.
-        
-        Usage:
-            with debug.timer_context("batch_1"):
-                debug.start_timer("vae_encode")  # Will be "batch_1_vae_encode"
-        """
-        old_namespace = self.timer_namespace
-        self.timer_namespace = namespace
-        try:
-            yield
-        finally:
-            self.timer_namespace = old_namespace
-            
 
     def start_timer(self, name: str, force: bool = False) -> None:
         """

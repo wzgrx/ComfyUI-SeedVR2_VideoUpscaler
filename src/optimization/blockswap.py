@@ -18,9 +18,9 @@ import torch
 import weakref
 
 from typing import Dict, Any, List
-from src.optimization.memory_manager import clear_memory
-from src.optimization.compatibility import call_rope_with_stability
-from src.common.distributed import get_device
+from .memory_manager import clear_memory
+from .compatibility import call_rope_with_stability
+from ..common.distributed import get_device
 
 
 def get_module_memory_mb(module: torch.nn.Module) -> float:
@@ -278,7 +278,7 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
                 )
 
             # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=True, force=False)
+            clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_block_forward")
         else:
             output = original_forward(*args, **kwargs)
 
@@ -343,7 +343,7 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
             )
 
         # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=True, force=False)
+        clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_io_forward")
 
         return output
     
@@ -530,16 +530,24 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     
     debug = runner.debug
     
-    # Early return if BlockSwap not active
-    if not hasattr(runner, "_blockswap_active") or not runner._blockswap_active:
+    # Check if there's any BlockSwap state to clean up
+    has_blockswap_state = (
+        hasattr(runner, "_blockswap_active") or 
+        hasattr(runner, "_block_swap_config") or
+        hasattr(runner, "_blockswap_bypass_protection")
+    )
+    
+    if not has_blockswap_state:
         return
 
     debug.log("Starting BlockSwap cleanup", category="cleanup")
 
     if keep_state_for_cache:
-        # Minimal cleanup for caching - just mark as inactive
+        # Minimal cleanup for caching - just mark as inactive and allow offloading
         # Everything else stays intact for fast reactivation
-        runner._blockswap_active = False
+        if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+            set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
+            runner._blockswap_active = False
         debug.log("BlockSwap deactivated for caching (configuration preserved)", category="success")
         return
 

@@ -11,8 +11,8 @@ import sys
 import time
 import psutil
 from typing import Tuple, Dict, Any, Optional, List, Union
-from src.common.cache import Cache
-from src.common.distributed import get_device
+from ..common.cache import Cache 
+from ..common.distributed import get_device
     
 
 def get_device_list():
@@ -141,7 +141,8 @@ def get_ram_usage(debug: Optional[Any] = None) -> Tuple[float, float, float, flo
 _os_memory_lib = None
 
 
-def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = True) -> None:
+def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = True, 
+                timer_name: Optional[str] = None) -> None:
     """
     Clear memory caches with two-tier approach for optimal performance.
     
@@ -150,6 +151,7 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
         force: If True, always clear. If False, only clear when <15% free
         deep: If True, perform deep cleanup including GC and OS operations.
               If False (default), only perform minimal GPU cache clearing.
+        timer_name: Optional suffix for timer names to make them unique per invocation
     
     Two-tier approach:
         - Minimal mode (deep=False): GPU cache operations (~1-5ms)
@@ -159,9 +161,23 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
     """
     global _os_memory_lib
     
+    # Create unique timer names if suffix provided
+    if timer_name:
+        main_timer = f"memory_clear_{timer_name}"
+        gpu_timer = f"gpu_cache_clear_{timer_name}"
+        gc_timer = f"garbage_collection_{timer_name}"
+        os_timer = f"os_memory_release_{timer_name}"
+        completion_msg = f"clear_memory() completion ({timer_name})"
+    else:
+        main_timer = "memory_clear"
+        gpu_timer = "gpu_cache_clear"
+        gc_timer = "garbage_collection"
+        os_timer = "os_memory_release"
+        completion_msg = "clear_memory() completion"
+    
     # Start timer for entire operation
     if debug:
-        debug.start_timer("memory_clear")
+        debug.start_timer(main_timer)
 
     # Check if we should clear based on memory pressure
     if not force:
@@ -198,7 +214,7 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
     # ===== MINIMAL OPERATIONS (Always performed) =====
     # Step 1: Clear GPU caches - Fast operations (~1-5ms)
     if debug:
-        debug.start_timer("gpu_cache_clear")
+        debug.start_timer(gpu_timer)
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -207,22 +223,22 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
         torch.mps.empty_cache()
     
     if debug:
-        debug.end_timer("gpu_cache_clear", "GPU cache clearing")
+        debug.end_timer(gpu_timer, "GPU cache clearing")
 
     # ===== DEEP OPERATIONS (Only when deep=True) =====
     if deep:
         # Step 2: Deep garbage collection (expensive ~5-20ms)
         if debug:
-            debug.start_timer("garbage_collection")
+            debug.start_timer(gc_timer)
 
         gc.collect(2)
 
         if debug:
-            debug.end_timer("garbage_collection", "Garbage collection")
+            debug.end_timer(gc_timer, "Garbage collection")
 
         # Step 3: Return memory to OS (platform-specific, ~5-30ms)
         if debug:
-            debug.start_timer("os_memory_release")
+            debug.start_timer(os_timer)
 
         try:
             if sys.platform == 'linux':
@@ -256,11 +272,11 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
                 debug.log(f"Failed to perform OS memory operations: {e}", level="WARNING", category="memory", force=True)
 
         if debug:
-            debug.end_timer("os_memory_release", "OS memory release")
+            debug.end_timer(os_timer, "OS memory release")
     
     # End overall timer
     if debug:
-        debug.end_timer("memory_clear", "clear_memory() completion")
+        debug.end_timer(main_timer, completion_msg)
 
 
 def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
@@ -289,7 +305,7 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
             debug.log(f"Clearing memory and retrying", category="info", force=True)
         
         # Clear memory
-        clear_memory(debug=debug, deep=True, force=True)
+        clear_memory(debug=debug, deep=True, force=True, timer_name=operation_name)
         # Let memory settle
         time.sleep(0.5)
         debug.log_memory_state("After memory clearing", show_tensors=True, detailed_tensors=False)
@@ -459,11 +475,14 @@ def manage_model_device(model: Optional[torch.nn.Module], target_device: str,
     
     # Normalize device strings for comparison
     target_type = target_device.split(':')[0] if ':' in target_device else target_device
-    current_type_upper = str(current_device.type).upper()
-    target_device_upper = target_device.upper()
-    
-    # Skip if already on target device (unless BlockSwap needs reconfiguration)
-    if current_type_upper == target_device_upper and not is_blockswap_model:
+    current_device_upper = str(current_device).upper()
+    target_device_upper = str(target_device).upper()
+
+    # Compare normalized device types
+    if current_device_upper == target_device_upper and not is_blockswap_model:
+        # Already on target device type, no movement needed
+        if debug:
+            debug.log(f"{model_name} already on {current_device_upper}, skipping movement", category="general")
         return False
         
     # Handle BlockSwap models specially
@@ -476,7 +495,7 @@ def manage_model_device(model: Optional[torch.nn.Module], target_device: str,
     # Standard model movement (non-BlockSwap)
     return _standard_model_movement(
         model, current_device, target_device, target_type, model_name,
-        preserve_vram, debug, reason, target_device_upper
+        preserve_vram, debug, reason
     )
 
 
@@ -501,7 +520,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         bool: True if model was moved
     """
     # Import BlockSwap function (avoid circular import)
-    from src.optimization.blockswap import set_blockswap_bypass
+    from .blockswap import set_blockswap_bypass
     
     if target_type == "cpu":
         # Moving to CPU (offload)
@@ -531,6 +550,8 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         # Check if we're in bypass mode (coming from preserve_vram offload)
         if not getattr(runner, "_blockswap_bypass_protection", False):
             # Not in bypass mode, blocks are already configured
+            if debug:
+                debug.log(f"{model_name} with BlockSwap active - blocks already distributed across devices, skipping movement", category="general")
             return False
         
         if debug:
@@ -588,8 +609,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: str, target_type: str,
                             model_name: str, preserve_vram: bool, 
-                            debug: Optional[Any], reason: Optional[str],
-                            target_device_upper: str) -> bool:
+                            debug: Optional[Any], reason: Optional[str]) -> bool:
     """
     Handle standard (non-BlockSwap) model movement.
     
@@ -602,7 +622,6 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
         preserve_vram: Whether in preserve_vram mode
         debug: Debug instance
         reason: Movement reason
-        target_device_upper: Target device type (uppercase)
         
     Returns:
         bool: True if model was moved
@@ -614,7 +633,7 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     # Log the movement with full device strings
     if debug:
         current_device_str = str(current_device).upper()
-        debug.log(f"Moving {model_name} from {current_device_str} to {target_device_upper} ({reason})", category="general")
+        debug.log(f"Moving {model_name} from {current_device_str} to {target_device.upper()} ({reason})", category="general")
 
     # Start timer based on direction
     timer_name = f"{model_name.lower()}_to_{'gpu' if target_type != 'cpu' else 'cpu'}"
@@ -638,7 +657,7 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     
     # End timer
     if debug:
-        debug.end_timer(timer_name, f"{model_name} moved to {target_device_upper}")
+        debug.end_timer(timer_name, f"{model_name} moved to {target_device.upper()}")
     
     return True
 
@@ -732,7 +751,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
     # 1. Clean BlockSwap if active
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
         # Import here to avoid circular dependency
-        from src.optimization.blockswap import cleanup_blockswap
+        from .blockswap import cleanup_blockswap
         cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
     
     # 2. Clear all runtime caches
@@ -740,15 +759,11 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
     
     if keep_models_in_ram:
         # 3a. Partial cleanup - move models to CPU but keep structure
-        blockswap_configured = hasattr(runner, '_block_swap_config') and runner._block_swap_config
-        
-        if hasattr(runner, 'dit') and not blockswap_configured:
-            manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", preserve_vram=True, debug=debug, reason="model caching")
-        elif blockswap_configured and debug:
-            debug.log("Skipping DiT movement - BlockSwap configuration preserved", category="general")
+        if hasattr(runner, 'dit'):
+            manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", preserve_vram=True, debug=debug, reason="model caching", runner=runner)
         
         if hasattr(runner, 'vae'):
-            manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", preserve_vram=True, debug=debug, reason="model caching")
+            manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", preserve_vram=True, debug=debug, reason="model caching", runner=runner)
     else:
         # 3b. Full cleanup - release memory and delete
         if hasattr(runner, 'dit'):
@@ -767,7 +782,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
                 setattr(runner, component, None)
     
     # 4. Final memory cleanup
-    clear_memory(debug=debug, deep=True, force=True)
+    clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
 
     # 5. Clearing cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None

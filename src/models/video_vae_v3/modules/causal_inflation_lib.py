@@ -14,7 +14,6 @@
 
 import math
 from contextlib import contextmanager
-import time
 from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
@@ -27,7 +26,7 @@ from .context_parallel_lib import cache_send_recv, get_cache_size
 from .global_config import get_norm_limit
 from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
-from src.optimization.memory_manager import clear_memory, retry_on_oom
+from ....optimization.memory_manager import clear_memory, retry_on_oom
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")

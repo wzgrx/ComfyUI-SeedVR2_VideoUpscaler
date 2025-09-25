@@ -7,21 +7,33 @@ import time
 import torch
 from typing import Tuple, Dict, Any
 
-from src.utils.constants import get_base_cache_dir
-from src.utils.downloads import download_weight
-from src.utils.model_registry import get_available_models, DEFAULT_MODEL
-from src.utils.constants import get_script_directory
-from src.utils.debug import Debug
-from src.core.model_manager import configure_runner
-from src.core.generation import generation_loop
-from src.optimization.memory_manager import (
+from ..utils.constants import get_base_cache_dir, get_script_directory
+from ..utils.downloads import download_weight
+from ..utils.model_registry import (
+    get_available_models,
+    DEFAULT_MODEL
+)
+from ..utils.debug import Debug
+from ..core.model_manager import configure_runner
+from ..core.generation import (
+    setup_device_environment,
+    prepare_generation_context, 
+    prepare_runner,
+    encode_all_batches, 
+    upscale_all_batches, 
+    decode_all_batches, 
+)
+from ..optimization.memory_manager import (
     release_text_embeddings,
     complete_cleanup, 
     get_device_list
 )
 
 # Import ComfyUI progress reporting
-from server import PromptServer
+try:
+    from comfy.utils import ProgressBar
+except ImportError:
+    ProgressBar = None
 
 script_directory = get_script_directory()
 
@@ -40,11 +52,9 @@ class SeedVR2:
     def __init__(self):
         """Initialize SeedVR2 node"""
         self.runner = None
-        self.text_pos_embeds = None
-        self.text_neg_embeds = None
         self.current_model_name = ""
+        self.ctx = None
         self.debug = None
-        self.last_batch_time = None
 
 
     @classmethod
@@ -81,7 +91,25 @@ class SeedVR2:
                     "min": 1, 
                     "max": 2048, 
                     "step": 4,
-                    "tooltip": "Number of frames to process per batch (recommend 4n+1 format)"
+                    "tooltip": "Frames per batch (with 4n+1 format: 1, 5, 9, 13, 17, 21...)"
+                }),
+                "color_correction": (["wavelet", "adain", "none"], {
+                    "default": "wavelet",
+                    "tooltip": "Color correction method. Wavelet: Frequency-based for natural results (recommended). AdaIN: Statistical matching for stylized effects. None: No color correction."
+                }),
+                "input_noise_scale": ("FLOAT", {
+                    "default": 0.00,
+                    "min": 0.00,
+                    "max": 1.00,
+                    "step": 0.001,
+                    "tooltip": "Input noise to reduce artifacts at high resolutions. Adds subtle noise to images before upscaling."
+                }),
+                "latent_noise_scale": ("FLOAT", {
+                    "default": 0.00,
+                    "min": 0.00,
+                    "max": 1.00,
+                    "step": 0.001,
+                    "tooltip": "Latent space noise during diffusion. Affects the conditioning process and can soften details. Use only if input_noise doesn't help."
                 }),
             },
             "optional": {
@@ -101,13 +129,14 @@ class SeedVR2:
     CATEGORY = "SEEDVR2"
 
     def execute(self, images: torch.Tensor, model: str, seed: int, new_resolution: int, 
-        batch_size: int, block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
+        batch_size: int, color_correction: str, input_noise_scale: float, latent_noise_scale: float, 
+        block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
         """Execute SeedVR2 video upscaling with progress reporting"""
         
         temporal_overlap = 0 
         
         if extra_args is None:
-            tiled_vae = True
+            tiled_vae = False
             vae_tile_size = 512
             vae_tile_overlap = 64
             preserve_vram = False
@@ -133,7 +162,26 @@ class SeedVR2:
             self.debug = Debug(enabled=enable_debug, show_timestamps=enable_debug)
         else:
             self.debug.enabled = enable_debug
-        
+
+        self.debug.log("", category="none", force=True)
+        self.debug.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
+        self.debug.log(" ║ ███████ ███████ ███████ ██████  ██    ██ ██████  ███████ ║", category="none", force=True)
+        self.debug.log(" ║ ██      ██      ██      ██   ██ ██    ██ ██   ██      ██ ║", category="none", force=True)
+        self.debug.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
+        self.debug.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
+        self.debug.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
+        self.debug.log(" ║                         © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
+        self.debug.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
+        self.debug.log("", category="none", force=True)
+
+        self.debug.start_timer("total_execution", force=True)
+
+        self.debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
+
+        # Initial memory state
+        self.debug.log_memory_state("Before model preparation", show_tensors=True, detailed_tensors=False)
+        self.debug.start_timer("model_preparation")
+
         # Check if download succeeded
         if not download_weight(model, debug=self.debug):
             raise RuntimeError(
@@ -144,7 +192,8 @@ class SeedVR2:
         cfg_scale = 1.0
         try:
             return self._internal_execute(images, model, seed, new_resolution, cfg_scale, 
-                                        batch_size, tiled_vae, vae_tile_size, vae_tile_overlap, 
+                                        batch_size, color_correction, input_noise_scale, latent_noise_scale, 
+                                        tiled_vae, vae_tile_size, vae_tile_overlap, 
                                         preserve_vram, temporal_overlap, 
                                         cache_model, device, block_swap_config)
         except Exception as e:
@@ -156,6 +205,11 @@ class SeedVR2:
         """
         Cleanup runner and free memory
         """
+        # Clear progress bar if it exists
+        if hasattr(self, '_pbar') and self._pbar is not None:
+            self._pbar.update_absolute(0, 100)
+            self._pbar = None
+            
         # Get debug from runner if not provided
         if debug is None and self.runner and hasattr(self.runner, 'debug'):
             debug = self.runner.debug
@@ -169,52 +223,45 @@ class SeedVR2:
                 del self.runner
                 self.runner = None
         
-        # Clear instance embeddings
-        release_text_embeddings(
-            self.text_pos_embeds, 
-            self.text_neg_embeds,
-            debug=debug,
-            names=["text_pos_embeds", "text_neg_embeds"] if debug else None
-        )
-        
-        self.text_pos_embeds = None
-        self.text_neg_embeds = None
+        # Clean up context text embeddings if they exist
+        if self.ctx and self.ctx.get('text_embeds'):
+            embeddings = []
+            names = []
+            for key, embeds_list in self.ctx['text_embeds'].items():
+                if embeds_list:
+                    embeddings.extend(embeds_list)
+                    names.append(key)
+            if embeddings:
+                release_text_embeddings(*embeddings, debug=debug, names=names)
+            self.ctx['text_embeds'] = None
+        self.ctx = None
         
         if not cache_model:
             self.current_model_name = ""
 
 
-    def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size, 
-                 tiled_vae, vae_tile_size, vae_tile_overlap,
-                 preserve_vram, temporal_overlap, cache_model, device, block_swap_config):
+    def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size,
+                color_correction, input_noise_scale, latent_noise_scale, tiled_vae, vae_tile_size, vae_tile_overlap,
+                preserve_vram, temporal_overlap, cache_model, device, block_swap_config) -> Tuple[torch.Tensor]:
         """Internal execution logic with progress tracking"""
         
         debug = self.debug
         
-        debug.start_timer("total_execution")
-        debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
+        # Initialize progress bar
+        if ProgressBar is not None:
+            self._pbar = ProgressBar(100)
+        else:
+            self._pbar = None
 
-        # Initial memory state
-        debug.log_memory_state("Before model preparation", show_tensors=True, detailed_tensors=False)
-        debug.start_timer("model_preparation")
+        # Setup device environment
+        device = setup_device_environment(device, debug)
 
-        os.environ["LOCAL_RANK"] = 0 if device == "none" else device.split(":")[1]
-        
-        if self.runner is not None:
-            current_model = getattr(self.runner, '_model_name', None)
-            model_changed = current_model != model
+        # Create generation context with the configured device
+        ctx = prepare_generation_context(device=device, debug=debug)
+        self.ctx = ctx
 
-            if model_changed and self.runner is not None:
-                debug.log(f"Model changed from {current_model} to {model}, clearing cache...", category="cache")
-                self.cleanup(
-                    cache_model=False,
-                    debug=debug,
-                )
-
-        # Configure runner
-        debug.log("Configuring inference runner...", category="runner")
-        
-        self.runner = configure_runner(
+        # Prepare runner with model state management
+        self.runner, model_changed = prepare_runner(
             model, get_base_cache_dir(), preserve_vram, debug,
             cache_model=cache_model,
             block_swap_config=block_swap_config,
@@ -223,24 +270,60 @@ class SeedVR2:
             vae_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
             cached_runner=self.runner if cache_model else None
         )
-
         self.current_model_name = model
 
         debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
 
         debug.log("", category="none", force=True)
         debug.log("Starting video upscaling generation...", category="generation", force=True)
-        debug.start_timer("generation_loop")
-
-        # Execute generation with debug
-        sample = generation_loop(
-            self.runner, images, cfg_scale, seed, new_resolution, 
-            batch_size, preserve_vram, temporal_overlap, debug,
-            progress_callback=self._progress_callback
+        debug.start_timer("generation")
+       
+        # Track total frames for FPS calculation
+        total_frames = len(images)
+        debug.log(f"   Total frames: {total_frames}, New resolution: {new_resolution}, Batch size: {batch_size}", category="generation", force=True)
+        
+        # Phase 1: Encode all batches
+        ctx = encode_all_batches(
+            self.runner, 
+            ctx=ctx, 
+            images=images, 
+            batch_size=batch_size, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback, 
+            temporal_overlap=temporal_overlap, 
+            res_w=new_resolution,
+            input_noise_scale=input_noise_scale
         )
+
+        # Phase 2: Upscale all batches
+        ctx = upscale_all_batches(
+            self.runner, 
+            ctx=ctx, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback, 
+            cfg_scale=cfg_scale, 
+            seed=seed,
+            latent_noise_scale=latent_noise_scale
+        )
+
+        # Phase 3: Decode all batches
+        ctx = decode_all_batches(
+            self.runner, 
+            ctx=ctx, 
+            preserve_vram=preserve_vram,
+            debug=debug, 
+            progress_callback=self._progress_callback,
+            color_correction=color_correction
+        )
+
+        # Get final result
+        sample = ctx['final_video']
         
         debug.log("", category="none", force=True)
         debug.log("Video upscaling completed successfully!", category="generation", force=True)
+
         # Log performance summary before clearing
         if debug.enabled:            
             # Log BlockSwap summary if it was used
@@ -248,6 +331,7 @@ class SeedVR2:
                 swap_summary = debug.get_swap_summary()
                 if swap_summary and swap_summary.get('total_swaps', 0) > 0:
                     total_time = swap_summary.get('block_total_ms', 0) + swap_summary.get('io_total_ms', 0)
+                    debug.log("", category="none")
                     debug.log(f"BlockSwap overhead: {total_time:.2f}ms", category="blockswap")
                     debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
                     
@@ -267,8 +351,7 @@ class SeedVR2:
                             debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
                                     f"({swap_summary['most_swapped_count']} times)", category="blockswap")
 
-        debug.end_timer("generation_loop", "Video generation", show_breakdown=True)
-        debug.log_memory_state("After video generation", detailed_tensors=False)
+        debug.end_timer("generation", "Video generation")
        
         debug.log("", category="none")
         debug.log("━━━━━━━━━ Final Cleanup ━━━━━━━━━", category="none")
@@ -290,40 +373,62 @@ class SeedVR2:
         debug.log("━━━━━━━━━━━━━━━━━━", category="none")
         child_times = {
             "Model preparation": debug.timer_durations.get("model_preparation", 0),
-            "Video generation": debug.timer_durations.get("generation_loop", 0),
+            "Video generation": debug.timer_durations.get("generation", 0),
             "Final cleanup": debug.timer_durations.get("final_cleanup", 0)
         }
-        debug.end_timer("total_execution", "Total execution", show_breakdown=True, custom_children=child_times)
+        # Add phase breakdowns as separate items (they'll appear at the same level)
+        if "phase1_encoding" in debug.timer_durations:
+            child_times["  Phase 1: VAE encoding"] = debug.timer_durations.get("phase1_encoding", 0)
+        if "phase2_upscaling" in debug.timer_durations:
+            child_times["  Phase 2: DiT upscaling"] = debug.timer_durations.get("phase2_upscaling", 0)
+        if "phase3_decoding" in debug.timer_durations:
+            child_times["  Phase 3: VAE decoding"] = debug.timer_durations.get("phase3_decoding", 0)
+
+        total_execution_time = debug.end_timer("total_execution", "Total execution", show_breakdown=True, custom_children=child_times)
+        
+        # Calculate and log FPS
+        if total_execution_time > 0:
+            fps = total_frames / total_execution_time
+            debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
+            
         debug.log("━━━━━━━━━━━━━━━━━━", category="none")
         
         # Clear history for next run (do this last, after all logging)
         debug.clear_history()
-        
+
+        # Clear progress bar and context reference
+        self._pbar = None
+        self.ctx = None
+
         return (sample,)
 
-    def _progress_callback(self, batch_idx, total_batches, current_batch_frames, message=""):
-        """Progress callback for generation loop"""
+    def _progress_callback(self, current_step, total_steps, current_batch_frames, phase_name=""):
+        """Progress callback for generation phases"""
         
-        # Calculate batch FPS
-        batch_time = 0
-        if self.last_batch_time is not None:
-            batch_time = time.time() - self.last_batch_time
-        elif "generation_loop" in self.debug.timers:
-            batch_time = time.time() - self.debug.timers["generation_loop"]
+        if not hasattr(self, '_pbar') or self._pbar is None:
+            return
+        
+        # Calculate overall progress across all phases
+        # Phase weights: Encode=20%, Upscale=60%, Decode=20%
+        phase_weights = {"Encoding": 0.2, "Upscaling": 0.6, "Decoding": 0.2}
+        phase_offset = {"Encoding": 0.0, "Upscaling": 0.2, "Decoding": 0.8}
+        
+        # Extract the phase type from "Phase X: Type" format
+        if ":" in phase_name:
+            phase_key = phase_name.split(":")[1].strip()
         else:
-            batch_time = self.debug.timer_durations.get("generation_loop", 0)
-        batch_fps = current_batch_frames / batch_time if batch_time > 0 else 0.0
-        self.debug.log(f"Batch {batch_idx} - FPS: {batch_fps:.2f} frames/sec", category="timing")
-        self.last_batch_time = time.time()
+            phase_key = "Upscaling"
         
-        # Send numerical progress
-        progress_value = int((batch_idx / total_batches) * 100)
-        progress_data = {
-            "value": progress_value,
-            "max": 100,
-            "node": "seedvr2_node"
-        }
-        PromptServer.instance.send_sync("progress", progress_data, None)
+        weight = phase_weights.get(phase_key, 1.0)
+        offset = phase_offset.get(phase_key, 0.0)
+        
+        # Calculate weighted progress
+        phase_progress = (current_step / total_steps) if total_steps > 0 else 0
+        overall_progress = offset + (phase_progress * weight)
+        
+        # Update the progress bar with the overall progress
+        progress_value = int(overall_progress * 100)
+        self._pbar.update_absolute(progress_value, 100)
 
     def __del__(self):
         """Destructor"""
@@ -336,8 +441,7 @@ class SeedVR2:
                 self.cleanup(cache_model=False, debug=debug)
             
             # Clear all remaining references
-            for attr in ['runner', 'text_pos_embeds', 'text_neg_embeds', 
-                        'current_model_name', 'debug', 'last_batch_time']:
+            for attr in ['runner', 'current_model_name', 'debug', 'ctx']:
                 if hasattr(self, attr):
                     delattr(self, attr)
         except:
@@ -414,7 +518,7 @@ class SeedVR2ExtraArgs:
         return {
             "required": {
                 "tiled_vae": ("BOOLEAN", {
-                    "default": True,
+                    "default": False,
                     "tooltip": "Process VAE in tiles to reduce VRAM usage but slower with potential artifacts. Only enable if running out of memory."
                 }),
                 "vae_tile_size": ("INT", {

@@ -388,12 +388,11 @@ When reporting issues, please include:
 
 ## 🙏 Credits
 
-- Original [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) implementation
+
+This ComfyUI implementation is a collaborative project by **[NumZ](https://github.com/numz)** and **[AInVFX](https://www.youtube.com/@AInVFX)**, based on the original [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) by ByteDance Seed Team.
+
+Special thanks to our community contributors including [benjaminherb](https://github.com/benjaminherb), [cmeka](https://github.com/cmeka), [FurkanGozukara](https://github.com/FurkanGozukara), [JohnAlcatraz](https://github.com/JohnAlcatraz), [lihaoyun6](https://github.com/lihaoyun6), [Luchuanzhao](https://github.com/Luchuanzhao), [Luke2642](https://github.com/Luke2642), [naxci1](https://github.com/naxci1), [q5sys](https://github.com/q5sys), and many others for their improvements, bug fixes, and testing.
 
 # 📜 License
 
 - The code in this repository is released under the MIT license as found in the [LICENSE file](LICENSE).
-
-```
-
-```

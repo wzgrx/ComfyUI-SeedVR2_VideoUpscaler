@@ -9,6 +9,7 @@ import argparse
 import time
 import platform
 import multiprocessing as mp
+from typing import Dict, Any, List, Optional, Tuple
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,11 +46,13 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
+from src.utils.model_registry import get_available_models, DEFAULT_MODEL
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
 
-def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, prepend_frames=0):
+def extract_frames_from_video(video_path: str, skip_first_frames: int = 0, 
+                            load_cap: Optional[int] = None, prepend_frames: int = 0) -> Tuple[torch.Tensor, float]:
     """
     Extract frames from video and convert to tensor format
     
@@ -143,7 +146,7 @@ def extract_frames_from_video(video_path, skip_first_frames=0, load_cap=None, pr
     return frames_tensor, fps
 
 
-def save_frames_to_video(frames_tensor, output_path, fps=30.0):
+def save_frames_to_video(frames_tensor: torch.Tensor, output_path: str, fps: float = 30.0) -> None:
     """
     Save frames tensor to video file
     
@@ -185,7 +188,7 @@ def save_frames_to_video(frames_tensor, output_path, fps=30.0):
     debug.log(f"Video saved successfully: {output_path}", category="success")
 
 
-def save_frames_to_png(frames_tensor, output_dir, base_name):
+def save_frames_to_png(frames_tensor: torch.Tensor, output_dir: str, base_name: str) -> None:
     """
     Save frames tensor as sequential PNG images.
 
@@ -216,7 +219,7 @@ def save_frames_to_png(frames_tensor, output_dir, base_name):
     debug.log(f"PNG saving completed: {total} files in '{output_dir}'", category="success")
 
 
-def apply_temporal_overlap_blending(frames_tensor, batch_size, overlap):
+def apply_temporal_overlap_blending(frames_tensor: torch.Tensor, batch_size: int, overlap: int) -> torch.Tensor:
     """
     Blend frames with temporal overlap in pixel space and remove duplicates.
     Args:
@@ -275,7 +278,8 @@ def apply_temporal_overlap_blending(frames_tensor, batch_size, overlap):
     return output
 
 
-def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
+def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray, 
+                   shared_args: Dict[str, Any], return_queue: mp.Queue) -> None:
     """Worker process that performs upscaling on a slice of frames using a dedicated GPU."""
     if platform.system() != "Darwin":
         # 1. Limit CUDA visibility to the chosen GPU BEFORE importing torch-heavy deps
@@ -284,42 +288,81 @@ def _worker_process(proc_idx, device_id, frames_np, shared_args, return_queue):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     import torch  # local import inside subprocess
-    from src.core.model_manager import configure_runner
-    from src.core.generation import generation_loop
+    from src.core.generation import (
+        setup_device_environment, prepare_generation_context, prepare_runner,
+        encode_all_batches, upscale_all_batches, decode_all_batches
+    )
     
     # Create debug instance for this worker process
     worker_debug = Debug(enabled=shared_args["debug"])
     
+    # Setup device environment
+    device = setup_device_environment(f"cuda:{device_id}", worker_debug)
+
+    # Create generation context with the configured device
+    ctx = prepare_generation_context(device=device, debug=worker_debug)
+
     # Reconstruct frames tensor
     frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
 
     # Prepare runner
     model_dir = shared_args["model_dir"]
     model_name = shared_args["model"]
-    # ensure model weights present (each process checks but very fast if already downloaded)
-    worker_debug.log(f"Configuring runner for device {device_id}", category="setup")
-    runner = configure_runner(model_name, model_dir, shared_args["preserve_vram"], worker_debug, block_swap_config=shared_args["block_swap_config"], vae_tiling_enabled=shared_args["vae_tiling_enabled"], vae_tile_size=shared_args["vae_tile_size"], vae_tile_overlap=shared_args["vae_tile_overlap"])
 
-    # Run generation
-    result_tensor = generation_loop(
-        runner=runner,
+    runner, _ = prepare_runner(
+        model_name, model_dir, shared_args["preserve_vram"], worker_debug,
+        block_swap_config=shared_args["block_swap_config"],
+        vae_tiling_enabled=shared_args["vae_tiling_enabled"],
+        vae_tile_size=shared_args["vae_tile_size"],
+        vae_tile_overlap=shared_args["vae_tile_overlap"],
+        cached_runner=None  # No caching in worker processes
+    )
+
+    # Phase 1: Encode all batches
+    ctx = encode_all_batches(
+        runner,
+        ctx=ctx,
         images=frames_tensor,
-        cfg_scale=shared_args["cfg_scale"],
-        seed=shared_args["seed"],
-        res_w=shared_args["res_w"],
         batch_size=shared_args["batch_size"],
         preserve_vram=shared_args["preserve_vram"],
-        temporal_overlap=shared_args["temporal_overlap"],
         debug=worker_debug,
-        block_swap_config=shared_args["block_swap_config"]
-
+        progress_callback=None,
+        temporal_overlap=shared_args["temporal_overlap"],
+        res_w=shared_args["res_w"],
+        input_noise_scale=shared_args["input_noise_scale"]
     )
+
+    # Phase 2: Upscale all batches  
+    ctx = upscale_all_batches(
+        runner,
+        ctx=ctx,
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        progress_callback=None,
+        cfg_scale=shared_args["cfg_scale"],
+        seed=shared_args["seed"],
+        latent_noise_scale=shared_args["latent_noise_scale"]
+    )
+
+    # Phase 3: Decode all batches
+    ctx = decode_all_batches(
+        runner,
+        ctx=ctx,
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        progress_callback=None,
+        color_correction=shared_args.get("color_correction", "wavelet")
+    )
+
+    # Get final result
+    result_tensor = ctx['final_video']
 
     # Send back result as numpy array to avoid CUDA transfers
     return_queue.put((proc_idx, result_tensor.cpu().numpy()))
 
 
-def _gpu_processing(frames_tensor, device_list, args):
+def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str], 
+                   args: argparse.Namespace) -> torch.Tensor:
     """Split frames and process them in parallel on multiple GPUs."""
     num_devices = len(device_list)
     total_frames = frames_tensor.shape[0]
@@ -351,6 +394,9 @@ def _gpu_processing(frames_tensor, device_list, args):
         "model": args.model,
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
         "preserve_vram": args.preserve_vram,
+        "color_correction": args.color_correction,
+        "input_noise_scale": args.input_noise_scale,
+        "latent_noise_scale": args.latent_noise_scale,
         "debug": args.debug,
         "cfg_scale": 1.0,
         "seed": args.seed,
@@ -442,7 +488,7 @@ class OneOrTwoValues(argparse.Action):
             parser.error(f"{option_string} arguments must be integers")
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
     
@@ -454,13 +500,8 @@ def parse_arguments():
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
-    parser.add_argument("--model", type=str, default="seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-                        choices=[
-                            "seedvr2_ema_3b_fp16.safetensors",
-                            "seedvr2_ema_3b_fp8_e4m3fn.safetensors", 
-                            "seedvr2_ema_7b_fp16.safetensors",
-                            "seedvr2_ema_7b_fp8_e4m3fn.safetensors"
-                        ],
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        choices=get_available_models(),
                         help="Model to use (default: 3B FP8)")
     parser.add_argument("--model_dir", type=str, default="seedvr2_models",
                             help="Directory containing the model files (default: use cache directory)")
@@ -472,6 +513,13 @@ def parse_arguments():
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
+    parser.add_argument("--color_correction", type=str, default="wavelet", 
+                        choices=["wavelet", "adain", "none"],
+                        help="Color correction method: 'wavelet' (natural, recommended), 'adain' (stylistic), 'none' (no correction)")
+    parser.add_argument("--input_noise_scale", type=float, default=0.0,
+                        help="Input noise scale (0.0-1.0) to reduce artifacts at high resolutions. (default: 0.0)")
+    parser.add_argument("--latent_noise_scale", type=float, default=0.0,
+                        help="Latent space noise scale (0.0-1.0). Adds noise during diffusion, can soften details. Use if input_noise doesn't help (default: 0.0)")
     parser.add_argument("--preserve_vram", action="store_true",
                         help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
@@ -498,7 +546,7 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     """Main CLI function"""
     debug.log(f"SeedVR2 Video Upscaler CLI started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", category="dit", force=True)
     
