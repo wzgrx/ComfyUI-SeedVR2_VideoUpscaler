@@ -329,7 +329,8 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         progress_callback=None,
         temporal_overlap=shared_args["temporal_overlap"],
         res_w=shared_args["res_w"],
-        input_noise_scale=shared_args["input_noise_scale"]
+        input_noise_scale=shared_args["input_noise_scale"],
+        color_correction=shared_args.get("color_correction", "wavelet")
     )
 
     # Phase 2: Upscale all batches  
