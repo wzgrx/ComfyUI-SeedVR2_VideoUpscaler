@@ -21,6 +21,11 @@ Key Features:
 
 import os
 import torch
+from typing import Dict, List, Optional, Tuple, Any, Callable, Union
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..utils.debug import Debug
+    from .infer import VideoDiffusionInfer
 from torchvision.transforms import Compose, Lambda, Normalize
 
 from ..utils.constants import get_script_directory
@@ -45,7 +50,7 @@ from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normaliz
 # Get script directory for embeddings
 script_directory = get_script_directory()
 
-def prepare_video_transforms(res_w):
+def prepare_video_transforms(res_w: int) -> Compose:
     """
     Prepare optimized video transformation pipeline
     
@@ -74,7 +79,8 @@ def prepare_video_transforms(res_w):
     ])
 
 
-def load_text_embeddings(script_directory, device, dtype):
+def load_text_embeddings(script_directory: str, device: Union[str, torch.device], 
+                        dtype: torch.dtype) -> Dict[str, List[torch.Tensor]]:
     """
     Load and prepare text embeddings for generation
     
@@ -97,7 +103,8 @@ def load_text_embeddings(script_directory, device, dtype):
     return {"texts_pos": [text_pos_embeds], "texts_neg": [text_neg_embeds]}
 
 
-def calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap):
+def calculate_optimal_batch_params(total_frames: int, batch_size: int, 
+                                  temporal_overlap: int) -> Dict[str, Any]:
     """
     Calculate optimal batch processing parameters for 4n+1 constraint.
     
@@ -155,7 +162,7 @@ def calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap):
     }
 
 
-def cut_videos(videos):
+def cut_videos(videos: torch.Tensor) -> torch.Tensor:
     """
     Correct video cutting respecting the constraint: frames % 4 == 1
     
@@ -185,13 +192,14 @@ def cut_videos(videos):
     return result
 
 
-def check_interrupt(ctx):
+def check_interrupt(ctx: Dict[str, Any]) -> None:
     """Single interrupt check to avoid redundant imports"""
     if ctx.get('interrupt_fn') is not None:
         ctx['interrupt_fn']()
 
 
-def prepare_generation_context(device, debug=None):
+def prepare_generation_context(device: Union[str, torch.device], 
+                              debug: Optional['Debug'] = None) -> Dict[str, Any]:
     """
     Create a generation context for shared state.
     Precision will be lazily initialized when first needed.
@@ -232,7 +240,9 @@ def prepare_generation_context(device, debug=None):
     return ctx
 
 
-def _ensure_precision_initialized(ctx, runner, debug=None):
+def _ensure_precision_initialized(ctx: Dict[str, Any], 
+                                runner: 'VideoDiffusionInfer', 
+                                debug: Optional['Debug'] = None) -> None:
     """Lazily initialize precision settings if not already done"""
     if ctx.get('compute_dtype') is not None:
         return  # Already initialized
@@ -267,7 +277,8 @@ def _ensure_precision_initialized(ctx, runner, debug=None):
             debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
 
 
-def setup_device_environment(device=None, debug=None):
+def setup_device_environment(device: Optional[str] = None, 
+                            debug: Optional['Debug'] = None) -> str:
     """
     Setup device environment variables before model loading.
     This must be called before configure_runner.
@@ -294,10 +305,13 @@ def setup_device_environment(device=None, debug=None):
     return device
 
 
-def prepare_runner(model_name, model_dir, preserve_vram, debug, 
-                   cache_model=False, block_swap_config=None,
-                   vae_tiling_enabled=False, vae_tile_size=(512, 512), 
-                   vae_tile_overlap=(64, 64), cached_runner=None):
+def prepare_runner(model_name: str, model_dir: str, preserve_vram: bool, 
+                  debug: 'Debug', cache_model: bool = False, 
+                  block_swap_config: Optional[Dict[str, Any]] = None,
+                  vae_tiling_enabled: bool = False, 
+                  vae_tile_size: Tuple[int, int] = (512, 512), 
+                  vae_tile_overlap: Tuple[int, int] = (64, 64), 
+                  cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
     """
     Prepare runner with model state management.
     Handles model changes and caching logic.
@@ -346,10 +360,13 @@ def prepare_runner(model_name, model_dir, preserve_vram, debug,
     return runner, model_changed
 
 
-def encode_all_batches(runner, ctx=None, images=None, batch_size=5, 
-                      preserve_vram=False, debug=None, progress_callback=None, 
-                      temporal_overlap=0, res_w=1072, input_noise_scale=0.0, 
-                      color_correction="wavelet"):
+def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                       images: Optional[torch.Tensor] = None, batch_size: int = 1, 
+                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+                       temporal_overlap: int = 0, res_w: int = 1072, 
+                       input_noise_scale: float = 0.0,
+                       color_correction: str = "wavelet") -> Dict[str, Any]:
     """
     Phase 1: VAE Encoding for all batches
     
@@ -563,8 +580,11 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=5,
     return ctx
 
 
-def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None, 
-                       progress_callback=None, cfg_scale=1.0, seed=100, latent_noise_scale=0.0):
+def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                        preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                        progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
+                        cfg_scale: float = 1.0, seed: int = 100, 
+                        latent_noise_scale: float = 0.0) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -735,7 +755,10 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
     return ctx
 
 
-def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progress_callback=None, color_correction="wavelet"):
+def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
+                       color_correction: str = "wavelet") -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding and Final Video Assembly.
     
