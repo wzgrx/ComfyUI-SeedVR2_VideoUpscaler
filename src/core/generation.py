@@ -861,6 +861,13 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
                     
                     # Move to GPU for color correction
                     transformed_video = transformed_video.to(ctx['device'], non_blocking=False)
+                    
+                    # Adjust transformed video to handles cases when padding was applied during encoding
+                    if transformed_video.shape[1] != sample.shape[0]:
+                        debug.log(f"Trimming transformed video from {transformed_video.shape[1]} to {sample.shape[0]} frames to match original input", 
+                                category="video")
+                        transformed_video = transformed_video[:, :sample.shape[0]]
+                    
                     input_video = [optimized_single_video_rearrange(transformed_video)]
                     
                     # Apply selected color correction method
