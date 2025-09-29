@@ -21,6 +21,11 @@ Key Features:
 
 import os
 import torch
+from typing import Dict, List, Optional, Tuple, Any, Callable, Union
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..utils.debug import Debug
+    from .infer import VideoDiffusionInfer
 from torchvision.transforms import Compose, Lambda, Normalize
 
 from ..utils.constants import get_script_directory
@@ -45,7 +50,7 @@ from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normaliz
 # Get script directory for embeddings
 script_directory = get_script_directory()
 
-def prepare_video_transforms(res_w):
+def prepare_video_transforms(res_w: int) -> Compose:
     """
     Prepare optimized video transformation pipeline
     
@@ -74,7 +79,8 @@ def prepare_video_transforms(res_w):
     ])
 
 
-def load_text_embeddings(script_directory, device, dtype):
+def load_text_embeddings(script_directory: str, device: Union[str, torch.device], 
+                        dtype: torch.dtype) -> Dict[str, List[torch.Tensor]]:
     """
     Load and prepare text embeddings for generation
     
@@ -97,7 +103,8 @@ def load_text_embeddings(script_directory, device, dtype):
     return {"texts_pos": [text_pos_embeds], "texts_neg": [text_neg_embeds]}
 
 
-def calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap):
+def calculate_optimal_batch_params(total_frames: int, batch_size: int, 
+                                  temporal_overlap: int) -> Dict[str, Any]:
     """
     Calculate optimal batch processing parameters for 4n+1 constraint.
     
@@ -155,7 +162,7 @@ def calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap):
     }
 
 
-def cut_videos(videos):
+def cut_videos(videos: torch.Tensor) -> torch.Tensor:
     """
     Correct video cutting respecting the constraint: frames % 4 == 1
     
@@ -185,13 +192,14 @@ def cut_videos(videos):
     return result
 
 
-def check_interrupt(ctx):
+def check_interrupt(ctx: Dict[str, Any]) -> None:
     """Single interrupt check to avoid redundant imports"""
     if ctx.get('interrupt_fn') is not None:
         ctx['interrupt_fn']()
 
 
-def prepare_generation_context(device, debug=None):
+def prepare_generation_context(device: Union[str, torch.device], 
+                              debug: Optional['Debug'] = None) -> Dict[str, Any]:
     """
     Create a generation context for shared state.
     Precision will be lazily initialized when first needed.
@@ -232,7 +240,9 @@ def prepare_generation_context(device, debug=None):
     return ctx
 
 
-def _ensure_precision_initialized(ctx, runner, debug=None):
+def _ensure_precision_initialized(ctx: Dict[str, Any], 
+                                runner: 'VideoDiffusionInfer', 
+                                debug: Optional['Debug'] = None) -> None:
     """Lazily initialize precision settings if not already done"""
     if ctx.get('compute_dtype') is not None:
         return  # Already initialized
@@ -267,7 +277,8 @@ def _ensure_precision_initialized(ctx, runner, debug=None):
             debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
 
 
-def setup_device_environment(device=None, debug=None):
+def setup_device_environment(device: Optional[str] = None, 
+                            debug: Optional['Debug'] = None) -> str:
     """
     Setup device environment variables before model loading.
     This must be called before configure_runner.
@@ -294,10 +305,13 @@ def setup_device_environment(device=None, debug=None):
     return device
 
 
-def prepare_runner(model_name, model_dir, preserve_vram, debug, 
-                   cache_model=False, block_swap_config=None,
-                   vae_tiling_enabled=False, vae_tile_size=(512, 512), 
-                   vae_tile_overlap=(64, 64), cached_runner=None):
+def prepare_runner(model_name: str, model_dir: str, preserve_vram: bool, 
+                  debug: 'Debug', cache_model: bool = False, 
+                  block_swap_config: Optional[Dict[str, Any]] = None,
+                  vae_tiling_enabled: bool = False, 
+                  vae_tile_size: Tuple[int, int] = (512, 512), 
+                  vae_tile_overlap: Tuple[int, int] = (64, 64), 
+                  cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
     """
     Prepare runner with model state management.
     Handles model changes and caching logic.
@@ -346,9 +360,13 @@ def prepare_runner(model_name, model_dir, preserve_vram, debug,
     return runner, model_changed
 
 
-def encode_all_batches(runner, ctx=None, images=None, batch_size=5, 
-                      preserve_vram=False, debug=None, progress_callback=None, 
-                      temporal_overlap=0, res_w=1072, input_noise_scale=0.0):
+def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                       images: Optional[torch.Tensor] = None, batch_size: int = 1, 
+                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+                       temporal_overlap: int = 0, res_w: int = 1072, 
+                       input_noise_scale: float = 0.0,
+                       color_correction: str = "wavelet") -> Dict[str, Any]:
     """
     Phase 1: VAE Encoding for all batches
     
@@ -368,6 +386,8 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=5,
         res_w: Target resolution for shortest edge
         input_noise_scale: Scale for input noise (0.0-1.0). Adds noise to input images
                           before VAE encoding to reduce artifacts at high resolutions.
+        color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
+                         Determines if transformed videos need to be stored for later use.
         
     Returns:
         dict: Context containing:
@@ -446,8 +466,12 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=5,
         num_encode_batches += 1
     
     # Pre-allocate lists for memory efficiency
-    ctx['all_transformed_videos'] = [None] * num_encode_batches
     ctx['all_latents'] = [None] * num_encode_batches
+    ctx['all_ori_lengths'] = [None] * num_encode_batches
+    if color_correction != "none":
+        ctx['all_transformed_videos'] = [None] * num_encode_batches
+    else:
+        ctx['all_transformed_videos'] = None
     
     encode_idx = 0
     
@@ -515,14 +539,22 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=5,
                 debug.log(f"Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
                 transformed_video = cut_videos(transformed_video)
             
-            # Store transformed video (by index for pre-allocation)
-            ctx['all_transformed_videos'][encode_idx] = (transformed_video, ori_length)
+            # Store original length for proper trimming later
+            ctx['all_ori_lengths'][encode_idx] = ori_length
+            
+            # Store transformed video on CPU if needed for color correction
+            if color_correction != "none":
+                # Move to CPU to free VRAM
+                transformed_video_cpu = transformed_video.to('cpu', non_blocking=False)
+                ctx['all_transformed_videos'][encode_idx] = transformed_video_cpu
             
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
-            ctx['all_latents'][encode_idx] = cond_latents[0]  # Store first element
             
-            del cond_latents
+            # Offload latents to CPU to save VRAM between phases
+            ctx['all_latents'][encode_idx] = cond_latents[0].to('cpu', non_blocking=False)
+            
+            del cond_latents, transformed_video
             
             debug.end_timer(f"encode_batch_{encode_idx+1}", f"Encoded batch {encode_idx+1}")
             
@@ -548,8 +580,11 @@ def encode_all_batches(runner, ctx=None, images=None, batch_size=5,
     return ctx
 
 
-def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None, 
-                       progress_callback=None, cfg_scale=1.0, seed=100, latent_noise_scale=0.0):
+def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                        preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                        progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
+                        cfg_scale: float = 1.0, seed: int = 100, 
+                        latent_noise_scale: float = 0.0) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -638,8 +673,8 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
             debug.log(f"Upscaling batch {upscale_idx+1}/{num_valid_latents}", category="generation", force=True)
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
             
-            # Move latent to device with correct dtype
-            latent = latent.to(ctx['device'], dtype=ctx['compute_dtype'])
+            # Move latent from CPU to device with correct dtype
+            latent = latent.to(ctx['device'], dtype=ctx['compute_dtype'], non_blocking=False)
             
             # Generate noise
             if torch.mps.is_available():
@@ -684,8 +719,8 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
                     )
             debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
             
-            # Store upscaled result (by index for pre-allocation)
-            ctx['all_upscaled_latents'][upscale_idx] = upscaled[0]
+            # Store upscaled result on CPU to save VRAM
+            ctx['all_upscaled_latents'][upscale_idx] = upscaled[0].to('cpu', non_blocking=False)
             
             # Free original latent
             ctx['all_latents'][batch_idx] = None
@@ -720,7 +755,10 @@ def upscale_all_batches(runner, ctx=None, preserve_vram=False, debug=None,
     return ctx
 
 
-def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progress_callback=None, color_correction="wavelet"):
+def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
+                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
+                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
+                       color_correction: str = "wavelet") -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding and Final Video Assembly.
     
@@ -757,9 +795,10 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
     if 'all_upscaled_latents' not in ctx or not ctx['all_upscaled_latents']:
         raise ValueError("No upscaled latents found. Run upscale_all_batches first.")
     
-    # Validate we have transformed videos for wavelet reconstruction
-    if 'all_transformed_videos' not in ctx or not ctx['all_transformed_videos']:
-        raise ValueError("No transformed videos found for reconstruction. Context corrupted.")
+    # Validate we have transformed videos if color correction is enabled
+    if color_correction != "none":
+        if 'all_transformed_videos' not in ctx or not ctx['all_transformed_videos']:
+            raise ValueError("No transformed videos found for color correction. Context corrupted.")
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
@@ -768,8 +807,8 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
     
-    # Pre-allocate to match transformed videos (which matches original batches)
-    num_batches = len([v for v in ctx['all_transformed_videos'] if v is not None])
+    # Pre-allocate to match original batches (use ori_lengths which is always available)
+    num_batches = len([l for l in ctx['all_ori_lengths'] if l is not None])
     ctx['batch_samples'] = [None] * num_batches
     
     decode_idx = 0
@@ -789,6 +828,9 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
+            # Move latent to device with correct dtype for decoding
+            upscaled_latent = upscaled_latent.to(ctx['device'], dtype=ctx['compute_dtype'], non_blocking=False)
+            
             # Decode latent
             debug.start_timer("vae_decode")
             samples = runner.vae_decode([upscaled_latent], preserve_vram=preserve_vram)
@@ -797,47 +839,53 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
             # Convert to Float16 for efficiency
             if samples and len(samples) > 0 and samples[0].dtype != torch.float16:
                 debug.log(f"Converting from {samples[0].dtype} to Float16", category="precision")
-                samples = [sample.to(torch.float16, non_blocking=True) for sample in samples]
+                samples = [sample.to(torch.float16, non_blocking=False) for sample in samples]
             
             # Process samples
             samples = optimized_video_rearrange(samples)
             
-            # Post-process with wavelet reconstruction
+            # Post-process samples
             for i, sample in enumerate(samples):
-                # Find corresponding transformed video
-                video_idx = min(batch_idx, len(ctx['all_transformed_videos']) - 1)
-                transformed_video, ori_length = ctx['all_transformed_videos'][video_idx]
+                # Get original length for trimming (always available)
+                video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
+                ori_length = ctx['all_ori_lengths'][video_idx]
                 
-                # Trim if necessary
+                # Trim to original length if necessary
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
                 
-                # Apply color correction based on selected method
-                if color_correction != "none":
-                    transformed_video = transformed_video.to(ctx['device'])
+                # Apply color correction if enabled
+                if color_correction != "none" and ctx['all_transformed_videos'] is not None:
+                    # Get transformed video from CPU
+                    transformed_video = ctx['all_transformed_videos'][video_idx]
+                    
+                    # Move to GPU for color correction
+                    transformed_video = transformed_video.to(ctx['device'], non_blocking=False)
                     input_video = [optimized_single_video_rearrange(transformed_video)]
                     
-                    # Start timing color correction operation
+                    # Apply selected color correction method
                     debug.start_timer(f"color_correction_{color_correction}")
                     
                     if color_correction == "wavelet":
-                        debug.log("Applying wavelet color reconstruction (frequency-based)", category="video")
-                        sample = wavelet_reconstruction(sample, input_video[0][:sample.size(0)], debug)
+                        debug.log("Applying wavelet color reconstruction", category="video")
+                        sample = wavelet_reconstruction(sample, input_video[0], debug)
                     elif color_correction == "adain":
-                        debug.log("Applying AdaIN color correction (statistical matching)", category="video")
-                        sample = adaptive_instance_normalization(sample, input_video[0][:sample.size(0)])
+                        debug.log("Applying AdaIN color correction", category="video")
+                        sample = adaptive_instance_normalization(sample, input_video[0])
                     else:
-                        debug.log(f"Unknown color correction method: {color_correction}, skipping", level="WARNING", category="video")
+                        debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
                     
-                    # End timing and log duration
-                    debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction}) completed")
+                    debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                     
-                    del input_video
+                    # Free the transformed video
+                    ctx['all_transformed_videos'][video_idx] = None
+                    del input_video, transformed_video
+                
                 else:
                     debug.log("Color correction disabled (set to none)", category="video")
-
-                ctx['all_transformed_videos'][video_idx] = None
-                del transformed_video
+                
+                # Free the original length entry
+                ctx['all_ori_lengths'][video_idx] = None
                 
                 # Convert to final format
                 sample = optimized_sample_to_image_format(sample)
@@ -877,6 +925,8 @@ def decode_all_batches(runner, ctx=None, preserve_vram=False, debug=None, progre
             del ctx['all_upscaled_latents']
         if 'all_transformed_videos' in ctx:
             del ctx['all_transformed_videos']
+        if 'all_ori_lengths' in ctx:
+            del ctx['all_ori_lengths']
     
     debug.log("Assembling final video from decoded batches...", category="video")
 

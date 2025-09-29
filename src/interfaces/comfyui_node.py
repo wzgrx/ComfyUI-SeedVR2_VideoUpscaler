@@ -293,7 +293,8 @@ class SeedVR2:
             progress_callback=self._progress_callback, 
             temporal_overlap=temporal_overlap, 
             res_w=new_resolution,
-            input_noise_scale=input_noise_scale
+            input_noise_scale=input_noise_scale,
+            color_correction=color_correction
         )
 
         # Phase 2: Upscale all batches
