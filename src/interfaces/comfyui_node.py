@@ -53,9 +53,9 @@ class SeedVR2:
     def __init__(self):
         """Initialize SeedVR2 node"""
         self.runner = None
-        self.current_model_name = ""
         self.ctx = None
         self.debug = None
+        self._model_name = ""
 
 
     @classmethod
@@ -215,22 +215,20 @@ class SeedVR2:
         if debug is None and self.runner and hasattr(self.runner, 'debug'):
             debug = self.runner.debug
         
-        # Consolidated cleanup function
+        # Use complete_cleanup for all cleanup operations
         if self.runner:
             complete_cleanup(runner=self.runner, debug=debug, keep_models_in_ram=cache_model)
             
+            # Delete the runner completely if not caching
             if not cache_model:
-                # Delete the runner completely
                 del self.runner
                 self.runner = None
+                self._model_name = ""
         
         # Clean up context text embeddings if they exist
         if self.ctx:
             cleanup_text_embeddings(self.ctx, debug)
-        self.ctx = None
-        
-        if not cache_model:
-            self.current_model_name = ""
+            self.ctx = None
 
 
     def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size,
@@ -263,7 +261,7 @@ class SeedVR2:
             vae_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
             cached_runner=self.runner if cache_model else None
         )
-        self.current_model_name = model
+        self._model_name = model
 
         debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
 
@@ -323,27 +321,21 @@ class SeedVR2:
 
         # Get final result
         sample = ctx['final_video']
-        
-        debug.log("", category="none", force=True)
-        debug.log("Video upscaling completed successfully!", category="generation", force=True)
-        
-        # Log BlockSwap summary if it was used
-        if hasattr(self.runner, 'block_swap_state') and self.runner.block_swap_state:
-            swap_summary = self.runner.block_swap_state.get_summary()
-            if swap_summary['enabled'] and swap_summary['total_swaps'] > 0:
-                debug.log("", category="none")
-                debug.log("━━━━━━━━━ BlockSwap Summary ━━━━━━━━━", category="none")
-                debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
-                debug.log(f"  Peak memory saved: {swap_summary['peak_memory_saved']:.2f} GB", category="blockswap")
-                debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
-                                   f"({swap_summary['most_swapped_count']} times)", category="blockswap")
 
-        debug.end_timer("generation", "Video generation")
-        
         # Ensure sample is on CPU (ComfyUI expects CPU tensors)
         if torch.is_tensor(sample) and sample.is_cuda:
             sample = sample.cpu()
         
+        debug.log("", category="none", force=True)
+        debug.log("Video upscaling completed successfully!", category="generation", force=True)
+
+        debug.end_timer("generation", "Video generation")
+
+        # Final cleanup
+        debug.start_timer("final_cleanup")
+        self.cleanup(cache_model=cache_model, debug=debug)
+        debug.end_timer("final_cleanup", "Final cleanup")
+
         # Log final memory state after ALL cleanup is done by the phases
         debug.log_memory_state("After all phases complete", show_tensors=True, detailed_tensors=False)
         
@@ -362,6 +354,8 @@ class SeedVR2:
             child_times["  Phase 2: DiT upscaling"] = debug.timer_durations.get("phase2_upscaling", 0)
         if "phase3_decoding" in debug.timer_durations:
             child_times["  Phase 3: VAE decoding"] = debug.timer_durations.get("phase3_decoding", 0)
+        if "phase4_postprocess" in debug.timer_durations:
+            child_times["  Phase 4: Post-processing"] = debug.timer_durations.get("phase4_postprocess", 0)
 
         total_execution_time = debug.end_timer("total_execution", "Total execution", show_breakdown=True, custom_children=child_times)
         
@@ -371,7 +365,7 @@ class SeedVR2:
             debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
             
         debug.log("━━━━━━━━━━━━━━━━━━", category="none")
-        
+
         # Clear history for next run (do this last, after all logging)
         debug.clear_history()
 
@@ -420,7 +414,7 @@ class SeedVR2:
                 self.cleanup(cache_model=False, debug=debug)
             
             # Clear all remaining references
-            for attr in ['runner', 'current_model_name', 'debug', 'ctx']:
+            for attr in ['runner', '_model_name', 'debug', 'ctx']:
                 if hasattr(self, attr):
                     delattr(self, attr)
         except:

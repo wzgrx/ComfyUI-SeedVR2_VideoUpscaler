@@ -343,9 +343,9 @@ def prepare_runner(model_name: str, model_dir: str, preserve_vram: bool,
         current_model = getattr(cached_runner, '_model_name', None)
         if current_model != model_name:
             model_changed = True
-            debug.log(f"Model changed from {current_model} to {model_name}, clearing cache...", category="cache")
-            complete_cleanup(runner=cached_runner, debug=debug, keep_models_in_ram=False)
-            cached_runner = None
+            debug.log(f"Model changed from {current_model} to {model_name}, clearing DiT cache...", category="cache")
+            cleanup_dit(runner=cached_runner, debug=debug, keep_models_in_ram=False)
+            cached_runner = None  
     
     # Configure runner
     debug.log("Configuring inference runner...", category="runner")
@@ -748,13 +748,44 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
         debug.log(f"Error in Phase 2 (Upscaling): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
+        # Log BlockSwap summary if it was used
+        if hasattr(runner, '_blockswap_active') and runner._blockswap_active:
+            swap_summary = debug.get_swap_summary()
+            if swap_summary and swap_summary.get('total_swaps', 0) > 0:
+                total_time = swap_summary.get('block_total_ms', 0) + swap_summary.get('io_total_ms', 0)
+                debug.log("BlockSwap Summary", category="blockswap")
+                debug.log(f"  BlockSwap overhead: {total_time:.2f}ms", category="blockswap")
+                debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
+                
+                # Show block swap details
+                if 'block_swaps' in swap_summary and swap_summary['block_swaps'] > 0:
+                    avg_ms = swap_summary.get('block_avg_ms', 0)
+                    total_ms = swap_summary.get('block_total_ms', 0)
+                    min_ms = swap_summary.get('block_min_ms', 0)
+                    max_ms = swap_summary.get('block_max_ms', 0)
+                    
+                    debug.log(f"  Block swaps: {swap_summary['block_swaps']} "
+                            f"(avg: {avg_ms:.2f}ms, min: {min_ms:.2f}ms, max: {max_ms:.2f}ms, total: {total_ms:.2f}ms)", 
+                            category="blockswap")
+                    
+                    # Show most frequently swapped block
+                    if 'most_swapped_block' in swap_summary:
+                        debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
+                                f"({swap_summary['most_swapped_count']} times)", category="blockswap")
+                
+                # Show I/O swap details if present
+                if 'io_swaps' in swap_summary and swap_summary['io_swaps'] > 0:
+                    debug.log(f"  I/O swaps: {swap_summary['io_swaps']} "
+                            f"(avg: {swap_summary.get('io_avg_ms', 0):.2f}ms, total: {swap_summary.get('io_total_ms', 0):.2f}ms)", 
+                            category="blockswap")
+
         # Cleanup DiT as it's no longer needed after upscaling
         cleanup_dit(runner=runner, debug=debug, keep_models_in_ram=cache_model)
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
         
-        clear_memory(debug=debug, deep=False, force=True, timer_name="upscale_all_batches_finally")
+        clear_memory(debug=debug, deep=True, force=True, timer_name="upscale_all_batches_finally")
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)

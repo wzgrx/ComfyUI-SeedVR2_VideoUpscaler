@@ -185,8 +185,6 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
     # Create runner
     runner = VideoDiffusionInfer(config, debug, vae_tiling_enabled=vae_tiling_enabled, vae_tile_size=vae_tile_size, vae_tile_overlap=vae_tile_overlap)
     OmegaConf.set_readonly(runner.config, False)
-    # Store model name for cache validation
-    runner._model_name = model
     debug.end_timer("runner_video_infer", "Video diffusion inference runner initialization")
     
     # Set device

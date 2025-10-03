@@ -776,13 +776,7 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
     if debug:
         debug.log("Cleaning up DiT components", category="cleanup")
     
-    # 1. Clean BlockSwap if active
-    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-        # Import here to avoid circular dependency
-        from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
-    
-    # 2. Clear DiT-specific runtime caches
+    # 1. Clear DiT-specific runtime caches first
     if hasattr(runner, 'dit'):
         model = runner.dit
         if hasattr(model, 'dit_model'):  # Handle wrapper
@@ -802,19 +796,27 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
             if hasattr(actual_obj, attr):
                 delattr(actual_obj, attr)
     
-    # 3. Handle DiT model based on caching preference
+    # 2. Handle model movement/cleanup based on caching preference
     if keep_models_in_ram:
-        # Move to CPU but keep structure
+        # Move to CPU while BlockSwap is still active (if applicable)
         manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", 
                            preserve_vram=True, debug=debug, reason="model caching", runner=runner)
-    else:
+    
+    # 3. Clean BlockSwap after model movement
+    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+        # Import here to avoid circular dependency
+        from .blockswap import cleanup_blockswap
+        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
+    
+    # 4. Complete cleanup if not caching
+    if not keep_models_in_ram:
         # Full cleanup - release memory and delete
         release_model_memory(model=runner.dit, debug=debug)
         runner.dit = None
         if debug:
             debug.log("DiT model deleted", category="cleanup")
     
-    # 4. Clear DiT-related components
+    # 5. Clear DiT-related components
     for component in ['sampler', 'sampling_timesteps', 'schedule']:
         if hasattr(runner, component):
             setattr(runner, component, None)
