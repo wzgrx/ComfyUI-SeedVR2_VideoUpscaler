@@ -342,14 +342,23 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         progress_callback=None,
         cfg_scale=shared_args["cfg_scale"],
         seed=shared_args["seed"],
-        latent_noise_scale=shared_args["latent_noise_scale"]
+        latent_noise_scale=shared_args["latent_noise_scale"],
+        cache_model=False
     )
 
     # Phase 3: Decode all batches
     ctx = decode_all_batches(
-        runner,
-        ctx=ctx,
+        runner, 
+        ctx=ctx, 
         preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug, 
+        progress_callback=None,
+        cache_model=shared_args["cache_model"]
+    )
+    
+    # Phase 4: Post-processing and final assembly
+    ctx = postprocess_all_batches(
+        ctx=ctx,
         debug=worker_debug,
         progress_callback=None,
         color_correction=shared_args.get("color_correction", "wavelet")

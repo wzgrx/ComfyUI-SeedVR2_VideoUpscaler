@@ -395,6 +395,34 @@ def release_text_embeddings(*embeddings: torch.Tensor, debug: Optional[Any] = No
                 debug.log(f"Cleaned up {names[i]}", category="cleanup")
 
 
+def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional[Any] = None) -> None:
+    """
+    Clean up text embeddings from a context dictionary.
+    Extracts embeddings, releases memory, and clears the context entry.
+    
+    Args:
+        ctx: Context dictionary potentially containing 'text_embeds'
+        debug: Optional debug instance for logging
+    """
+    if not ctx or not ctx.get('text_embeds'):
+        return
+    
+    embeddings = []
+    names = []
+    for key, embeds_list in ctx['text_embeds'].items():
+        if embeds_list:
+            embeddings.extend(embeds_list)
+            names.append(key)
+    
+    if embeddings:
+        release_text_embeddings(embeddings, names, debug)
+        
+        if debug:
+            debug.log(f"Cleaned up text embeddings: {', '.join(names)}", category="cleanup")
+    
+    ctx['text_embeds'] = None
+
+    
 def release_model_memory(model: Optional[torch.nn.Module], debug: Optional[Any] = None) -> None:
     """
     Release all GPU/MPS memory from model in-place without CPU transfer.
@@ -737,9 +765,99 @@ def clear_runtime_caches(runner: Any, debug: Optional[Any]) -> int:
     return cleaned_items
 
 
+def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
+    """
+    Cleanup DiT model and BlockSwap state after upscaling phase.
+    Called at the end of upscale_all_batches when DiT is no longer needed.
+    """
+    if not runner or not hasattr(runner, 'dit'):
+        return
+    
+    if debug:
+        debug.log("Cleaning up DiT components", category="cleanup")
+    
+    # 1. Clean BlockSwap if active
+    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+        # Import here to avoid circular dependency
+        from .blockswap import cleanup_blockswap
+        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
+    
+    # 2. Clear DiT-specific runtime caches
+    if hasattr(runner, 'dit'):
+        model = runner.dit
+        if hasattr(model, 'dit_model'):  # Handle wrapper
+            model = model.dit_model
+        
+        # Clear RoPE caches
+        rope_cleared = clear_rope_lru_caches(model=model, debug=debug)
+        if rope_cleared > 0 and debug:
+            debug.log(f"Cleared {rope_cleared} RoPE LRU caches", category="success")
+        
+        # Clear DiT temporary attributes
+        temp_attrs = ['_temp_cache', '_block_cache', '_swap_cache', '_generation_cache',
+                      '_rope_cache', '_intermediate_cache', '_backward_cache']
+        
+        actual_obj = model.dit_model if hasattr(model, 'dit_model') else model
+        for attr in temp_attrs:
+            if hasattr(actual_obj, attr):
+                delattr(actual_obj, attr)
+    
+    # 3. Handle DiT model based on caching preference
+    if keep_models_in_ram:
+        # Move to CPU but keep structure
+        manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", 
+                           preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+    else:
+        # Full cleanup - release memory and delete
+        release_model_memory(model=runner.dit, debug=debug)
+        runner.dit = None
+        if debug:
+            debug.log("DiT model deleted", category="cleanup")
+    
+    # 4. Clear DiT-related components
+    for component in ['sampler', 'sampling_timesteps', 'schedule']:
+        if hasattr(runner, component):
+            setattr(runner, component, None)
+
+
+def cleanup_vae(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
+    """
+    Cleanup VAE model after decoding phase.
+    Called at the end of decode_all_batches when VAE is no longer needed.
+    """
+    if not runner or not hasattr(runner, 'vae'):
+        return
+    
+    if debug:
+        debug.log("Cleaning up VAE components", category="cleanup")
+    
+    # 1. Clear VAE-specific temporary attributes
+    if hasattr(runner, 'vae'):
+        temp_attrs = ['_temp_cache', '_block_cache', '_swap_cache', '_generation_cache',
+                      '_rope_cache', '_intermediate_cache', '_backward_cache']
+        
+        for attr in temp_attrs:
+            if hasattr(runner.vae, attr):
+                delattr(runner.vae, attr)
+    
+    # 2. Handle VAE model based on caching preference
+    if keep_models_in_ram:
+        # Move to CPU but keep structure
+        manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", 
+                           preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+    else:
+        # Full cleanup - release memory and delete
+        release_model_memory(model=runner.vae, debug=debug)
+        runner.vae = None
+        if debug:
+            debug.log("VAE model deleted", category="cleanup")
+
+
 def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
     """
-    Complete cleanup of runner and all components.
+    Complete cleanup of runner and remaining components.
+    This is now a lightweight cleanup for final stage, as model-specific cleanup
+    happens in their respective phases.
     """
     if not runner:
         return
@@ -748,43 +866,27 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
     if debug:
         debug.log(f"Starting {cleanup_type}", category="cleanup")
     
-    # 1. Clean BlockSwap if active
-    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-        # Import here to avoid circular dependency
-        from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
+    # 1. Cleanup any remaining models if they still exist
+    # (This handles cases where phases were skipped or errored)
+    if hasattr(runner, 'dit') and runner.dit is not None:
+        cleanup_dit(runner=runner, debug=debug, keep_models_in_ram=keep_models_in_ram)
     
-    # 2. Clear all runtime caches
+    if hasattr(runner, 'vae') and runner.vae is not None:
+        cleanup_vae(runner=runner, debug=debug, keep_models_in_ram=keep_models_in_ram)
+    
+    # 2. Clear remaining runtime caches
     clear_runtime_caches(runner=runner, debug=debug)
     
-    if keep_models_in_ram:
-        # 3a. Partial cleanup - move models to CPU but keep structure
-        if hasattr(runner, 'dit'):
-            manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", preserve_vram=True, debug=debug, reason="model caching", runner=runner)
-        
-        if hasattr(runner, 'vae'):
-            manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", preserve_vram=True, debug=debug, reason="model caching", runner=runner)
-    else:
-        # 3b. Full cleanup - release memory and delete
-        if hasattr(runner, 'dit'):
-            release_model_memory(model=runner.dit, debug=debug)
-            runner.dit = None
-            debug.log("DiT model deleted", category="cleanup")
-        
-        if hasattr(runner, 'vae'):
-            release_model_memory(model=runner.vae, debug=debug)
-            runner.vae = None
-            debug.log("VAE model deleted", category="cleanup")
-        
-        # Clear other components
-        for component in ['sampler', 'sampling_timesteps', 'schedule', 'config']:
-            if hasattr(runner, component):
-                setattr(runner, component, None)
+    # 3. Clear config and other non-model components
+    if not keep_models_in_ram:
+        if hasattr(runner, 'config'):
+            setattr(runner, 'config', None)
     
     # 4. Final memory cleanup
     clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
-
-    # 5. Clearing cuBLAS workspaces
+    
+    # 5. Clear cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None
-
-    debug.log(f"Completed {cleanup_type}", category="success")
+    
+    if debug:
+        debug.log(f"Completed {cleanup_type}", category="success")

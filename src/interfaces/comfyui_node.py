@@ -21,10 +21,11 @@ from ..core.generation import (
     prepare_runner,
     encode_all_batches, 
     upscale_all_batches, 
-    decode_all_batches, 
+    decode_all_batches,
+    postprocess_all_batches,
 )
 from ..optimization.memory_manager import (
-    release_text_embeddings,
+    cleanup_text_embeddings,
     complete_cleanup, 
     get_device_list
 )
@@ -224,16 +225,8 @@ class SeedVR2:
                 self.runner = None
         
         # Clean up context text embeddings if they exist
-        if self.ctx and self.ctx.get('text_embeds'):
-            embeddings = []
-            names = []
-            for key, embeds_list in self.ctx['text_embeds'].items():
-                if embeds_list:
-                    embeddings.extend(embeds_list)
-                    names.append(key)
-            if embeddings:
-                release_text_embeddings(*embeddings, debug=debug, names=names)
-            self.ctx['text_embeds'] = None
+        if self.ctx:
+            cleanup_text_embeddings(self.ctx, debug)
         self.ctx = None
         
         if not cache_model:
@@ -306,7 +299,8 @@ class SeedVR2:
             progress_callback=self._progress_callback, 
             cfg_scale=cfg_scale, 
             seed=seed,
-            latent_noise_scale=latent_noise_scale
+            latent_noise_scale=latent_noise_scale,
+            cache_model=cache_model
         )
 
         # Phase 3: Decode all batches
@@ -316,6 +310,14 @@ class SeedVR2:
             preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback,
+            cache_model=cache_model
+        )
+
+        # Phase 4: Post-processing and final assembly
+        ctx = postprocess_all_batches(
+            ctx=ctx,
+            debug=debug,
+            progress_callback=self._progress_callback,
             color_correction=color_correction
         )
 
@@ -324,50 +326,26 @@ class SeedVR2:
         
         debug.log("", category="none", force=True)
         debug.log("Video upscaling completed successfully!", category="generation", force=True)
-
-        # Log performance summary before clearing
-        if debug.enabled:            
-            # Log BlockSwap summary if it was used
-            if hasattr(self.runner, '_blockswap_active') and self.runner._blockswap_active:
-                swap_summary = debug.get_swap_summary()
-                if swap_summary and swap_summary.get('total_swaps', 0) > 0:
-                    total_time = swap_summary.get('block_total_ms', 0) + swap_summary.get('io_total_ms', 0)
-                    debug.log("", category="none")
-                    debug.log(f"BlockSwap overhead: {total_time:.2f}ms", category="blockswap")
-                    debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
-                    
-                    # Show block swap details
-                    if 'block_swaps' in swap_summary and swap_summary['block_swaps'] > 0:
-                        avg_ms = swap_summary.get('block_avg_ms', 0)
-                        total_ms = swap_summary.get('block_total_ms', 0)
-                        min_ms = swap_summary.get('block_min_ms', 0)
-                        max_ms = swap_summary.get('block_max_ms', 0)
-                        
-                        debug.log(f"  Block swaps: {swap_summary['block_swaps']} "
-                                f"(avg: {avg_ms:.2f}ms, min: {min_ms:.2f}ms, max: {max_ms:.2f}ms, total: {total_ms:.2f}ms)", 
-                                category="blockswap")
-                        
-                        # Show most frequently swapped block
-                        if 'most_swapped_block' in swap_summary:
-                            debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
-                                    f"({swap_summary['most_swapped_count']} times)", category="blockswap")
+        
+        # Log BlockSwap summary if it was used
+        if hasattr(self.runner, 'block_swap_state') and self.runner.block_swap_state:
+            swap_summary = self.runner.block_swap_state.get_summary()
+            if swap_summary['enabled'] and swap_summary['total_swaps'] > 0:
+                debug.log("", category="none")
+                debug.log("━━━━━━━━━ BlockSwap Summary ━━━━━━━━━", category="none")
+                debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
+                debug.log(f"  Peak memory saved: {swap_summary['peak_memory_saved']:.2f} GB", category="blockswap")
+                debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
+                                   f"({swap_summary['most_swapped_count']} times)", category="blockswap")
 
         debug.end_timer("generation", "Video generation")
-       
-        debug.log("", category="none")
-        debug.log("━━━━━━━━━ Final Cleanup ━━━━━━━━━", category="none")
-        debug.start_timer("final_cleanup")
-        
-        # Perform cleanup (this already calls clear_memory internally)
-        self.cleanup(cache_model=cache_model, debug=debug)
         
         # Ensure sample is on CPU (ComfyUI expects CPU tensors)
         if torch.is_tensor(sample) and sample.is_cuda:
             sample = sample.cpu()
         
-        # Log final memory state after ALL cleanup is done
-        debug.end_timer("final_cleanup", "Final cleanup", show_breakdown=True)
-        debug.log_memory_state("After final cleanup", show_tensors=True, detailed_tensors=False)
+        # Log final memory state after ALL cleanup is done by the phases
+        debug.log_memory_state("After all phases complete", show_tensors=True, detailed_tensors=False)
         
         # Final timing summary
         debug.log("", category="none")

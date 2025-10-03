@@ -1,22 +1,25 @@
 """
 Generation Logic Module for SeedVR2
 
-This module implements a three-phase batch processing pipeline for video upscaling:
+This module implements a four-phase batch processing pipeline for video upscaling:
 - Phase 1: Batch VAE encoding of all input frames
 - Phase 2: Batch DiT upscaling of all encoded latents
 - Phase 3: Batch VAE decoding of all upscaled latents
+- Phase 4: Post-processing and final video assembly
 
 This architecture minimizes model swapping overhead by completing each phase
 for all batches before moving to the next phase, significantly improving
 performance especially when using model offloading.
 
 Key Features:
-- Three-phase pipeline (encode-all → upscale-all → decode-all) for efficiency
+- Four-phase pipeline (encode-all → upscale-all → decode-all → postprocess-all) for efficiency
 - Native FP8 pipeline support for 2x speedup and 50% VRAM reduction
 - Temporal overlap support for smooth transitions between batches
 - Adaptive dtype detection and optimal autocast configuration
 - Memory-efficient pre-allocated batch processing
 - Advanced video format handling (4n+1 constraint)
+- Clean separation of concerns with phase-specific resource management
+- Each phase handles its own cleanup in finally blocks
 """
 
 import os
@@ -32,10 +35,12 @@ from ..utils.constants import get_script_directory
 from ..common.distributed import get_device
 from .model_manager import configure_runner
 from ..optimization.memory_manager import (
-    clear_memory, 
-    release_text_embeddings, 
-    manage_model_device, 
-    complete_cleanup
+    cleanup_dit,
+    cleanup_vae,
+    cleanup_text_embeddings,
+    complete_cleanup,
+    clear_memory,
+    manage_model_device
 )
 from ..optimization.performance import (
     optimized_video_rearrange, 
@@ -584,7 +589,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
                         preserve_vram: bool = False, debug: Optional['Debug'] = None, 
                         progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
                         cfg_scale: float = 1.0, seed: int = 100, 
-                        latent_noise_scale: float = 0.0) -> Dict[str, Any]:
+                        latent_noise_scale: float = 0.0, cache_model: bool = False) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -603,6 +608,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
                            Adds noise during diffusion conditioning. Can soften details
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
+        cache_model: If True, keep models in RAM for reuse instead of deleting them
         
     Returns:
         dict: Updated context containing:
@@ -742,12 +748,13 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
         debug.log(f"Error in Phase 2 (Upscaling): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always offload DiT if needed
-        if preserve_vram:
-            manage_model_device(model=runner.dit, target_device='cpu', 
-                              model_name="DiT", preserve_vram=preserve_vram, debug=debug,
-                              runner=runner)
-        clear_memory(debug=debug, deep=False, force=True, timer_name=f"upscale_all_batches - finally - minimal")
+        # Cleanup DiT as it's no longer needed after upscaling
+        cleanup_dit(runner=runner, debug=debug, keep_models_in_ram=cache_model)
+        
+        # Cleanup text embeddings as they're no longer needed after upscaling
+        cleanup_text_embeddings(ctx, debug)
+        
+        clear_memory(debug=debug, deep=False, force=True, timer_name="upscale_all_batches_finally")
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
@@ -758,11 +765,11 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
 def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
                        preserve_vram: bool = False, debug: Optional['Debug'] = None, 
                        progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
-                       color_correction: str = "wavelet") -> Dict[str, Any]:
+                       cache_model: bool = False) -> Dict[str, Any]:
     """
-    Phase 3: VAE Decoding and Final Video Assembly.
+    Phase 3: VAE Decoding.
     
-    Decodes all upscaled latents back to pixel space and assembles final video.
+    Decodes all upscaled latents back to pixel space.
     Requires context from upscale_all_batches with upscaled latents.
     
     Args:
@@ -771,12 +778,12 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         preserve_vram: If True, offload VAE between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
-        color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
+        cache_model: If True, keep models in RAM for reuse instead of deleting them
         
     Returns:
         dict: Updated context containing:
-            - final_video: Assembled video tensor [T, H, W, C] in float16, range [0,1]
-            - All intermediate storage cleared for memory efficiency
+            - batch_samples: List of decoded samples ready for post-processing
+            - VAE cleanup completed
             
     Raises:
         ValueError: If context is missing or has no upscaled latents
@@ -794,11 +801,6 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     # Validate we have upscaled latents
     if 'all_upscaled_latents' not in ctx or not ctx['all_upscaled_latents']:
         raise ValueError("No upscaled latents found. Run upscale_all_batches first.")
-    
-    # Validate we have transformed videos if color correction is enabled
-    if color_correction != "none":
-        if 'all_transformed_videos' not in ctx or not ctx['all_transformed_videos']:
-            raise ValueError("No transformed videos found for color correction. Context corrupted.")
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 3: VAE decoding ━━━━━━━━", category="none", force=True)
@@ -844,25 +846,109 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
             # Process samples
             samples = optimized_video_rearrange(samples)
             
-            # Post-process samples
+            # Store decoded samples for post-processing
+            ctx['batch_samples'][decode_idx] = samples
+            
+            # Free the upscaled latent
+            ctx['all_upscaled_latents'][batch_idx] = None
+            del upscaled_latent, samples
+            
+            debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
+            
+            if progress_callback:
+                progress_callback(decode_idx+1, num_valid_latents,
+                                1, "Phase 3: Decoding")
+            
+            decode_idx += 1
+            
+    except Exception as e:
+        debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
+        raise
+    finally:
+        # Cleanup VAE as it's no longer needed
+        cleanup_vae(runner=runner, debug=debug, keep_models_in_ram=cache_model)
+        
+        # Clean up upscaled latents storage
+        if 'all_upscaled_latents' in ctx:
+            del ctx['all_upscaled_latents']
+        
+    debug.end_timer("phase3_decoding", "Phase 3: VAE decoding complete", show_breakdown=True)
+    debug.log_memory_state("After phase 3 (VAE decoding)", show_tensors=False)
+    
+    return ctx
+
+
+def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
+                         debug: Optional['Debug'] = None,
+                         progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+                         color_correction: str = "wavelet") -> Dict[str, Any]:
+    """
+    Phase 4: Post-processing and Final Video Assembly.
+    
+    Applies color correction and assembles the final video from decoded batches.
+    Requires context from decode_all_batches with decoded samples.
+    
+    Args:
+        ctx: Context from decode_all_batches containing batch_samples (required)
+        debug: Debug instance for logging (required)
+        progress_callback: Optional callback(current, total, frames, phase_name)
+        color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
+        
+    Returns:
+        dict: Updated context containing:
+            - final_video: Assembled video tensor [T, H, W, C] in float16, range [0,1]
+            - All intermediate storage cleared for memory efficiency
+            
+    Raises:
+        ValueError: If context is missing or has no batch samples
+    """
+    if debug is None:
+        raise ValueError("Debug instance must be provided to postprocess_all_batches")
+    
+    if ctx is None:
+        raise ValueError("Context is required for postprocess_all_batches. Run decode_all_batches first.")
+    
+    # Validate we have batch samples
+    if 'batch_samples' not in ctx or not ctx['batch_samples']:
+        raise ValueError("No batch samples found. Run decode_all_batches first.")
+    
+    debug.log("", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 4: Post-processing ━━━━━━━━", category="none", force=True)
+    debug.start_timer("phase4_postprocess")
+    
+    # Count valid samples
+    num_valid_samples = len([s for s in ctx['batch_samples'] if s is not None])
+    processed_samples = []
+    
+    try:
+        for batch_idx, samples in enumerate(ctx['batch_samples']):
+            if samples is None:
+                continue
+                
+            check_interrupt(ctx)
+            
+            debug.log(f"Post-processing batch {batch_idx+1}/{num_valid_samples}", category="video", force=True)
+            debug.start_timer(f"postprocess_batch_{batch_idx+1}")
+            
+            # Post-process each sample in the batch
             for i, sample in enumerate(samples):
                 # Get original length for trimming (always available)
                 video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
-                ori_length = ctx['all_ori_lengths'][video_idx]
+                ori_length = ctx['all_ori_lengths'][video_idx] if 'all_ori_lengths' in ctx else sample.shape[0]
                 
                 # Trim to original length if necessary
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
                 
                 # Apply color correction if enabled
-                if color_correction != "none" and ctx['all_transformed_videos'] is not None:
+                if color_correction != "none" and ctx.get('all_transformed_videos') is not None:
                     # Get transformed video from CPU
                     transformed_video = ctx['all_transformed_videos'][video_idx]
                     
                     # Move to GPU for color correction
                     transformed_video = transformed_video.to(ctx['device'], non_blocking=False)
                     
-                    # Adjust transformed video to handles cases when padding was applied during encoding
+                    # Adjust transformed video to handle cases when padding was applied during encoding
                     if transformed_video.shape[1] != sample.shape[0]:
                         debug.log(f"Trimming transformed video from {transformed_video.shape[1]} to {sample.shape[0]} frames to match original input", 
                                 category="video")
@@ -892,7 +978,8 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
                     debug.log("Color correction disabled (set to none)", category="video")
                 
                 # Free the original length entry
-                ctx['all_ori_lengths'][video_idx] = None
+                if 'all_ori_lengths' in ctx and video_idx < len(ctx['all_ori_lengths']):
+                    ctx['all_ori_lengths'][video_idx] = None
                 
                 # Convert to final format
                 sample = optimized_sample_to_image_format(sample)
@@ -900,86 +987,73 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
                 sample_cpu = sample.to(torch.float16).to("cpu")
                 del sample
                 
-                # Store by index for pre-allocation
-                ctx['batch_samples'][decode_idx] = sample_cpu
+                # Store processed sample
+                processed_samples.append(sample_cpu)
             
-            # Free the upscaled latent
-            ctx['all_upscaled_latents'][batch_idx] = None
-            del upscaled_latent, samples
-            
-            debug.end_timer(f"decode_batch_{decode_idx+1}", f"Decoded batch {decode_idx+1}")
+            debug.end_timer(f"postprocess_batch_{batch_idx+1}", f"Post-processed batch {batch_idx+1}")
             
             if progress_callback:
-                progress_callback(decode_idx+1, num_valid_latents,
-                                1, "Phase 3: Decoding")
-            
-            decode_idx += 1
-            
-    except Exception as e:
-        debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
-        raise
-    finally:
-        # Always offload VAE if needed
-        if preserve_vram:
-            manage_model_device(model=runner.vae, target_device='cpu', 
-                              model_name="VAE", preserve_vram=preserve_vram, debug=debug,
-                              runner=runner)
-        
-        # Always clean up intermediate storage
-        if 'all_latents' in ctx:
-            del ctx['all_latents']
-        if 'all_upscaled_latents' in ctx:
-            del ctx['all_upscaled_latents']
-        if 'all_transformed_videos' in ctx:
-            del ctx['all_transformed_videos']
-        if 'all_ori_lengths' in ctx:
-            del ctx['all_ori_lengths']
-    
-    debug.log("Assembling final video from decoded batches...", category="video")
+                progress_callback(batch_idx+1, num_valid_samples,
+                                1, "Phase 4: Post-processing")
 
-    # Merge all batch results into final video
-    if ctx['batch_samples'] and any(s is not None for s in ctx['batch_samples']):
-        valid_samples = [s for s in ctx['batch_samples'] if s is not None]
-        total_frames = sum(batch.shape[0] for batch in valid_samples)
-        
-        if total_frames > 0:
-            sample_shape = valid_samples[0].shape
-            H, W, C = sample_shape[1], sample_shape[2], sample_shape[3]
-            
-            debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info")
-            
-            # Pre-allocate final tensor
-            ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=torch.float16)
-            
-            # Copy batch results into final tensor
-            current_idx = 0
-            for batch in valid_samples:
-                batch_frames = batch.shape[0]
-                ctx['final_video'][current_idx:current_idx + batch_frames] = batch
-                current_idx += batch_frames
-            
-            final_shape = ctx['final_video'].shape
-            Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
+        debug.log("Assembling final video from processed batches...", category="video")
 
-            debug.log(f"Final video assembled: Total frames: {total_frames}, shape per frame: {Hf}x{Wf}x{Cf}", category="video", force=True)
+        # Merge all processed samples into final video
+        if processed_samples:
+            total_frames = sum(batch.shape[0] for batch in processed_samples)
+            
+            if total_frames > 0:
+                sample_shape = processed_samples[0].shape
+                H, W, C = sample_shape[1], sample_shape[2], sample_shape[3]
+                
+                debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info")
+                
+                # Pre-allocate final tensor
+                ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=torch.float16)
+                
+                # Copy batch results into final tensor
+                current_idx = 0
+                for batch in processed_samples:
+                    batch_frames = batch.shape[0]
+                    ctx['final_video'][current_idx:current_idx + batch_frames] = batch
+                    current_idx += batch_frames
+                
+                final_shape = ctx['final_video'].shape
+                Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
+
+                debug.log(f"Final video assembled: Total frames: {total_frames}, shape per frame: {Hf}x{Wf}x{Cf}", category="video", force=True)
+            else:
+                ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
+                debug.log("No frame to assemble", level="WARNING", category="video", force=True)
         else:
             ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
-            debug.log("No frame to assemble", level="WARNING", category="video", force=True)
-    else:
-        ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
-        debug.log("No samples to assemble", level="WARNING", category="video", force=True)
-    
-    # Clean up batch samples
-    ctx['batch_samples'].clear()
-    
-    # Clean up video transform
-    if ctx.get('video_transform'):
-        for transform in ctx['video_transform'].transforms:
-            if hasattr(transform, '__dict__'):
-                transform.__dict__.clear()
-        ctx['video_transform'] = None
-    
-    debug.end_timer("phase3_decoding", "Phase 3: VAE decoding complete", show_breakdown=True)
-    debug.log_memory_state("After phase 3 (VAE decoding)", show_tensors=False)
+            debug.log("No samples to assemble", level="WARNING", category="video", force=True)
+            
+    except Exception as e:
+        debug.log(f"Error in Phase 4 (Post-processing): {e}", level="ERROR", category="error", force=True)
+        raise
+    finally:
+        # Clean up post-processing intermediate storage
+        if 'batch_samples' in ctx:
+            ctx['batch_samples'].clear()
+            del ctx['batch_samples']
+        
+        # Clean up video transform
+        if ctx.get('video_transform'):
+            for transform in ctx['video_transform'].transforms:
+                if hasattr(transform, '__dict__'):
+                    transform.__dict__.clear()
+            ctx['video_transform'] = None
+            
+        # Clean up any remaining intermediate storage
+        for storage_key in ['all_latents', 'all_transformed_videos', 'all_ori_lengths']:
+            if storage_key in ctx:
+                del ctx[storage_key]
+        
+        # Final deep memory clear to ensure everything is cleaned
+        clear_memory(debug=debug, deep=True, force=True, timer_name="final_memory_clear")
+        
+    debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
+    debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)
     
     return ctx
