@@ -263,6 +263,7 @@ class SeedVR2:
         )
         self._model_name = model
 
+        debug.log_memory_state("After model preparation", show_tensors=True, detailed_tensors=False)
         debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
 
         debug.log("", category="none", force=True)

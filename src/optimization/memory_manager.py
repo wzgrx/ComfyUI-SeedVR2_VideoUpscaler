@@ -816,8 +816,12 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
         if debug:
             debug.log("DiT model deleted", category="cleanup")
     
-    # 5. Clear DiT-related components
-    for component in ['sampler', 'sampling_timesteps', 'schedule']:
+    # 5. Clear DiT-related components and temporary attributes
+    dit_components = [
+        'sampler', 'sampling_timesteps', 'schedule',
+        '_dit_checkpoint', '_dit_block_swap_config', '_pending_blockswap_config'
+    ]
+    for component in dit_components:
         if hasattr(runner, component):
             setattr(runner, component, None)
 
@@ -853,6 +857,12 @@ def cleanup_vae(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
         runner.vae = None
         if debug:
             debug.log("VAE model deleted", category="cleanup")
+    
+    # 3. Clear VAE temporary attributes
+    vae_attributes = ['_vae_checkpoint', '_vae_dtype_override']
+    for attr in vae_attributes:
+        if hasattr(runner, attr):
+            setattr(runner, attr, None)
 
 
 def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
@@ -884,10 +894,19 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool
         if hasattr(runner, 'config'):
             setattr(runner, 'config', None)
     
-    # 4. Final memory cleanup
+    # 4. Clear all temporary loading/configuration attributes
+    temp_attributes = [
+        '_dit_checkpoint', '_dit_block_swap_config', '_pending_blockswap_config',
+        '_vae_checkpoint', '_vae_dtype_override', '_model_name'
+    ]
+    for attr in temp_attributes:
+        if hasattr(runner, attr):
+            setattr(runner, attr, None)
+    
+    # 5. Final memory cleanup
     clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
     
-    # 5. Clear cuBLAS workspaces
+    # 6. Clear cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None
     
     if debug:

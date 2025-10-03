@@ -33,7 +33,7 @@ from torchvision.transforms import Compose, Lambda, Normalize
 
 from ..utils.constants import get_script_directory
 from ..common.distributed import get_device
-from .model_manager import configure_runner
+from .model_manager import configure_runner, materialize_model
 from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
@@ -47,6 +47,7 @@ from ..optimization.performance import (
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
+from ..optimization.blockswap import apply_block_swap_to_dit
 from ..common.seed import set_seed
 from ..data.image.transforms.divisible_crop import DivisibleCrop
 from ..data.image.transforms.na_resize import NaResize
@@ -481,10 +482,17 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     encode_idx = 0
     
     try:
-        # Move VAE to GPU once for all encoding
+        # Materialize VAE if still on meta device
+        if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
+            materialize_model(runner, "vae", str(ctx['device']), runner.config, 
+                            preserve_vram, debug)
+        
+        # Move VAE to GPU for encoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
+        
+        debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
         for batch_idx in range(0, total_frames, step):
             check_interrupt(ctx)
@@ -665,11 +673,23 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
     upscale_idx = 0
     
     try:
-        # Move DiT to GPU once for all upscaling
+        # Materialize DiT if still on meta device
+        if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
+            materialize_model(runner, "dit", str(ctx['device']), runner.config, 
+                            preserve_vram, debug)
+        # Check for pending BlockSwap on already-materialized cached models
+        elif hasattr(runner, '_pending_blockswap_config') and runner._pending_blockswap_config:
+            debug.log("Applying deferred BlockSwap to cached DiT", category="blockswap")
+            apply_block_swap_to_dit(runner, runner._pending_blockswap_config, debug)
+            runner._pending_blockswap_config = None
+        
+        # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=str(ctx['device']), 
                             model_name="DiT", preserve_vram=False, debug=debug,
                             runner=runner)
         
+        debug.log_memory_state("After DiT loading", detailed_tensors=False)
+
         for batch_idx, latent in enumerate(ctx['all_latents']):
             if latent is None:
                 continue
@@ -847,10 +867,17 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     decode_idx = 0
     
     try:
-        # Move VAE to GPU once for all decoding
+        # VAE should already be materialized from encoding phase
+        if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
+            materialize_model(runner, "vae", str(ctx['device']), runner.config, 
+                            preserve_vram, debug)
+        
+        # Move VAE to GPU for decoding
         manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
+        
+        debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
         for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
             if upscaled_latent is None:

@@ -145,7 +145,6 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
 
     debug.log("BlockSwap configuration complete", category="success")
     debug.end_timer("apply_blockswap", "BlockSwap configuration application")
-    debug.log_memory_state("After BlockSwap", detailed_tensors=False)
     
 
 def _configure_io_components(model, device: str, offload_device: str, 

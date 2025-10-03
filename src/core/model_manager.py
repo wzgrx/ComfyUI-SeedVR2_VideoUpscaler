@@ -131,9 +131,12 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
             # Always cleanup existing BlockSwap state when config changes
             cleanup_blockswap(cached_runner, keep_state_for_cache=False)
             
-            # Apply new configuration only if not disabled
+            # DEFER new configuration to DiT phase instead of applying now
             if desired_config:
-                apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
+                cached_runner._pending_blockswap_config = block_swap_config
+                debug.log("BlockSwap application deferred to DiT phase", category="blockswap")
+            else:
+                cached_runner._pending_blockswap_config = None
                 
         elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
             # Config matches but was deactivated - just reactivate
@@ -192,15 +195,14 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
     #if torch.mps.is_available():
     #    device = "mps"
     
-    # Configure models
+    # Prepare model structures
     dit_checkpoint_path = find_model_file(model, base_cache_dir)
-    debug.start_timer("dit_model_infer")
-    runner = configure_model_inference(runner, "dit", device, dit_checkpoint_path, config,
-                                   preserve_vram, debug, block_swap_config)
-
-    debug.end_timer("dit_model_infer", "DiT model configuration")
-    debug.log_memory_state("After DiT model configuration", detailed_tensors=False)
-
+    debug.start_timer("model_structures")
+    
+    # Prepare DiT structure
+    runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, config, 
+                                    block_swap_config, debug)
+    
     # Set VAE dtype for MPS compatibility
     if torch.mps.is_available():
         original_vae_dtype = config.vae.dtype
@@ -208,28 +210,19 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
         debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {config.vae.dtype} for compatibility", 
                     category="precision", force=True)
     
-    debug.start_timer("vae_model_infer")
+    # Prepare VAE structure
     vae_checkpoint_path = find_model_file(config.vae.checkpoint, base_cache_dir)
-    vae_override_dtype = getattr(torch, config.vae.dtype) if torch.mps.is_available() else None
-    runner = configure_model_inference(runner, "vae", device, vae_checkpoint_path, config,
-                                   preserve_vram, debug=debug, override_dtype=vae_override_dtype)
+    runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, config, 
+                                    None, debug)
+    
     debug.log(f"VAE downsample factors configured (spatial: {spatial_downsample_factor}x, temporal: {temporal_downsample_factor}x)", category="vae")
-    debug.end_timer("vae_model_infer", "VAE model configuration")
-    debug.log_memory_state("After VAE model configuration", detailed_tensors=False)
+    
+    debug.end_timer("model_structures", "Model structures prepared")
     
     debug.start_timer("vae_memory_limit")
     if hasattr(runner.vae, "set_memory_limit"):
         runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
     debug.end_timer("vae_memory_limit", "VAE memory limit set")
-    
-    # Check if BlockSwap is active
-    blockswap_active = (
-        block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
-    )
-    
-    # Apply BlockSwap if configured
-    if blockswap_active:
-        apply_block_swap_to_dit(runner, block_swap_config, debug)
     
     # Store debug instance on runner for consistent access
     runner.debug = debug
@@ -528,52 +521,104 @@ class GGUFTensor(torch.Tensor):
         return super().__torch_function__(func, types, args, kwargs)
 
 
-def configure_model_inference(runner: VideoDiffusionInfer, model_type: str, device: str, 
-                             checkpoint_path: str, config: OmegaConf, 
-                             preserve_vram: bool = False, debug: Optional[Debug] = None, 
-                             block_swap_config: Optional[Dict[str, Any]] = None,
-                             override_dtype: Optional[torch.dtype] = None) -> VideoDiffusionInfer:
+def prepare_model_structure(runner: VideoDiffusionInfer, model_type: str, 
+                           checkpoint_path: str, config: OmegaConf, 
+                           block_swap_config: Optional[Dict[str, Any]] = None,
+                           debug: Optional[Debug] = None) -> VideoDiffusionInfer:
     """
-    Configure DiT or VAE model for inference with optimized memory management.
-    
-    Uses meta device initialization for CPU models to avoid unnecessary memory allocation
-    during model creation, reducing initialization time by ~90% for large models.
+    Prepare model structure on meta device without loading weights.
+    This uses zero memory as meta device doesn't allocate real memory.
     
     Args:
-        runner: VideoDiffusionInfer instance to configure
-        model_type: "dit" or "vae" - determines model configuration
-        device (str): Target device for inference (cuda:0, cpu, etc.)
-        checkpoint_path (str): Path to model checkpoint (.safetensors or .pth)
-        config: Model configuration object with dit/vae sub-configs
-        preserve_vram (bool): Keep model on CPU to preserve VRAM
-        debug: Debug instance for logging and profiling
-        block_swap_config (dict): BlockSwap configuration (DiT only)
-        override_dtype (torch.dtype, optional): Override model weights dtype during loading
-            (e.g., torch.bfloat16 for MPS compatibility)
+        runner: VideoDiffusionInfer instance
+        model_type: "dit" or "vae"
+        checkpoint_path: Path to checkpoint (stored for later loading)
+        config: Model configuration
+        block_swap_config: BlockSwap config (stored for DiT)
+        debug: Debug instance
         
     Returns:
-        runner: Updated runner with configured model
-        
-    Raises:
-        ValueError: If debug instance is not provided
+        runner: Updated runner with model structure on meta device
     """
     if debug is None:
-        raise ValueError(f"Debug instance must be provided to configure_{model_type}_model_inference")
+        raise ValueError(f"Debug instance required for prepare_model_structure")
     
-    # Model type configuration
     is_dit = (model_type == "dit")
     model_type_upper = "DiT" if is_dit else "VAE"
     model_config = config.dit.model if is_dit else config.vae.model
     
-    # Determine target device and reason for CPU usage
+    # Always create on meta device for zero memory usage
+    debug.log(f"Creating {model_type_upper} model structure on meta device", 
+             category=model_type, force=True)
+    debug.start_timer(f"{model_type}_structure")
+    
+    with torch.device("meta"):
+        model = create_object(model_config)
+    
+    debug.end_timer(f"{model_type}_structure", f"{model_type_upper} structure created")
+    
+    # Store model and config for later materialization
+    if is_dit:
+        runner.dit = model
+        runner._dit_checkpoint = checkpoint_path
+        runner._dit_block_swap_config = block_swap_config
+    else:
+        runner.vae = model  
+        runner._vae_checkpoint = checkpoint_path
+        # Store VAE dtype override if needed
+        runner._vae_dtype_override = getattr(torch, config.vae.dtype) if torch.mps.is_available() else None
+    
+    return runner
+
+
+def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str, 
+                     config: OmegaConf, preserve_vram: bool = False,
+                     debug: Optional[Debug] = None) -> None:
+    """
+    Materialize model weights from checkpoint to memory.
+    Call this right before the model is needed.
+    
+    Args:
+        runner: Runner with model structure on meta device
+        model_type: "dit" or "vae"
+        device: Target device for inference
+        config: Full configuration
+        preserve_vram: Whether to keep on CPU
+        debug: Debug instance
+    """
+    if debug is None:
+        raise ValueError(f"Debug instance required for materialize_model")
+        
+    is_dit = (model_type == "dit")
+    model_type_upper = "DiT" if is_dit else "VAE"
+    
+    # Get model and checkpoint path
+    if is_dit:
+        model = runner.dit
+        checkpoint_path = runner._dit_checkpoint
+        block_swap_config = runner._dit_block_swap_config
+        override_dtype = None
+    else:
+        model = runner.vae
+        checkpoint_path = runner._vae_checkpoint
+        block_swap_config = None
+        override_dtype = runner._vae_dtype_override
+    
+    # Check if already materialized
+    if model is None:
+        debug.log(f"No {model_type_upper} model structure found", level="WARNING", category=model_type, force=True)
+        return
+    param_device = next(model.parameters()).device
+    if param_device.type != 'meta':
+        debug.log(f"{model_type_upper} already materialized on {model.device}", category=model_type)
+        return
+    
+    # Determine target device
     blockswap_active = is_dit and block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
     use_cpu = preserve_vram or blockswap_active
     target_device = "cpu" if use_cpu else device
     
-    # Always use meta init for memory efficiency
-    use_meta_init = True
-
-    # Create descriptive reason string for logging
+    # Build reason string for logging
     cpu_reason = ""
     if target_device == "cpu":
         reasons = []
@@ -583,55 +628,35 @@ def configure_model_inference(runner: VideoDiffusionInfer, model_type: str, devi
             reasons.append("preserve_vram")
         cpu_reason = f" ({', '.join(reasons)})" if reasons else ""
     
-    # Create and load model
-    model = _create_model(model_config, target_device, use_meta_init, model_type_upper, debug)
-    model = _load_model_weights(model, checkpoint_path, target_device, use_meta_init, 
-                                model_type_upper, cpu_reason, debug, override_dtype)
+    # Start materialization
+    debug.start_timer(f"{model_type}_materialize")
     
+    # Load weights (this materializes from meta to target device)
+    model = _load_model_weights(model, checkpoint_path, target_device, True,
+                               model_type_upper, cpu_reason, debug, override_dtype) 
+   
     # Apply model-specific configurations
     model = _apply_model_specific_config(model, runner, config, is_dit, debug)
     
-    return runner
-
-
-def _create_model(model_config: OmegaConf, target_device: str, use_meta_init: bool, 
-                 model_type: str, debug: Debug):
-    """
-    Create model with optimized initialization strategy.
+    debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
-    Uses meta device for CPU models to avoid unnecessary memory allocation,
-    otherwise creates directly on target device.
+    # Apply BlockSwap if needed (DiT only)
+    if is_dit:
+        # Check for pending BlockSwap from cached runner first
+        if hasattr(runner, '_pending_blockswap_config') and runner._pending_blockswap_config:
+            debug.log("Applying deferred BlockSwap from cached runner", category="blockswap")
+            apply_block_swap_to_dit(runner, runner._pending_blockswap_config, debug)
+            runner._pending_blockswap_config = None
+        elif blockswap_active:
+            apply_block_swap_to_dit(runner, block_swap_config, debug)
     
-    Args:
-        model_config: Model configuration object
-        target_device: Target device for the model
-        use_meta_init: Whether to use meta device initialization
-        model_type: Model type string for logging
-        debug: Debug instance
-        
-    Returns:
-        Created model instance
-    """
-    if use_meta_init:
-        # Fast path: Create on meta device to avoid memory allocation
-        debug.log(f"Creating {model_type} model structure on meta device (fast initialization)", 
-                 category=model_type.lower(), force=True)
-        debug.start_timer(f"{model_type.lower()}_model_create")
-        with torch.device("meta"):
-            model = create_object(model_config)
-        debug.end_timer(f"{model_type.lower()}_model_create", 
-                       f"{model_type} model structure creation")
+    # Clean up stored configs
+    if is_dit:
+        runner._dit_checkpoint = None
+        runner._dit_block_swap_config = None
     else:
-        # Standard path: Create directly on target device
-        debug.log(f"Creating {model_type} model on {target_device.upper()}", 
-                 category=model_type.lower(), force=True)
-        debug.start_timer(f"{model_type.lower()}_model_create")
-        with torch.device(target_device):
-            model = create_object(model_config)
-        debug.end_timer(f"{model_type.lower()}_model_create", 
-                       f"{model_type} model creation")
-    
-    return model
+        runner._vae_checkpoint = None
+        runner._vae_dtype_override = None
 
 
 def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: str, 
