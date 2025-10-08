@@ -10,8 +10,10 @@ from typing import Tuple, Dict, Any
 from ..utils.constants import get_base_cache_dir, get_script_directory
 from ..utils.downloads import download_weight
 from ..utils.model_registry import (
-    get_available_models,
-    DEFAULT_MODEL
+    get_available_vae_models,
+    get_available_dit_models,
+    DEFAULT_DIT,
+    DEFAULT_VAE
 )
 from ..utils.debug import Debug
 from ..core.model_manager import configure_runner
@@ -55,7 +57,8 @@ class SeedVR2:
         self.runner = None
         self.ctx = None
         self.debug = None
-        self._model_name = ""
+        self._dit_model_name = ""
+        self._vae_model_name = ""
 
 
     @classmethod
@@ -68,10 +71,12 @@ class SeedVR2:
         """
         return {
             "required": {
-                "images": ("IMAGE", ),
-                "model": (get_available_models(), {
-                    "default": DEFAULT_MODEL,
-                    "tooltip": "Model variants with different sizes and precisions. Models will automatically download on first use. Additional models can be added to the ComfyUI models folder."
+                "pixels": ("IMAGE", ),
+                "dit": ("SEEDVR2_DIT", {
+                    "tooltip": "DiT model configuration from SeedVR2 Load DiT Model node"
+                }),
+                "vae": ("SEEDVR2_VAE", {
+                    "tooltip": "VAE model configuration from SeedVR2 Load VAE Model node"
                 }),
                 "seed": ("INT", {
                     "default": 100,
@@ -80,89 +85,96 @@ class SeedVR2:
                     "step": 1,
                     "tooltip": "Random seed for generation. Same seed = same output."
                 }),
+            },
+            "optional": {
                 "new_resolution": ("INT", {
                     "default": 1072, 
                     "min": 16, 
-                    "max": 4320, 
+                    "max": 16384, 
                     "step": 16,
                     "tooltip": "Target resolution for the shortest edge. Maintains aspect ratio."
                 }),
                 "batch_size": ("INT", {
-                    "default": 5, 
+                    "default": 5,
                     "min": 1, 
-                    "max": 2048, 
+                    "max": 16384,
                     "step": 4,
-                    "tooltip": "Frames per batch (with 4n+1 format: 1, 5, 9, 13, 17, 21...)"
+                    "tooltip": "Frames processed per batch. At least 5 for temporal consistency. Higher = better quality but more VRAM."
                 }),
                 "color_correction": (["wavelet", "adain", "none"], {
                     "default": "wavelet",
-                    "tooltip": "Color correction method. Wavelet: Frequency-based for natural results (recommended). AdaIN: Statistical matching for stylized effects. None: No color correction."
+                    "tooltip": "Color correction method: wavelet=natural, adain=stylistic, none=raw output"
                 }),
                 "input_noise_scale": ("FLOAT", {
-                    "default": 0.00,
+                    "default": 0.0,
                     "min": 0.00,
                     "max": 1.00,
                     "step": 0.001,
-                    "tooltip": "Input noise to reduce artifacts at high resolutions. Adds subtle noise to images before upscaling."
+                    "tooltip": "Add noise to input to reduce high-res artifacts."
                 }),
                 "latent_noise_scale": ("FLOAT", {
                     "default": 0.00,
                     "min": 0.00,
                     "max": 1.00,
                     "step": 0.001,
-                    "tooltip": "Latent space noise during diffusion. Affects the conditioning process and can soften details. Use only if input_noise doesn't help."
+                    "tooltip": "Add noise during diffusion for detail softening (use sparingly)"
                 }),
-            },
-            "optional": {
-                "block_swap_config": ("block_swap_config", {
-                    "tooltip": "Optional BlockSwap configuration for additional VRAM savings"
+                "preserve_vram": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Offload models between pipeline steps (slower but saves VRAM)"
                 }),
-                "extra_args": ("extra_args", {
-                    "tooltip": "Configure extra args"
+                "enable_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Show detailed memory usage and timing information during generation, useful for troubleshooting."
                 }),
             }
         }
     
     # Define return types for ComfyUI
-    RETURN_NAMES = ("image", )
+    RETURN_NAMES = ("IMAGE", )
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "execute"
     CATEGORY = "SEEDVR2"
 
-    def execute(self, images: torch.Tensor, model: str, seed: int, new_resolution: int, 
-        batch_size: int, color_correction: str, input_noise_scale: float, latent_noise_scale: float, 
-        block_swap_config=None, extra_args=None) -> Tuple[torch.Tensor]:
+    def execute(self, pixels: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
+                seed: int, new_resolution: int = 1072, batch_size: int = 5,
+                color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
+                latent_noise_scale: float = 0.0, preserve_vram: bool = False,
+                enable_debug: bool = False) -> Tuple[torch.Tensor]:
         """Execute SeedVR2 video upscaling with progress reporting"""
         
-        temporal_overlap = 0 
+        # Unpack DiT configuration
+        dit_model = dit["model"]
+        dit_device = dit["device"]
+        blocks_to_swap = dit.get("blocks_to_swap", 0)
+        offload_io_components = dit.get("offload_io_components", False)
+        cache_model_dit = dit.get("cache_in_ram", False)
         
-        if extra_args is None:
-            tiled_vae = False
-            vae_tile_size = 512
-            vae_tile_overlap = 64
-            preserve_vram = False
-            cache_model = False
-            enable_debug = False
-            devices = get_device_list()
-            device = devices[0]
-        else:
-            tiled_vae = extra_args["tiled_vae"]
-            vae_tile_size = extra_args["vae_tile_size"]
-            vae_tile_overlap = extra_args["vae_tile_overlap"]
-            preserve_vram = extra_args["preserve_vram"]
-            cache_model = extra_args["cache_model"]
-            enable_debug = extra_args["enable_debug"]
-            device = extra_args["device"]
+        # Unpack VAE configuration
+        vae_model = vae["model"]
+        vae_device = vae["device"]
+        encode_tiled = vae.get("encode_tiled", False)
+        encode_tile_size = vae.get("encode_tile_size", 512)
+        encode_tile_overlap = vae.get("encode_tile_overlap", 64)
+        decode_tiled = vae.get("decode_tiled", False) 
+        decode_tile_size = vae.get("decode_tile_size", 512)
+        decode_tile_overlap = vae.get("decode_tile_overlap", 64)
+        cache_model_vae = vae.get("cache_in_ram", False)
         
-        # Validate tiling parameters
-        if vae_tile_overlap >= vae_tile_size:
-            raise ValueError(f"VAE tile overlap ({vae_tile_overlap}) must be less than tile size ({vae_tile_size})")
-
-        # Initialize or reuse debug instance based on enable_debug parameter with timestamps
-        if self.debug is None:
-            self.debug = Debug(enabled=enable_debug, show_timestamps=enable_debug)
-        else:
-            self.debug.enabled = enable_debug
+        # Create block_swap_config if blocks_to_swap > 0
+        block_swap_config = None
+        if blocks_to_swap > 0:
+            block_swap_config = {
+                "blocks_to_swap": blocks_to_swap,
+                "offload_io_components": offload_io_components,
+            }
+        
+        # Fixed parameters (could be exposed in future)
+        temporal_overlap = 0
+        
+        # Initialize debug
+        self.debug = Debug(enabled=enable_debug)
+        debug = self.debug
 
         self.debug.log("", category="none", force=True)
         self.debug.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
@@ -180,29 +192,31 @@ class SeedVR2:
         self.debug.log("━━━━━━━━━ Model Preparation ━━━━━━━━━", category="none")
 
         # Initial memory state
-        self.debug.log_memory_state("Before model preparation", show_tensors=True, detailed_tensors=False)
+        self.debug.log_memory_state("Before model preparation", show_tensors=False, detailed_tensors=False)
         self.debug.start_timer("model_preparation")
 
         # Check if download succeeded
-        if not download_weight(model, debug=self.debug):
+        if not download_weight(dit_model=dit_model, vae_model=vae_model, debug=self.debug):
             raise RuntimeError(
-                f"Required files for {model} are not available. "
-                "Please check the console output for manual download instructions."
+                f"Failed to download required model files. "
+                f"DiT model: {dit_model}, VAE model: {vae_model}. "
+                "Please check the console output above for specific file failures and manual download instructions."
             )
 
         cfg_scale = 1.0
         try:
-            return self._internal_execute(images, model, seed, new_resolution, cfg_scale, 
+            return self._internal_execute(pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, 
                                         batch_size, color_correction, input_noise_scale, latent_noise_scale, 
-                                        tiled_vae, vae_tile_size, vae_tile_overlap, 
+                                        encode_tiled, encode_tile_size, encode_tile_overlap, 
+                                        decode_tiled, decode_tile_size, decode_tile_overlap, 
                                         preserve_vram, temporal_overlap, 
-                                        cache_model, device, block_swap_config)
+                                        cache_model_dit, cache_model_vae, dit_device, vae_device, block_swap_config)
         except Exception as e:
-            self.cleanup(cache_model=cache_model, debug=self.debug)
+            self.cleanup(cache_model_dit=cache_model_dit, cache_model_vae=cache_model_vae, debug=self.debug)
             raise e
         
 
-    def cleanup(self, cache_model: bool = False, debug=None):
+    def cleanup(self, cache_model_dit: bool = False, cache_model_vae: bool = False, debug=None):
         """
         Cleanup runner and free memory
         """
@@ -217,13 +231,14 @@ class SeedVR2:
         
         # Use complete_cleanup for all cleanup operations
         if self.runner:
-            complete_cleanup(runner=self.runner, debug=debug, keep_models_in_ram=cache_model)
+            complete_cleanup(runner=self.runner, debug=debug, keep_dit_in_ram=cache_model_dit, keep_vae_in_ram=cache_model_vae)
             
-            # Delete the runner completely if not caching
-            if not cache_model:
+            # Delete runner only if neither model is cached
+            if not (cache_model_dit or cache_model_vae):
                 del self.runner
                 self.runner = None
-                self._model_name = ""
+                self._dit_model_name = ""
+                self._vae_model_name = ""
         
         # Clean up context text embeddings if they exist
         if self.ctx:
@@ -231,9 +246,10 @@ class SeedVR2:
             self.ctx = None
 
 
-    def _internal_execute(self, images, model, seed, new_resolution, cfg_scale, batch_size,
-                color_correction, input_noise_scale, latent_noise_scale, tiled_vae, vae_tile_size, vae_tile_overlap,
-                preserve_vram, temporal_overlap, cache_model, device, block_swap_config) -> Tuple[torch.Tensor]:
+    def _internal_execute(self, pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, batch_size,
+                color_correction, input_noise_scale, latent_noise_scale, encode_tiled, encode_tile_size, 
+                encode_tile_overlap, decode_tiled, decode_tile_size, decode_tile_overlap, 
+                preserve_vram, temporal_overlap, cache_model_dit, cache_model_vae, dit_device, vae_device, block_swap_config) -> Tuple[torch.Tensor]:
         """Internal execution logic with progress tracking"""
         
         debug = self.debug
@@ -245,25 +261,34 @@ class SeedVR2:
             self._pbar = None
 
         # Setup device environment
-        device = setup_device_environment(device, debug)
+        dit_device, vae_device = setup_device_environment(dit_device, vae_device, debug)
 
         # Create generation context with the configured device
-        ctx = prepare_generation_context(device=device, debug=debug)
+        ctx = prepare_generation_context(dit_device=dit_device, vae_device=vae_device, debug=debug)
         self.ctx = ctx
 
         # Prepare runner with model state management
         self.runner, model_changed = prepare_runner(
-            model, get_base_cache_dir(), preserve_vram, debug,
-            cache_model=cache_model,
+            dit_model=dit_model, 
+            vae_model=vae_model, 
+            model_dir=get_base_cache_dir(),
+            preserve_vram=preserve_vram,
+            debug=debug,
+            cache_model_dit=cache_model_dit,
+            cache_model_vae=cache_model_vae,
             block_swap_config=block_swap_config,
-            vae_tiling_enabled=tiled_vae,
-            vae_tile_size=(vae_tile_size, vae_tile_size),
-            vae_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
-            cached_runner=self.runner if cache_model else None
+            encode_tiled=encode_tiled,
+            encode_tile_size=(encode_tile_size, encode_tile_size),
+            encode_tile_overlap=(encode_tile_overlap, encode_tile_overlap),
+            decode_tiled=decode_tiled,
+            decode_tile_size=(decode_tile_size, decode_tile_size),
+            decode_tile_overlap=(decode_tile_overlap, decode_tile_overlap),
+            cached_runner=self.runner if (cache_model_dit or cache_model_vae) else None
         )
-        self._model_name = model
+        self._dit_model_name = dit_model
+        self._vae_model_name = vae_model
 
-        debug.log_memory_state("After model preparation", show_tensors=True, detailed_tensors=False)
+        debug.log_memory_state("After model preparation", show_tensors=False, detailed_tensors=False)
         debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
 
         debug.log("", category="none", force=True)
@@ -271,14 +296,14 @@ class SeedVR2:
         debug.start_timer("generation")
        
         # Track total frames for FPS calculation
-        total_frames = len(images)
+        total_frames = len(pixels)
         debug.log(f"   Total frames: {total_frames}, New resolution: {new_resolution}, Batch size: {batch_size}", category="generation", force=True)
         
         # Phase 1: Encode all batches
         ctx = encode_all_batches(
             self.runner, 
             ctx=ctx, 
-            images=images, 
+            images=pixels, 
             batch_size=batch_size, 
             preserve_vram=preserve_vram,
             debug=debug, 
@@ -299,7 +324,7 @@ class SeedVR2:
             cfg_scale=cfg_scale, 
             seed=seed,
             latent_noise_scale=latent_noise_scale,
-            cache_model=cache_model
+            cache_model=cache_model_dit
         )
 
         # Phase 3: Decode all batches
@@ -309,7 +334,7 @@ class SeedVR2:
             preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback,
-            cache_model=cache_model
+            cache_model=cache_model_vae
         )
 
         # Phase 4: Post-processing and final assembly
@@ -334,11 +359,11 @@ class SeedVR2:
 
         # Final cleanup
         debug.start_timer("final_cleanup")
-        self.cleanup(cache_model=cache_model, debug=debug)
+        self.cleanup(cache_model_dit=cache_model_dit, cache_model_vae=cache_model_vae, debug=debug)
         debug.end_timer("final_cleanup", "Final cleanup")
 
         # Log final memory state after ALL cleanup is done by the phases
-        debug.log_memory_state("After all phases complete", show_tensors=True, detailed_tensors=False)
+        debug.log_memory_state("After all phases complete", show_tensors=False, detailed_tensors=False)
         
         # Final timing summary
         debug.log("", category="none")
@@ -412,7 +437,7 @@ class SeedVR2:
             
             # Full cleanup
             if hasattr(self, 'cleanup'):
-                self.cleanup(cache_model=False, debug=debug)
+                self.cleanup(cache_model_dit=False, cache_model_vae=False, debug=debug)
             
             # Clear all remaining references
             for attr in ['runner', '_model_name', 'debug', 'ctx']:
@@ -421,141 +446,149 @@ class SeedVR2:
         except:
             pass
 
-class SeedVR2BlockSwap:
-    """Configure block swapping to reduce VRAM usage"""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "blocks_to_swap": (
-                    "INT",
-                    {
-                        "default": 16,
-                        "min": 0,
-                        "max": 36,
-                        "step": 1,
-                        "tooltip": "Number of transformer blocks to swap to CPU. Start with 16 and increase until OOM errors stop. 0=disabled",
-                    },
-                ),
-                "offload_io_components": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "Offload embeddings and I/O layers to CPU. Enable if you need additional VRAM savings beyond block swapping",
-                    },
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("block_swap_config",)
-    FUNCTION = "create_config"
-    CATEGORY = "SEEDVR2"
-    DESCRIPTION = """Configure block swapping to reduce VRAM usage during video upscaling.
-
-BlockSwap dynamically moves transformer blocks between GPU and CPU/RAM during inference, enabling large models to run on limited VRAM systems with minimal performance impact.
-
-Configuration Guidelines:
-    - blocks_to_swap=0: Disabled (fastest, highest VRAM usage)
-    - blocks_to_swap=16: Balanced mode (moderate speed/VRAM trade-off)
-    - blocks_to_swap=32-36: Maximum savings (slowest, lowest VRAM)
-
-Advanced Options:
-    - offload_io_components: Moves embeddings and I/O layers to CPU for additional VRAM savings (slower)
-
-Performance Tips:
-    - Start with blocks_to_swap=16 and increase until you no longer get OOM errors or decrease if you have spare VRAM
-    - Enable offload_io_components if you still need additional VRAM savings
-    - Note: Even if inference succeeds, you may still OOM during VAE decoding - combine BlockSwap with VAE tiling if needed (feature in development)
-    - Combine with smaller batch_size for maximum VRAM savings
-
-The actual memory savings depend on your specific model architecture and will be shown in the debug output when enabled.
-    """
-
-    def create_config(self, blocks_to_swap, offload_io_components):
-        """Create BlockSwap configuration"""
-        if blocks_to_swap == 0:
-            return (None,)
-        config = {
-            "blocks_to_swap": blocks_to_swap,
-            "offload_io_components": offload_io_components,
-        }
-        
-        return (config,)
-    
-class SeedVR2ExtraArgs:
-    """Configure extra args"""
+class SeedVR2LoadDiTModel:
+    """Configure DiT model and memory optimization settings"""
     
     @classmethod
     def INPUT_TYPES(cls):
         devices = get_device_list()
         return {
             "required": {
-                "tiled_vae": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Process VAE in tiles to reduce VRAM usage but slower with potential artifacts. Only enable if running out of memory."
-                }),
-                "vae_tile_size": ("INT", {
-                    "default": 512,
-                    "min": 64,
-                    "step": 32,
-                    "tooltip": "VAE tile size in pixels. Smaller = less VRAM but more seams/artifacts and slower. Larger = more VRAM but better quality and faster."
-                }),
-                "vae_tile_overlap": ("INT", {
-                    "default": 64,
-                    "min": 0,
-                    "step": 32,
-                    "tooltip": "Pixel overlap between tiles to reduce visible seams. Higher = better blending but slower processing."
-                }),
-                "preserve_vram": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Offload models between steps to save VRAM. Slower but uses less memory."
-                }),
-                "cache_model": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Keep model and VAE in RAM between runs. Speeds up batch processing."
-                }),
-                "enable_debug": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Show detailed memory usage and timing information during generation."
+                "model": (get_available_dit_models(), {
+                    "default": DEFAULT_DIT,
+                    "tooltip": "DiT model for upscaling. Models will automatically download on first use. Additional models can be added to the ComfyUI models folder."
                 }),
                 "device": (devices, {
-                    "default": devices[0]
+                    "default": devices[0],
+                    "tooltip": "Device to use for DiT upscaling"
+                }),
+            },
+            "optional": {
+                "blocks_to_swap": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 36,
+                    "step": 1,
+                    "tooltip": "BlockSwap: Number of transformer blocks to offload (0=disabled, 16=balanced, 32=max savings for 3b model, 36=max savings for 7b model)"
+                }),
+                "offload_io_components": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Offload embeddings/IO layers to CPU for additional VRAM savings"
+                }),
+                "cache_in_ram": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Keep DiT model in RAM between runs for faster batch processing"
                 }),
             }
         }
     
-    RETURN_TYPES = ("extra_args",)
+    RETURN_TYPES = ("SEEDVR2_DIT",)
     FUNCTION = "create_config"
     CATEGORY = "SEEDVR2"
-    DESCRIPTION = "Configure extra args."
+    DESCRIPTION = "Configure DiT model loading and memory optimization settings"
     
-    def create_config(self, tiled_vae, vae_tile_size, vae_tile_overlap, preserve_vram, cache_model, enable_debug, device):
+    def create_config(self, model, device, blocks_to_swap=0, offload_io_components=False, cache_in_ram=False):
         config = {
-            "tiled_vae": tiled_vae,
-            "vae_tile_size": vae_tile_size,
-            "vae_tile_overlap": vae_tile_overlap,
-            "preserve_vram": preserve_vram,
-            "cache_model": cache_model,
-            "enable_debug": enable_debug,
+            "model": model,
             "device": device,
+            "blocks_to_swap": blocks_to_swap,
+            "offload_io_components": offload_io_components,
+            "cache_in_ram": cache_in_ram,
         }
-        
         return (config,)
 
 
+class SeedVR2LoadVAEModel:
+    """Configure VAE settings and tiling options"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        devices = get_device_list()
+        return {
+            "required": {
+                "model": (get_available_vae_models(), {
+                    "default": DEFAULT_VAE,
+                    "tooltip": "VAE model for encoding/decoding. Models will automatically download on first use. Additional models can be added to the ComfyUI models folder."
+                }),
+                "device": (devices, {
+                    "default": devices[0],
+                    "tooltip": "Device to use for VAE processing"
+                }),
+            },
+            "optional": {
+                "encode_tiled": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable tiled encoding to reduce VRAM during encoding"
+                }),
+                "encode_tile_size": ("INT", {
+                    "default": 512,
+                    "min": 64,
+                    "step": 32,
+                    "tooltip": "Size of encoding tiles in pixels. Smaller = less VRAM but more seams/artifacts and slower. Larger = more VRAM but better quality and faster."
+                }),
+                "encode_tile_overlap": ("INT", {
+                    "default": 64,
+                    "min": 0,
+                    "step": 32,
+                    "tooltip": "Pixel overlap between encoding tiles to reduce visible seams. Higher = better blending but slower processing."
+                }),
+                "decode_tiled": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable tiled decoding to reduce VRAM during decoding"
+                }),
+                "decode_tile_size": ("INT", {
+                    "default": 512,
+                    "min": 64,
+                    "step": 32,
+                    "tooltip": "Size of decoding tiles in pixels. Smaller = less VRAM but more seams/artifacts and slower. Larger = more VRAM but better quality and faster."
+                }),
+                "decode_tile_overlap": ("INT", {
+                    "default": 64,
+                    "min": 0,
+                    "step": 32,
+                    "tooltip": "Pixel overlap between decoding tiles to reduce visible seams. Higher = better blending but slower processing."
+                }),
+                "cache_in_ram": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Keep VAE model in RAM between runs for faster batch processing"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("SEEDVR2_VAE",)
+    FUNCTION = "create_config"
+    CATEGORY = "SEEDVR2"
+    DESCRIPTION = "Configure VAE settings and tiling options for memory optimization"
+    
+    def create_config(self, model, device, encode_tiled=False, encode_tile_size=512, 
+                     encode_tile_overlap=64, decode_tiled=False, decode_tile_size=512,
+                     decode_tile_overlap=64, cache_in_ram=False):
+        config = {
+            "model": model,
+            "device": device,
+            "encode_tiled": encode_tiled,
+            "encode_tile_size": encode_tile_size,
+            "encode_tile_overlap": encode_tile_overlap,
+            "decode_tiled": decode_tiled,
+            "decode_tile_size": decode_tile_size,
+            "decode_tile_overlap": decode_tile_overlap,
+            "cache_in_ram": cache_in_ram,
+        }
+        return (config,)
+        
 # ComfyUI Node Mappings
 NODE_CLASS_MAPPINGS = {
     "SeedVR2": SeedVR2,
-    "SeedVR2BlockSwap": SeedVR2BlockSwap,
-    "SeedVR2ExtraArgs": SeedVR2ExtraArgs,
+    "SeedVR2LoadDiTModel": SeedVR2LoadDiTModel,
+    "SeedVR2LoadVAEModel": SeedVR2LoadVAEModel,
 }
 
 # Human-readable node display names
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2": "SeedVR2 Video Upscaler",
-    "SeedVR2BlockSwap": "SeedVR2 BlockSwap Config",
-    "SeedVR2ExtraArgs": "SeedVR2 Extra Args",
+    "SeedVR2LoadDiTModel": "SeedVR2 (Down)Load DiT Model",
+    "SeedVR2LoadVAEModel": "SeedVR2 (Down)Load VAE Model",
 }
 
 # Export version and metadata
@@ -566,6 +599,8 @@ __description__ = "High-quality video upscaling using advanced diffusion models"
 # Additional exports for introspection
 __all__ = [
     'SeedVR2',
+    'SeedVR2LoadDiTModel',
+    'SeedVR2LoadVAEModel',
     'NODE_CLASS_MAPPINGS', 
     'NODE_DISPLAY_NAME_MAPPINGS'
-] 
+]

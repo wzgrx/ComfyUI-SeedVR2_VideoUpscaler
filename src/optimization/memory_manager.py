@@ -308,7 +308,7 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
         clear_memory(debug=debug, deep=True, force=True, timer_name=operation_name)
         # Let memory settle
         time.sleep(0.5)
-        debug.log_memory_state("After memory clearing", show_tensors=True, detailed_tensors=False)
+        debug.log_memory_state("After memory clearing", show_tensors=False, detailed_tensors=False)
         
         # Single retry
         try:
@@ -765,10 +765,15 @@ def clear_runtime_caches(runner: Any, debug: Optional[Any]) -> int:
     return cleaned_items
 
 
-def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
+def cleanup_dit(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = False) -> None:
     """
     Cleanup DiT model and BlockSwap state after upscaling phase.
     Called at the end of upscale_all_batches when DiT is no longer needed.
+    
+    Args:
+        runner: Runner instance containing DiT model
+        debug: Debug instance for logging
+        keep_model_in_ram: If True, move DiT to CPU and keep in RAM; if False, delete completely
     """
     if not runner or not hasattr(runner, 'dit'):
         return
@@ -797,7 +802,7 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
                 delattr(actual_obj, attr)
     
     # 2. Handle model movement/cleanup based on caching preference
-    if keep_models_in_ram:
+    if keep_model_in_ram:
         # Move to CPU while BlockSwap is still active (if applicable)
         manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", 
                            preserve_vram=True, debug=debug, reason="model caching", runner=runner)
@@ -806,10 +811,10 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
         # Import here to avoid circular dependency
         from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_models_in_ram)
+        cleanup_blockswap(runner=runner, keep_state_for_cache=keep_model_in_ram)
     
     # 4. Complete cleanup if not caching
-    if not keep_models_in_ram:
+    if not keep_model_in_ram:
         # Full cleanup - release memory and delete
         release_model_memory(model=runner.dit, debug=debug)
         runner.dit = None
@@ -826,10 +831,15 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
             setattr(runner, component, None)
 
 
-def cleanup_vae(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
+def cleanup_vae(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = False) -> None:
     """
     Cleanup VAE model after decoding phase.
     Called at the end of decode_all_batches when VAE is no longer needed.
+    
+    Args:
+        runner: Runner instance containing VAE model
+        debug: Debug instance for logging
+        keep_model_in_ram: If True, move VAE to CPU and keep in RAM; if False, delete completely
     """
     if not runner or not hasattr(runner, 'vae'):
         return
@@ -847,7 +857,7 @@ def cleanup_vae(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
                 delattr(runner.vae, attr)
     
     # 2. Handle VAE model based on caching preference
-    if keep_models_in_ram:
+    if keep_model_in_ram:
         # Move to CPU but keep structure
         manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", 
                            preserve_vram=True, debug=debug, reason="model caching", runner=runner)
@@ -865,49 +875,85 @@ def cleanup_vae(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = Fa
             setattr(runner, attr, None)
 
 
-def complete_cleanup(runner: Any, debug: Optional[Any], keep_models_in_ram: bool = False) -> None:
+def complete_cleanup(runner: Any, debug: Optional[Any], keep_dit_in_ram: bool = False, keep_vae_in_ram: bool = False) -> None:
     """
-    Complete cleanup of runner and remaining components.
-    This is now a lightweight cleanup for final stage, as model-specific cleanup
-    happens in their respective phases.
+    Complete cleanup of runner and remaining components with independent model caching support.
+    This is a lightweight cleanup for final stage, as model-specific cleanup
+    happens in their respective phases (cleanup_dit, cleanup_vae).
+    
+    Args:
+        runner: Runner instance to clean up
+        debug: Debug instance for logging
+        keep_dit_in_ram: If True, preserve DiT model in RAM for future runs
+        keep_vae_in_ram: If True, preserve VAE model in RAM for future runs
+        
+    Behavior:
+        - Can cache DiT and VAE independently for flexible memory management
+        - Preserves _dit_model_name and _vae_model_name when either model is cached for change detection
+        - Clears all temporary attributes and runtime caches
+        - Performs deep memory cleanup only when both models are fully released
+        
+    Note:
+        Model name tracking (_dit_model_name, _vae_model_name) is only cleared if neither
+        model is cached, enabling proper model change detection on subsequent runs.
     """
     if not runner:
         return
     
-    cleanup_type = "partial cleanup (keeping models in RAM)" if keep_models_in_ram else "full cleanup"
     if debug:
+        cleanup_type = "partial cleanup" if (keep_dit_in_ram or keep_vae_in_ram) else "full cleanup"
         debug.log(f"Starting {cleanup_type}", category="cleanup")
     
     # 1. Cleanup any remaining models if they still exist
     # (This handles cases where phases were skipped or errored)
     if hasattr(runner, 'dit') and runner.dit is not None:
-        cleanup_dit(runner=runner, debug=debug, keep_models_in_ram=keep_models_in_ram)
+        cleanup_dit(runner=runner, debug=debug, keep_model_in_ram=keep_dit_in_ram)
     
     if hasattr(runner, 'vae') and runner.vae is not None:
-        cleanup_vae(runner=runner, debug=debug, keep_models_in_ram=keep_models_in_ram)
+        cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=keep_vae_in_ram)
     
     # 2. Clear remaining runtime caches
     clear_runtime_caches(runner=runner, debug=debug)
     
     # 3. Clear config and other non-model components
-    if not keep_models_in_ram:
+    if not (keep_dit_in_ram or keep_vae_in_ram):
         if hasattr(runner, 'config'):
             setattr(runner, 'config', None)
     
     # 4. Clear all temporary loading/configuration attributes
     temp_attributes = [
         '_dit_checkpoint', '_dit_block_swap_config', '_pending_blockswap_config',
-        '_vae_checkpoint', '_vae_dtype_override', '_model_name'
+        '_vae_checkpoint', '_vae_dtype_override'
     ]
     for attr in temp_attributes:
         if hasattr(runner, attr):
             setattr(runner, attr, None)
+    
+    # Preserve model name tracking if either model is being cached for future change detection
+    if not (keep_dit_in_ram or keep_vae_in_ram):
+        # Only clear model names if neither model is cached
+        if hasattr(runner, '_dit_model_name'):
+            setattr(runner, '_dit_model_name', None)
+        if hasattr(runner, '_vae_model_name'):
+            setattr(runner, '_vae_model_name', None)
     
     # 5. Final memory cleanup
     clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
     
     # 6. Clear cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None
+    
+    # Log what models are cached for next run
+    if keep_dit_in_ram or keep_vae_in_ram:
+        cached_models = []
+        if keep_dit_in_ram and hasattr(runner, '_dit_model_name'):
+            cached_models.append(f"DiT ({runner._dit_model_name})")
+        if keep_vae_in_ram and hasattr(runner, '_vae_model_name'):
+            cached_models.append(f"VAE ({runner._vae_model_name})")
+        
+        if cached_models:
+            models_str = " and ".join(cached_models)
+            debug.log(f"Models cached in RAM for next run: {models_str}", category="store", force=True)
     
     if debug:
         debug.log(f"Completed {cleanup_type}", category="success")

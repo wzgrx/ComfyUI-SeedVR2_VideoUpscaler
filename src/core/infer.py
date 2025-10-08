@@ -62,16 +62,23 @@ def optimized_channels_to_second(tensor):
         return tensor.permute(*dims)
 
 class VideoDiffusionInfer():
-    def __init__(self, config: DictConfig, debug=None,  vae_tiling_enabled: bool = False, 
-                 vae_tile_size: Tuple[int, int] = (512, 512), vae_tile_overlap: Tuple[int, int] = (64, 64)):
+    def __init__(self, config: DictConfig, debug=None,  
+                 encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
+                 encode_tile_overlap: Tuple[int, int] = (64, 64),
+                 decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
+                 decode_tile_overlap: Tuple[int, int] = (64, 64)):
         # Check if debug instance is available
         if debug is None:
             raise ValueError("Debug instance must be provided to VideoDiffusionInfer")
         self.config = config
         self.debug = debug
-        self.vae_tiling_enabled = vae_tiling_enabled
-        self.vae_tile_size = vae_tile_size
-        self.vae_tile_overlap = vae_tile_overlap
+        # Store separate encode and decode tiling parameters
+        self.encode_tiled = encode_tiled
+        self.encode_tile_size = encode_tile_size
+        self.encode_tile_overlap = encode_tile_overlap
+        self.decode_tiled = decode_tiled
+        self.decode_tile_size = decode_tile_size
+        self.decode_tile_overlap = decode_tile_overlap
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -144,9 +151,9 @@ class VideoDiffusionInfer():
             else:
                 batches = [sample.unsqueeze(0) for sample in samples]
 
-            use_tiling = (hasattr(self, 'vae_tiling_enabled') and self.vae_tiling_enabled)
-            if use_tiling:
-                self.debug.log(f"Using VAE tiled encoding (Tile: {self.vae_tile_size}, Overlap: {self.vae_tile_overlap})", category="vae", force=True)
+            use_encode_tiling = self.encode_tiled
+            if use_encode_tiling:
+                self.debug.log(f"Using VAE tiled encoding (Tile: {self.encode_tile_size}, Overlap: {self.encode_tile_overlap})", category="vae", force=True)
 
             # VAE process by each group.
             for sample in batches:
@@ -157,13 +164,13 @@ class VideoDiffusionInfer():
 
                 if use_sample:
                     latent = self.vae.encode(sample, preserve_vram=preserve_vram, 
-                                             tiled=use_tiling, tile_size=self.vae_tile_size, 
-                                             tile_overlap=self.vae_tile_overlap).latent
+                                             tiled=use_encode_tiling, tile_size=self.encode_tile_size, 
+                                             tile_overlap=self.encode_tile_overlap).latent
                 else:
                     # Deterministic vae encode, only used for i2v inference (optionally)
                     latent = self.vae.encode(sample, preserve_vram=preserve_vram, 
-                                             tiled=use_tiling, tile_size=self.vae_tile_size,
-                                             tile_overlap=self.vae_tile_overlap).posterior.mode().squeeze(2)
+                                             tiled=use_encode_tiling, tile_size=self.encode_tile_size,
+                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = rearrange(latent, "b c ... -> b ... c")
@@ -202,9 +209,9 @@ class VideoDiffusionInfer():
             else:
                 latents = [latent.unsqueeze(0) for latent in latents]
 
-            use_tiling = (hasattr(self, 'vae_tiling_enabled') and self.vae_tiling_enabled)
-            if use_tiling:
-                self.debug.log(f"Using VAE tiled decoding (Tile: {self.vae_tile_size}, Overlap: {self.vae_tile_overlap})", category="vae", force=True)
+            use_decode_tiling = self.decode_tiled
+            if use_decode_tiling:
+                self.debug.log(f"Using VAE tiled decoding (Tile: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap})", category="vae", force=True)
 
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info")
 
@@ -216,8 +223,8 @@ class VideoDiffusionInfer():
 
                 sample = self.vae.decode(
                     latent, preserve_vram=preserve_vram,
-                    tiled=use_tiling, tile_size=self.vae_tile_size,
-                    tile_overlap=self.vae_tile_overlap).sample
+                    tiled=use_decode_tiling, tile_size=self.decode_tile_size,
+                    tile_overlap=self.decode_tile_overlap).sample
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)

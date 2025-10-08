@@ -204,17 +204,28 @@ def check_interrupt(ctx: Dict[str, Any]) -> None:
         ctx['interrupt_fn']()
 
 
-def prepare_generation_context(device: Union[str, torch.device], 
-                              debug: Optional['Debug'] = None) -> Dict[str, Any]:
+def prepare_generation_context(dit_device: str, vae_device: str, debug: Optional['Debug'] = None) -> Dict[str, Any]:
     """
-    Create a generation context for shared state.
-    Precision will be lazily initialized when first needed.
+    Initialize generation context for the upscaling pipeline.
+    
+    Creates a context dictionary that holds all state and configuration needed
+    throughout the generation process.
+    Supports independent device placement for DiT and VAE models.
     
     Args:
-        device: Device string (required, e.g., "cuda:0", "cpu")
+        dit_device: Device for DiT model (required, e.g., "cuda:0", "cuda:1", "cpu")
+        vae_device: Device for VAE model (required, e.g., "cuda:0", "cuda:1", "cpu")
         debug: Debug instance for logging
+        
+    Raises:
+        ValueError: If dit_device or vae_device is None
+        
+    Note:
+        Precision settings (compute_dtype, autocast_dtype) are lazily initialized
+        when first needed via _ensure_precision_initialized() to detect actual
+        model dtypes and configure optimal computation settings.
     """
-    if device is None:
+    if dit_device is None or vae_device is None:
         raise ValueError("Device must be provided to prepare_generation_context")
     
     try:
@@ -226,7 +237,8 @@ def prepare_generation_context(device: Union[str, torch.device],
         comfyui_available = False
     
     ctx = {
-        'device': device,
+        'dit_device': dit_device,
+        'vae_device': vae_device,
         'compute_dtype': None,
         'autocast_dtype': None,
         'video_transform': None,
@@ -283,86 +295,137 @@ def _ensure_precision_initialized(ctx: Dict[str, Any],
             debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
 
 
-def setup_device_environment(device: Optional[str] = None, 
-                            debug: Optional['Debug'] = None) -> str:
+def setup_device_environment(dit_device: Optional[str] = None, 
+                            vae_device: Optional[str] = None,
+                            debug: Optional['Debug'] = None) -> Tuple[str, str]:
     """
     Setup device environment variables before model loading.
     This must be called before configure_runner.
     
+    Handles independent device configuration for DiT and VAE models,
+    allowing them to run on different GPUs for load balancing.
+    
     Args:
-        device: Device string (e.g., "cuda:0", "none")
+        dit_device: Device string for DiT model (e.g., "cuda:0", "none")
+        vae_device: Device string for VAE model (e.g., "cuda:1", "none")
         debug: Debug instance for logging
         
     Returns:
-        str: Processed device string
+        Tuple[str, str]: (processed_dit_device, processed_vae_device)
     """
-    if device is None:
-        device = get_device() if (torch.cuda.is_available() or torch.mps.is_available()) else "cpu"
+    # Get default device if not specified
+    default_device = "cpu"
+    if torch.cuda.is_available() or torch.mps.is_available():
+        default_device = str(get_device())
     
-    # Set LOCAL_RANK for distributed compatibility
-    if device != "none" and ":" in device:
-        os.environ["LOCAL_RANK"] = device.split(":")[1]
+    # Apply defaults
+    if dit_device is None:
+        dit_device = default_device
+    if vae_device is None:
+        vae_device = default_device
+    
+    # Set LOCAL_RANK based on primary device (DiT device)
+    # This is for distributed compatibility with the main model
+    if dit_device != "none" and ":" in dit_device:
+        os.environ["LOCAL_RANK"] = dit_device.split(":")[1]
     else:
         os.environ["LOCAL_RANK"] = "0"
     
     if debug:
-        debug.log(f"Device environment configured: {device}, LOCAL_RANK={os.environ['LOCAL_RANK']}", category="setup")
+        debug.log(f"Device environment configured: DiT={dit_device}, VAE={vae_device}, LOCAL_RANK={os.environ['LOCAL_RANK']}", category="setup")
     
-    return device
+    return dit_device, vae_device
 
 
-def prepare_runner(model_name: str, model_dir: str, preserve_vram: bool, 
-                  debug: 'Debug', cache_model: bool = False, 
-                  block_swap_config: Optional[Dict[str, Any]] = None,
-                  vae_tiling_enabled: bool = False, 
-                  vae_tile_size: Tuple[int, int] = (512, 512), 
-                  vae_tile_overlap: Tuple[int, int] = (64, 64), 
-                  cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
+def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram: bool, debug: 'Debug',
+                   cache_model_dit: bool = False, cache_model_vae: bool = False, block_swap_config: Optional[Dict[str, Any]] = None,
+                   encode_tiled: bool = False, encode_tile_size: Optional[Tuple[int, int]] = None,
+                   encode_tile_overlap: Optional[Tuple[int, int]] = None,
+                   decode_tiled: bool = False, decode_tile_size: Optional[Tuple[int, int]] = None,
+                   decode_tile_overlap: Optional[Tuple[int, int]] = None,
+                   cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
     """
     Prepare runner with model state management.
-    Handles model changes and caching logic.
+    Handles model changes and caching logic with independent DiT/VAE caching support.
     
     Args:
-        model_name: Name of the model to load
-        model_dir: Directory containing models  
-        preserve_vram: Whether to preserve VRAM
-        debug: Debug instance
-        cache_model: Whether to cache model between runs
-        block_swap_config: BlockSwap configuration
-        vae_tiling_enabled: Enable VAE tiling
-        vae_tile_size: VAE tile dimensions
-        vae_tile_overlap: VAE tile overlap
-        cached_runner: Existing runner instance if caching
+        dit_model: Name of the DiT model to load
+        vae_model: Name of the VAE model to load
+        model_dir: Directory containing model files  
+        preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
+        debug: Debug instance for logging
+        cache_model_dit: Whether to cache DiT model in RAM between runs
+        cache_model_vae: Whether to cache VAE model in RAM between runs
+        block_swap_config: Optional BlockSwap configuration for DiT memory optimization
+        encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
+        encode_tile_size: Tile size for encoding (height, width)
+        encode_tile_overlap: Tile overlap for encoding (height, width)
+        decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
+        decode_tile_size: Tile size for decoding (height, width)
+        decode_tile_overlap: Tile overlap for decoding (height, width)
+        cached_runner: Existing runner instance if caching (passed if either model is cached)
         
     Returns:
-        tuple: (runner, model_changed) - runner instance and whether model changed
-    """    
-    model_changed = False
+        tuple: (runner, model_changed) - configured runner instance and whether any model changed (DiT or VAE)
+    """   
+    dit_changed = False
+    vae_changed = False
     
-    # Check for model change if we have a cached runner
+    # Check for model changes if we have a cached runner
     if cached_runner is not None:
-        current_model = getattr(cached_runner, '_model_name', None)
-        if current_model != model_name:
-            model_changed = True
-            debug.log(f"Model changed from {current_model} to {model_name}, clearing DiT cache...", category="cache")
-            cleanup_dit(runner=cached_runner, debug=debug, keep_models_in_ram=False)
-            cached_runner = None  
+        current_dit = getattr(cached_runner, '_dit_model_name', None)
+        current_vae = getattr(cached_runner, '_vae_model_name', None)
+        
+        # Check DiT model change
+        if current_dit != dit_model:
+            dit_changed = True
+            debug.log(f"DiT model changed from {current_dit} to {dit_model}, clearing DiT cache...", category="cache")
+            cleanup_dit(runner=cached_runner, debug=debug, keep_model_in_ram=False)
+        
+        # Check VAE model change
+        if current_vae != vae_model:
+            vae_changed = True
+            debug.log(f"VAE model changed from {current_vae} to {vae_model}, clearing VAE cache...", category="cache")
+            cleanup_vae(runner=cached_runner, debug=debug, keep_model_in_ram=False)
+        
+        # If either model changed, invalidate cached_runner for that model
+        # Keep runner alive only if at least one model is still valid and cached
+        if dit_changed and vae_changed:
+            # Both changed - full recreation needed
+            cached_runner = None
+        elif dit_changed and not cache_model_vae:
+            # DiT changed and VAE not cached - full recreation
+            cached_runner = None
+        elif vae_changed and not cache_model_dit:
+            # VAE changed and DiT not cached - full recreation
+            cached_runner = None
+        # Otherwise keep cached_runner for partial reuse
     
     # Configure runner
     debug.log("Configuring inference runner...", category="runner")
     runner = configure_runner(
-        model_name, model_dir, preserve_vram, debug,
-        cache_model=cache_model,
+        dit_model=dit_model,
+        vae_model=vae_model,
+        base_cache_dir=model_dir,
+        preserve_vram=preserve_vram,
+        debug=debug,
+        cache_model_dit=cache_model_dit,
+        cache_model_vae=cache_model_vae,
         block_swap_config=block_swap_config,
-        vae_tiling_enabled=vae_tiling_enabled,
-        vae_tile_size=vae_tile_size,
-        vae_tile_overlap=vae_tile_overlap,
-        cached_runner=cached_runner if cache_model else None
+        encode_tiled=encode_tiled,
+        encode_tile_size=encode_tile_size,
+        encode_tile_overlap=encode_tile_overlap,
+        decode_tiled=decode_tiled,
+        decode_tile_size=decode_tile_size,
+        decode_tile_overlap=decode_tile_overlap,
+        cached_runner=cached_runner if (cache_model_dit or cache_model_vae) else None
     )
     
-    # Store model name for future comparisons
-    runner._model_name = model_name
+    # Store both model names for future comparisons
+    runner._dit_model_name = dit_model
+    runner._vae_model_name = vae_model
     
+    model_changed = dit_changed or vae_changed
     return runner, model_changed
 
 
@@ -484,11 +547,11 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     try:
         # Materialize VAE if still on meta device
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
-            materialize_model(runner, "vae", str(ctx['device']), runner.config, 
+            materialize_model(runner, "vae", str(ctx['vae_device']), runner.config, 
                             preserve_vram, debug)
         
         # Move VAE to GPU for encoding (no-op if already there)
-        manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
+        manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
         
@@ -514,7 +577,7 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
             
             # Process current batch
             video = images[start_idx:end_idx]
-            video = video.permute(0, 3, 1, 2).to(ctx['device'], dtype=ctx['compute_dtype'])
+            video = video.permute(0, 3, 1, 2).to(ctx['vae_device'], dtype=ctx['compute_dtype'])
             
             # Apply transformations
             transformed_video = ctx['video_transform'](video)
@@ -616,7 +679,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
                            Adds noise during diffusion conditioning. Can soften details
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
-        cache_model: If True, keep models in RAM for reuse instead of deleting them
+        cache_model: If True, keep DiT model in RAM for reuse instead of deleting it
         
     Returns:
         dict: Updated context containing:
@@ -646,7 +709,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
     
     # Load text embeddings if not already loaded
     if ctx.get('text_embeds') is None:
-        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['device'], ctx['compute_dtype'])
+        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'])
         debug.log("Loaded text embeddings for DiT", category="dit")
     
     # Configure diffusion parameters
@@ -675,7 +738,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
     try:
         # Materialize DiT if still on meta device
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
-            materialize_model(runner, "dit", str(ctx['device']), runner.config, 
+            materialize_model(runner, "dit", str(ctx['dit_device']), runner.config, 
                             preserve_vram, debug)
         # Check for pending BlockSwap on already-materialized cached models
         elif hasattr(runner, '_pending_blockswap_config') and runner._pending_blockswap_config:
@@ -684,7 +747,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
             runner._pending_blockswap_config = None
         
         # Move DiT to GPU for upscaling (no-op if already there)
-        manage_model_device(model=runner.dit, target_device=str(ctx['device']), 
+        manage_model_device(model=runner.dit, target_device=str(ctx['dit_device']), 
                             model_name="DiT", preserve_vram=False, debug=debug,
                             runner=runner)
         
@@ -700,13 +763,13 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
             
             # Move latent from CPU to device with correct dtype
-            latent = latent.to(ctx['device'], dtype=ctx['compute_dtype'], non_blocking=False)
+            latent = latent.to(ctx['dit_device'], dtype=ctx['compute_dtype'], non_blocking=False)
             
             # Generate noise
             if torch.mps.is_available():
                 base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
             else:
-                with torch.cuda.device(ctx['device']):
+                with torch.cuda.device(ctx['dit_device']):
                     base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
             
             noises = [base_noise]
@@ -719,8 +782,8 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
             def _add_noise(x, aug_noise):
                 if latent_noise_scale == 0.0:
                     return x
-                t = torch.tensor([1000.0], device=ctx['device'], dtype=ctx['compute_dtype']) * latent_noise_scale
-                shape = torch.tensor(x.shape[1:], device=ctx['device'])[None]
+                t = torch.tensor([1000.0], device=ctx['dit_device'], dtype=ctx['compute_dtype']) * latent_noise_scale
+                shape = torch.tensor(x.shape[1:], device=ctx['dit_device'])[None]
                 t = runner.timestep_transform(t, shape)
                 x = runner.schedule.forward(x, aug_noise, t)
                 del t, shape
@@ -737,7 +800,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
             # Run inference
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
-                with torch.autocast(str(ctx['device']), ctx['autocast_dtype'], enabled=True):
+                with torch.autocast(str(ctx['dit_device']), ctx['autocast_dtype'], enabled=True):
                     upscaled = runner.inference(
                         noises=noises,
                         conditions=conditions,
@@ -800,7 +863,7 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
                             category="blockswap")
 
         # Cleanup DiT as it's no longer needed after upscaling
-        cleanup_dit(runner=runner, debug=debug, keep_models_in_ram=cache_model)
+        cleanup_dit(runner=runner, debug=debug, keep_model_in_ram=cache_model)
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
@@ -829,7 +892,7 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         preserve_vram: If True, offload VAE between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
-        cache_model: If True, keep models in RAM for reuse instead of deleting them
+        cache_model: If True, keep VAE model in RAM for reuse instead of deleting it
         
     Returns:
         dict: Updated context containing:
@@ -869,11 +932,11 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     try:
         # VAE should already be materialized from encoding phase
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
-            materialize_model(runner, "vae", str(ctx['device']), runner.config, 
+            materialize_model(runner, "vae", str(ctx['vae_device']), runner.config, 
                             preserve_vram, debug)
         
         # Move VAE to GPU for decoding
-        manage_model_device(model=runner.vae, target_device=str(ctx['device']), 
+        manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
         
@@ -889,7 +952,7 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
             # Move latent to device with correct dtype for decoding
-            upscaled_latent = upscaled_latent.to(ctx['device'], dtype=ctx['compute_dtype'], non_blocking=False)
+            upscaled_latent = upscaled_latent.to(ctx['vae_device'], dtype=ctx['compute_dtype'], non_blocking=False)
             
             # Decode latent
             debug.start_timer("vae_decode")
@@ -924,7 +987,7 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         raise
     finally:
         # Cleanup VAE as it's no longer needed
-        cleanup_vae(runner=runner, debug=debug, keep_models_in_ram=cache_model)
+        cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=cache_model)
         
         # Clean up upscaled latents storage
         if 'all_upscaled_latents' in ctx:
@@ -1004,7 +1067,7 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     transformed_video = ctx['all_transformed_videos'][video_idx]
                     
                     # Move to GPU for color correction
-                    transformed_video = transformed_video.to(ctx['device'], non_blocking=False)
+                    transformed_video = transformed_video.to(ctx['vae_device'], non_blocking=False)
                     
                     # Adjust transformed video to handle cases when padding was applied during encoding
                     if transformed_video.shape[1] != sample.shape[0]:

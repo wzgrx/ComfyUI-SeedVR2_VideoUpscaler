@@ -55,109 +55,200 @@ from ..common.distributed import get_device
 script_directory = get_script_directory()
 
 
-def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = False, debug: Optional[Debug] = None, 
-                    cache_model: bool = False, block_swap_config: Optional[Dict[str, Any]] = None, 
-                    cached_runner: Optional[VideoDiffusionInfer] = None, vae_tiling_enabled: bool = False,
-                    vae_tile_size: Optional[Tuple[int, int]] = None, 
-                    vae_tile_overlap: Optional[Tuple[int, int]] = None) -> VideoDiffusionInfer:
+def _check_model_reload_status(cached_runner: VideoDiffusionInfer, 
+                               cache_dit: bool, cache_vae: bool,
+                               dit_model: str, vae_model: str,
+                               debug: Debug) -> Tuple[bool, bool]:
     """
-    Configure and create a VideoDiffusionInfer runner for the specified model
+    Determine which models need reloading.
+    
+    Returns:
+        Tuple[bool, bool]: (need_reload_dit, need_reload_vae)
+    """
+    need_reload_dit = not cache_dit or not hasattr(cached_runner, 'dit') or cached_runner.dit is None
+    need_reload_vae = not cache_vae or not hasattr(cached_runner, 'vae') or cached_runner.vae is None
+    
+    if need_reload_dit:
+        reason = "cache disabled" if not cache_dit else "not in memory"
+        debug.log(f"DiT will be reloaded ({reason}): {dit_model}", category="cache", force=True)
+    else:
+        cached_dit_name = getattr(cached_runner, '_dit_model_name', dit_model)
+        debug.log(f"DiT cached in RAM - reusing: {cached_dit_name}", category="reuse", force=True)
+        
+    if need_reload_vae:
+        reason = "cache disabled" if not cache_vae else "not in memory"
+        debug.log(f"VAE will be reloaded ({reason}): {vae_model}", category="cache", force=True)
+    else:
+        cached_vae_name = getattr(cached_runner, '_vae_model_name', vae_model)
+        debug.log(f"VAE cached in RAM - reusing: {cached_vae_name}", category="reuse", force=True)
+    
+    return need_reload_dit, need_reload_vae
+
+
+def _reload_missing_models(cached_runner: VideoDiffusionInfer,
+                          need_reload_dit: bool, need_reload_vae: bool,
+                          dit_model: str, vae_model: str, base_cache_dir: str,
+                          block_swap_config: Optional[Dict[str, Any]],
+                          debug: Debug) -> Optional[VideoDiffusionInfer]:
+    """
+    Reload models that are missing from cache.
+    
+    Returns:
+        cached_runner if successful, None if config is missing and full recreation needed
+    """
+    if not (need_reload_dit or need_reload_vae):
+        return cached_runner
+    
+    # Verify config exists
+    if not hasattr(cached_runner, 'config') or cached_runner.config is None:
+        debug.log("Config missing - full runner recreation required", category="cache", force=True)
+        return None
+    
+    config = cached_runner.config
+    
+    # Reload DiT if needed
+    if need_reload_dit:
+        dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
+        debug.log(f"Preparing DiT structure: {dit_model}", category="dit")
+        cached_runner = prepare_model_structure(cached_runner, "dit", dit_checkpoint_path, 
+                                               config, block_swap_config, debug)
+    
+    # Reload VAE if needed
+    if need_reload_vae:
+        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+        debug.log(f"Preparing VAE structure: {vae_model}", category="vae")
+        cached_runner = prepare_model_structure(cached_runner, "vae", vae_checkpoint_path, 
+                                               config, None, debug)
+    
+    return cached_runner
+
+
+def _handle_blockswap_config(cached_runner: VideoDiffusionInfer,
+                             block_swap_config: Optional[Dict[str, Any]],
+                             debug: Debug) -> None:
+    """Handle BlockSwap configuration changes for cached runner."""
+    # Normalize configurations
+    desired_config = None
+    if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
+        desired_config = (
+            block_swap_config.get("blocks_to_swap"),
+            block_swap_config.get("offload_io_components", False)
+        )
+    
+    current_config = None
+    if hasattr(cached_runner, "_block_swap_config"):
+        current_config = (
+            cached_runner._block_swap_config.get("blocks_swapped"),
+            cached_runner._block_swap_config.get("offload_io_components", False)
+        )
+    
+    # Apply changes if needed
+    if desired_config != current_config:
+        fmt_curr = "disabled" if current_config is None else f"blocks={current_config[0]}, offload={current_config[1]}"
+        fmt_new = "disabled" if desired_config is None else f"blocks={desired_config[0]}, offload={desired_config[1]}"
+        debug.log(f"BlockSwap config changed: {fmt_curr} → {fmt_new}", category="blockswap", force=True)
+        
+        cleanup_blockswap(cached_runner, keep_state_for_cache=False)
+        cached_runner._pending_blockswap_config = block_swap_config if desired_config else None
+        
+        if desired_config:
+            debug.log("BlockSwap application deferred to DiT phase", category="blockswap")
+            
+    elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
+        cached_runner._blockswap_active = True
+        debug.log(f"BlockSwap reactivated: blocks={desired_config[0]}, offload={desired_config[1]}", 
+                 category="blockswap", force=True)
+
+
+def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preserve_vram: bool, debug: Debug, cache_model_dit: bool = False,
+                    cache_model_vae: bool = False, block_swap_config: Optional[Dict[str, Any]] = None, 
+                    cached_runner: Optional[VideoDiffusionInfer] = None,
+                    encode_tiled: bool = False, encode_tile_size: Optional[Tuple[int, int]] = None,
+                    encode_tile_overlap: Optional[Tuple[int, int]] = None,
+                    decode_tiled: bool = False, decode_tile_size: Optional[Tuple[int, int]] = None,
+                    decode_tile_overlap: Optional[Tuple[int, int]] = None) -> VideoDiffusionInfer:
+    """
+    Configure and create a VideoDiffusionInfer runner for the specified model with independent caching support.
     
     Args:
-        model (str): Model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
-        base_cache_dir (str): Base directory containing model files
-        preserve_vram (bool): Whether to preserve VRAM
+        dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
+        vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
+        base_cache_dir: Base directory containing model files
+        preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
         debug: Debug instance for logging
-        cache_model (bool): Enable model caching
-        block_swap_config (dict): Optional BlockSwap configuration
-        cached_runner: Optional cached runner to reuse entirely (not just DiT)
+        cache_model_dit: Whether to cache DiT model in RAM between runs
+        cache_model_vae: Whether to cache VAE model in RAM between runs
+        block_swap_config: Optional BlockSwap configuration for DiT memory optimization
+        cached_runner: Optional cached runner to reuse (passed if either model is cached)
+        encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
+        encode_tile_size: Tile size for encoding (height, width)
+        encode_tile_overlap: Tile overlap for encoding (height, width)
+        decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
+        decode_tile_size: Tile size for decoding (height, width)
+        decode_tile_overlap: Tile overlap for decoding (height, width)
         
     Returns:
         VideoDiffusionInfer: Configured runner instance ready for inference
         
     Features:
+        - Independent DiT and VAE caching for flexible memory management
         - Dynamic config loading based on model type (3B vs 7B)
         - Automatic import path resolution for different environments
-        - VAE configuration with proper parameter handling
+        - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and RoPE cache pre-initialization
+        - BlockSwap integration for large model support on limited VRAM
     """
     # Check if debug instance is available
     if debug is None:
         raise ValueError("Debug instance must be provided to configure_runner")
     
-    # Check if we can reuse the cached runner
-    if cached_runner and cache_model:
-
+    # Check if we can reuse the cached runner (if either model is cached)
+    if cached_runner and (cache_model_dit or cache_model_vae):
         debug.start_timer("cache_reuse")
-        # Update all runtime parameters dynamically
-        runtime_params = {
-            'vae_tiling_enabled': vae_tiling_enabled,
-            'vae_tile_size': vae_tile_size,
-            'vae_tile_overlap': vae_tile_overlap
-        }
-        for key, value in runtime_params.items():
+        
+        # Update runtime parameters
+        for key, value in {
+            'encode_tiled': encode_tiled,
+            'encode_tile_size': encode_tile_size,
+            'encode_tile_overlap': encode_tile_overlap,
+            'decode_tiled': decode_tiled,
+            'decode_tile_size': decode_tile_size,
+            'decode_tile_overlap': decode_tile_overlap
+        }.items():
             setattr(cached_runner, key, value)
         
-        debug.log(f"Cache hit: Reusing runner for model {model}", category="reuse", force=True)
+        # Check what needs reloading and log status
+        need_reload_dit, need_reload_vae = _check_model_reload_status(
+            cached_runner, cache_model_dit, cache_model_vae, 
+            dit_model, vae_model, debug
+        )
         
-        # Normalize configurations for comparison
-        # None represents "BlockSwap disabled"
-        desired_config = None
-        if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
-            desired_config = (
-                block_swap_config.get("blocks_to_swap"),
-                block_swap_config.get("offload_io_components", False)
-            )
+        # Reload missing models
+        cached_runner = _reload_missing_models(
+            cached_runner, need_reload_dit, need_reload_vae,
+            dit_model, vae_model, base_cache_dir, block_swap_config, debug
+        )
         
-        current_config = None
-        if hasattr(cached_runner, "_block_swap_config"):
-            current_config = (
-                cached_runner._block_swap_config.get("blocks_swapped"),
-                cached_runner._block_swap_config.get("offload_io_components", False)
-            )
-        
-        # Format configs for logging
-        def format_config(cfg):
-            if cfg is None:
-                return "disabled"
-            return f"blocks={cfg[0]}, offload_io={cfg[1]}"
-        
-        # Apply changes only if configurations differ
-        if desired_config != current_config:
-            # Log the change
-            debug.log(f"BlockSwap config changed: {format_config(current_config)} → {format_config(desired_config)}", 
-                     category="blockswap", force=True)
+        # Proceed only if we have a valid runner
+        if cached_runner is not None:
+            # Handle BlockSwap configuration
+            _handle_blockswap_config(cached_runner, block_swap_config, debug)
             
-            # Always cleanup existing BlockSwap state when config changes
-            cleanup_blockswap(cached_runner, keep_state_for_cache=False)
+            # Store debug instance
+            cached_runner.debug = debug
+            debug.end_timer("cache_reuse", "Cache reuse complete")
             
-            # DEFER new configuration to DiT phase instead of applying now
-            if desired_config:
-                cached_runner._pending_blockswap_config = block_swap_config
-                debug.log("BlockSwap application deferred to DiT phase", category="blockswap")
-            else:
-                cached_runner._pending_blockswap_config = None
-                
-        elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
-            # Config matches but was deactivated - just reactivate
-            cached_runner._blockswap_active = True
-            debug.log(f"BlockSwap reactivated: {format_config(desired_config)}", category="reuse", force=True)
-        
-        # Store debug instance on runner
-        cached_runner.debug = debug
-
-        debug.end_timer("cache_reuse", "Reuse cached runner")
-
-        return cached_runner
-        
-    else:
-        debug.log(f"Cache miss: Creating new runner for model {model}", category="cache", force=True)
+            return cached_runner
+    
+    # Full runner creation
+    debug.log(f"Creating new runner: DiT={dit_model}, VAE={vae_model}", 
+             category="runner", force=True)
     
     # If we reach here, create a new runner
     debug.start_timer("config_load")
 
     # Select config based on model type   
-    if "7b" in model:
+    if "7b" in dit_model:
         config_path = os.path.join(script_directory, './configs_7b', 'main.yaml')
     else:
         config_path = os.path.join(script_directory, './configs_3b', 'main.yaml')
@@ -186,7 +277,13 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
     
     debug.start_timer("runner_video_infer")
     # Create runner
-    runner = VideoDiffusionInfer(config, debug, vae_tiling_enabled=vae_tiling_enabled, vae_tile_size=vae_tile_size, vae_tile_overlap=vae_tile_overlap)
+    runner = VideoDiffusionInfer(config, debug, 
+                                encode_tiled=encode_tiled, 
+                                encode_tile_size=encode_tile_size, 
+                                encode_tile_overlap=encode_tile_overlap,
+                                decode_tiled=decode_tiled,
+                                decode_tile_size=decode_tile_size,
+                                decode_tile_overlap=decode_tile_overlap)
     OmegaConf.set_readonly(runner.config, False)
     debug.end_timer("runner_video_infer", "Video diffusion inference runner initialization")
     
@@ -195,11 +292,9 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
     #if torch.mps.is_available():
     #    device = "mps"
     
-    # Prepare model structures
-    dit_checkpoint_path = find_model_file(model, base_cache_dir)
     debug.start_timer("model_structures")
-    
     # Prepare DiT structure
+    dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
     runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, config, 
                                     block_swap_config, debug)
     
@@ -211,7 +306,7 @@ def configure_runner(model: str, base_cache_dir: str, preserve_vram: bool = Fals
                     category="precision", force=True)
     
     # Prepare VAE structure
-    vae_checkpoint_path = find_model_file(config.vae.checkpoint, base_cache_dir)
+    vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
     runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, config, 
                                     None, debug)
     

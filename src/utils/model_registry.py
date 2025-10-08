@@ -24,7 +24,7 @@ MODEL_CLASSES = {
 class ModelInfo:
     """Model metadata"""
     repo: str = "numz/SeedVR2_comfyUI"
-    category: str = "model"  # 'model' or 'vae'
+    category: str = "dit"  # 'model' or 'vae'
     precision: str = "fp16"  # 'fp16', 'fp8_e4m3fn', 'Q4_K_M', etc.
     size: str = "3B"  # '3B', '7B', etc.
     variant: Optional[str] = None  # 'sharp', etc.
@@ -52,20 +52,20 @@ MODEL_REGISTRY = {
 }
 
 # Configuration constants
-DEFAULT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 DEFAULT_VAE = "ema_vae_fp16.safetensors"
 
-def get_default_models() -> List[str]:
-    """Get list of default models (non-VAE)"""
-    return [name for name, info in MODEL_REGISTRY.items() if info.category == "model"]
+def get_default_models(category: str) -> List[str]:
+    """Get list of default models"""
+    return [name for name, info in MODEL_REGISTRY.items() if info.category == category]
 
 def get_model_repo(model_name: str) -> str:
     """Get repository for a specific model"""
     return MODEL_REGISTRY.get(model_name, ModelInfo()).repo
 
-def get_available_models() -> List[str]:
-    """Get all available models including those discovered on disk"""
-    model_list = get_default_models()
+def get_available_dit_models() -> List[str]:
+    """Get all available DiT models including those discovered on disk"""
+    model_list = get_default_models("dit")
     
     try:
         # Get all model files from all paths
@@ -82,4 +82,9 @@ def get_available_models() -> List[str]:
     except:
         pass
     
+    return model_list
+
+def get_available_vae_models() -> List[str]:
+    """Get all available VAE models from the registry"""
+    model_list = get_default_models("vae")
     return model_list

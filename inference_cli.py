@@ -46,7 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
-from src.utils.model_registry import get_available_models, DEFAULT_MODEL
+from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
@@ -297,10 +297,14 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     worker_debug = Debug(enabled=shared_args["debug"])
     
     # Setup device environment
-    device = setup_device_environment(f"cuda:{device_id}", worker_debug)
+    dit_device, vae_device = setup_device_environment(
+        dit_device=f"cuda:{device_id}", 
+        vae_device=f"cuda:{device_id}", 
+        debug=worker_debug
+    )
 
-    # Create generation context with the configured device
-    ctx = prepare_generation_context(device=device, debug=worker_debug)
+    # Create generation context with the configured devices
+    ctx = prepare_generation_context(dit_device=dit_device, vae_device=vae_device, debug=worker_debug)
 
     # Reconstruct frames tensor
     frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
@@ -310,11 +314,20 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     model_name = shared_args["model"]
 
     runner, _ = prepare_runner(
-        model_name, model_dir, shared_args["preserve_vram"], worker_debug,
+        dit_model=model_name,
+        vae_model=DEFAULT_VAE,
+        model_dir=model_dir,
+        preserve_vram=shared_args["preserve_vram"],
+        debug=worker_debug,
+        cache_model_dit=False,
+        cache_model_vae=False,
         block_swap_config=shared_args["block_swap_config"],
-        vae_tiling_enabled=shared_args["vae_tiling_enabled"],
-        vae_tile_size=shared_args["vae_tile_size"],
-        vae_tile_overlap=shared_args["vae_tile_overlap"],
+        encode_tiled=shared_args["vae_encode_tiling_enabled"],
+        encode_tile_size=shared_args["vae_encode_tile_size"],
+        encode_tile_overlap=shared_args["vae_encode_tile_overlap"],
+        decode_tiled=shared_args["vae_decode_tiling_enabled"],
+        decode_tile_size=shared_args["vae_decode_tile_size"],
+        decode_tile_overlap=shared_args["vae_decode_tile_overlap"],
         cached_runner=None  # No caching in worker processes
     )
 
@@ -419,9 +432,12 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
             'offload_io_components': args.offload_io_components,
             'cache_model': False, # No caching in CLI mode
         },
-        "vae_tiling_enabled": args.vae_tiling_enabled,
-        "vae_tile_size": args.vae_tile_size,
-        "vae_tile_overlap": args.vae_tile_overlap,
+        "vae_encode_tiling_enabled": args.vae_encode_tiling_enabled,
+        "vae_encode_tile_size": args.vae_encode_tile_size,
+        "vae_encode_tile_overlap": args.vae_encode_tile_overlap,
+        "vae_decode_tiling_enabled": args.vae_decode_tiling_enabled,
+        "vae_decode_tile_size": args.vae_decode_tile_size,
+        "vae_decode_tile_overlap": args.vae_decode_tile_overlap,
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -510,8 +526,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Target resolution of the short side (default: 1072)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
-                        choices=get_available_models(),
+    parser.add_argument("--model", type=str, default=DEFAULT_DIT,
+                        choices=get_available_dit_models(),
                         help="Model to use (default: 3B FP8)")
     parser.add_argument("--model_dir", type=str, default="seedvr2_models",
                             help="Directory containing the model files (default: use cache directory)")
@@ -547,12 +563,18 @@ def parse_arguments() -> argparse.Namespace:
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
     parser.add_argument("--offload_io_components", action="store_true",
                         help="Offload IO components to CPU for VRAM optimization")
-    parser.add_argument("--vae_tiling_enabled", action="store_true",
-                        help="Enable VAE tiling for improved VRAM usage")
-    parser.add_argument("--vae_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
-                        help="VAE tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
-    parser.add_argument("--vae_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="VAE tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_tiling_enabled is set")
+    parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
+                        help="Enable VAE encode tiling for improved VRAM usage")
+    parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
+                        help="VAE encode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_encode_tiling_enabled is set")
+    parser.add_argument("--vae_encode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
+                        help="VAE encode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_encode_tiling_enabled is set")
+    parser.add_argument("--vae_decode_tiling_enabled", action="store_true",
+                        help="Enable VAE decode tiling for improved VRAM usage")
+    parser.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
+                        help="VAE decode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
+    parser.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
+                        help="VAE decode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
     return parser.parse_args()
 
 
@@ -568,13 +590,17 @@ def main() -> None:
     for key, value in vars(args).items():
         debug.log(f"  {key}: {value}", category="none")
 
-    if args.vae_tiling_enabled and (args.vae_tile_overlap[0] >= args.vae_tile_size[0] or args.vae_tile_overlap[1] >= args.vae_tile_size[1]):
-        print(f"Error: VAE tile overlap {args.vae_tile_overlap} must be smaller than tile size {args.vae_tile_size}")
+    if args.vae_encode_tiling_enabled and (args.vae_encode_tile_overlap[0] >= args.vae_encode_tile_size[0] or args.vae_encode_tile_overlap[1] >= args.vae_encode_tile_size[1]):
+        debug.log(f"VAE encode tile overlap {args.vae_encode_tile_overlap} must be smaller than tile size {args.vae_encode_tile_size}", level="ERROR", category="vae", force=True)
+        sys.exit(1)
+    
+    if args.vae_decode_tiling_enabled and (args.vae_decode_tile_overlap[0] >= args.vae_decode_tile_size[0] or args.vae_decode_tile_overlap[1] >= args.vae_decode_tile_size[1]):
+        debug.log(f"VAE decode tile overlap {args.vae_decode_tile_overlap} must be smaller than tile size {args.vae_decode_tile_size}", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
     if args.debug:
         if platform.system() == "Darwin":
-            print("You are running on macOS and will use the MPS backend!")
+            debug.log("You are running on macOS and will use the MPS backend!", category="info", force=True)
         else:
             # Show actual CUDA device visibility
             debug.log(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set (all)')}", category="device")
@@ -613,7 +639,10 @@ def main() -> None:
         if args.debug:
             debug.log(f"Using devices: {device_list}", category="device")
         processing_start = time.time()
-        download_weight(args.model, args.model_dir)
+        # Download both DiT and VAE models
+        if not download_weight(dit_model=args.model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
+            debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
+            sys.exit(1)
         result = _gpu_processing(frames_tensor, device_list, args)
         generation_time = time.time() - processing_start
         
