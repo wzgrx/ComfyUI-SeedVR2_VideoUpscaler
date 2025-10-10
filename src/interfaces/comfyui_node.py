@@ -153,7 +153,7 @@ class SeedVR2:
                 - model: Model filename
                 - device: Target device
                 - blocks_to_swap: BlockSwap configuration
-                - offload_io_components: I/O component offload flag
+                - swap_io_components: I/O component swap flag
                 - cache_in_ram: Model caching flag
                 - torch_compile_args: Optional compilation settings
             vae: VAE model configuration from SeedVR2LoadVAEModel node containing:
@@ -193,7 +193,7 @@ class SeedVR2:
         dit_model = dit["model"]
         dit_device = dit["device"]
         blocks_to_swap = dit.get("blocks_to_swap", 0)
-        offload_io_components = dit.get("offload_io_components", False)
+        swap_io_components = dit.get("swap_io_components", False)
         cache_model_dit = dit.get("cache_in_ram", False)
         dit_torch_compile_args = dit.get("torch_compile_args", None)
 
@@ -214,7 +214,7 @@ class SeedVR2:
         if blocks_to_swap > 0:
             block_swap_config = {
                 "blocks_to_swap": blocks_to_swap,
-                "offload_io_components": offload_io_components,
+                "swap_io_components": swap_io_components,
             }
         
         # Fixed parameters (could be exposed in future)
@@ -624,7 +624,7 @@ class SeedVR2LoadDiTModel:
                     "step": 1,
                     "tooltip": "BlockSwap: Number of transformer blocks to offload (0=disabled, 16=balanced, 32=max savings for 3b model, 36=max savings for 7b model)"
                 }),
-                "offload_io_components": ("BOOLEAN", {
+                "swap_io_components": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Offload embeddings/IO layers to CPU for additional VRAM savings"
                 }),
@@ -644,7 +644,7 @@ class SeedVR2LoadDiTModel:
     DESCRIPTION = "Configure DiT model loading and memory optimization settings"
     
     def create_config(self, model: str, device: str, blocks_to_swap: int = 0, 
-                     offload_io_components: bool = False, cache_in_ram: bool = False, 
+                     swap_io_components: bool = False, cache_in_ram: bool = False, 
                      torch_compile_args: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any]]:
         """
         Create DiT model configuration dictionary
@@ -653,7 +653,7 @@ class SeedVR2LoadDiTModel:
             model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
             device: Target device for DiT model (e.g., "cuda:0", "cpu")
             blocks_to_swap: Number of transformer blocks to offload for BlockSwap (0=disabled)
-            offload_io_components: Whether to offload input/output layers to CPU
+            swap_io_components: Whether to offload input/output layers to CPU
             cache_in_ram: Whether to keep model in RAM between runs
             torch_compile_args: Optional torch.compile configuration from settings node
             
@@ -664,7 +664,7 @@ class SeedVR2LoadDiTModel:
             "model": model,
             "device": device,
             "blocks_to_swap": blocks_to_swap,
-            "offload_io_components": offload_io_components,
+            "swap_io_components": swap_io_components,
             "cache_in_ram": cache_in_ram,
             "torch_compile_args": torch_compile_args,
         }

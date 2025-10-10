@@ -606,7 +606,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
                     block.to("cpu")
             
             # Handle I/O components
-            if not runner._block_swap_config.get("offload_io_components", False):
+            if not runner._block_swap_config.get("swap_io_components", False):
                 # I/O components should be on GPU if not offloaded
                 for name, module in model.named_children():
                     if name != "blocks":
@@ -827,7 +827,7 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = Fal
     # 5. Clear DiT-related components and temporary attributes
     dit_components = [
         'sampler', 'sampling_timesteps', 'schedule',
-        '_dit_checkpoint', '_dit_block_swap_config', '_pending_blockswap_config'
+        '_dit_checkpoint', '_dit_block_swap_config'
     ]
     for component in dit_components:
         if hasattr(runner, component):
@@ -925,7 +925,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_dit_in_ram: bool = 
     
     # 4. Clear all temporary loading/configuration attributes
     temp_attributes = [
-        '_dit_checkpoint', '_dit_block_swap_config', '_pending_blockswap_config',
+        '_dit_checkpoint', '_dit_block_swap_config',
         '_vae_checkpoint', '_vae_dtype_override'
     ]
     for attr in temp_attributes:

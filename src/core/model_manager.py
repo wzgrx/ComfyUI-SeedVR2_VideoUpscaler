@@ -132,31 +132,34 @@ def _handle_blockswap_config(cached_runner: VideoDiffusionInfer,
     if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
         desired_config = (
             block_swap_config.get("blocks_to_swap"),
-            block_swap_config.get("offload_io_components", False)
+            block_swap_config.get("swap_io_components", False)
         )
     
     current_config = None
     if hasattr(cached_runner, "_block_swap_config"):
         current_config = (
             cached_runner._block_swap_config.get("blocks_swapped"),
-            cached_runner._block_swap_config.get("offload_io_components", False)
+            cached_runner._block_swap_config.get("swap_io_components", False)
         )
     
     # Apply changes if needed
     if desired_config != current_config:
-        fmt_curr = "disabled" if current_config is None else f"blocks={current_config[0]}, offload={current_config[1]}"
-        fmt_new = "disabled" if desired_config is None else f"blocks={desired_config[0]}, offload={desired_config[1]}"
+        fmt_curr = "disabled" if current_config is None else f"blocks={current_config[0]}, I/O={current_config[1]}"
+        fmt_new = "disabled" if desired_config is None else f"blocks={desired_config[0]}, I/O={desired_config[1]}"
         debug.log(f"BlockSwap config changed: {fmt_curr} → {fmt_new}", category="blockswap", force=True)
         
         cleanup_blockswap(cached_runner, keep_state_for_cache=False)
-        cached_runner._pending_blockswap_config = block_swap_config if desired_config else None
         
         if desired_config:
-            debug.log("BlockSwap application deferred to DiT phase", category="blockswap")
+            # Apply BlockSwap immediately since model is already materialized
+            apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
+        else:
+            # Clear any pending config
+            cached_runner._dit_block_swap_config = None
             
     elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
         cached_runner._blockswap_active = True
-        debug.log(f"BlockSwap reactivated: blocks={desired_config[0]}, offload={desired_config[1]}", 
+        debug.log(f"BlockSwap reactivated: blocks={desired_config[0]}, I/O={desired_config[1]}", 
                  category="blockswap", force=True)
 
 

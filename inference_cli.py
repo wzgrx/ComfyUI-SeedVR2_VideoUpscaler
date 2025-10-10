@@ -455,7 +455,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "block_swap_config": {
             'blocks_to_swap': args.blocks_to_swap,
             'use_none_blocking': args.use_none_blocking,
-            'offload_io_components': args.offload_io_components,
+            'swap_io_components': args.swap_io_components,
             'cache_model': False,
         },
         "vae_encode_tiling_enabled": args.vae_encode_tiling_enabled,
@@ -595,8 +595,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Temporal overlap for processing (default: 0, no temporal overlap)")
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
-    parser.add_argument("--offload_io_components", action="store_true",
-                        help="Offload IO components to CPU for VRAM optimization")
+    parser.add_argument("--swap_io_components", action="store_true",
+                        help="Swap IO components to CPU for VRAM optimization")
     parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
                         help="Enable VAE encode tiling for improved VRAM usage")
     parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),

@@ -72,7 +72,7 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
         runner: VideoDiffusionInfer instance containing the model
         block_swap_config: Configuration dictionary with keys:
             - blocks_to_swap: Number of blocks to swap (from the start)
-            - offload_io_components: Whether to offload I/O components
+            - swap_io_components: Whether to offload I/O components
             - enable_debug: Whether to enable debug logging
     """
     if not block_swap_config:
@@ -103,7 +103,7 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     blocks_to_swap = block_swap_config.get("blocks_to_swap", 0)
     if blocks_to_swap > 0:
         configs.append(f"{blocks_to_swap} blocks")
-    if block_swap_config.get("offload_io_components", False):
+    if block_swap_config.get("swap_io_components", False):
         configs.append("I/O components")
     debug.log(f"BlockSwap configured: {', '.join(configs)}", category="blockswap", force=True)
     debug.log("BlockSwap will swap blocks to GPU during inference", category="info", force=True)
@@ -125,16 +125,16 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     debug.log(f"Configuring: {blocks_to_swap}/{total_blocks} blocks for swapping", category="blockswap")
     
     # Configure I/O components
-    offload_io_components = block_swap_config.get("offload_io_components", False)
+    swap_io_components = block_swap_config.get("swap_io_components", False)
     io_components_offloaded = _configure_io_components(model, device, offload_device, 
-                                                       offload_io_components, debug)
+                                                       swap_io_components, debug)
 
     # Configure block placement and memory tracking
     memory_stats = _configure_blocks(model, device, offload_device, debug)
     memory_stats['io_components'] = io_components_offloaded
 
      # Log memory summary
-    _log_memory_summary(memory_stats, offload_device, device, offload_io_components, 
+    _log_memory_summary(memory_stats, offload_device, device, swap_io_components, 
                        debug)
     
     # Wrap block forward methods for dynamic swapping
@@ -151,7 +151,7 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     # Store configuration for debugging and cleanup
     runner._block_swap_config = {
         "blocks_swapped": blocks_to_swap,
-        "offload_io_components": offload_io_components,
+        "swap_io_components": swap_io_components,
         "total_blocks": total_blocks,
         "offload_device": offload_device,
         "main_device": device,
@@ -168,22 +168,22 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     
 
 def _configure_io_components(model, device: str, offload_device: str, 
-                            offload_io_components: bool, debug) -> List[str]:
+                            swap_io_components: bool, debug) -> List[str]:
     """Configure I/O component placement and wrapping."""
     io_components_offloaded = []
     
     # Process non-block parameters
     for name, param in model.named_parameters():
         if "block" not in name:
-            target_device = offload_device if offload_io_components else device
+            target_device = offload_device if swap_io_components else device
             param.data = param.data.to(target_device, non_blocking=False)
-            status = "(offloaded)" if offload_io_components else ""
+            status = "(offloaded)" if swap_io_components else ""
             debug.log(f"  {name} → {target_device} {status}", category="blockswap")
 
     # Handle I/O modules with dynamic swapping
     for name, module in model.named_children():
         if name != "blocks":
-            if offload_io_components:
+            if swap_io_components:
                 module.to(offload_device)
                 _wrap_io_forward(module, name, model, debug)
                 io_components_offloaded.append(name)
@@ -227,7 +227,7 @@ def _configure_blocks(model, device: str, offload_device: str,
 
 
 def _log_memory_summary(memory_stats: Dict[str, float], offload_device: str, 
-                       device: str, offload_io_components: bool,
+                       device: str, swap_io_components: bool,
                        debug) -> None:
     """Log memory usage summary."""
     debug.log("BlockSwap memory configuration:", category="blockswap")
@@ -241,7 +241,7 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: str,
     total_memory = memory_stats['offload_memory'] + memory_stats['main_memory']
     debug.log(f"  Total transformer blocks memory: {total_memory:.2f}MB", category="blockswap")
     
-    if offload_io_components and memory_stats.get('io_components'):
+    if swap_io_components and memory_stats.get('io_components'):
         debug.log(f"  I/O components offloaded: {', '.join(memory_stats['io_components'])}", category="blockswap")
 
 
