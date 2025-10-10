@@ -136,8 +136,8 @@ class NaSwinAttention(MMWindowAttention):
             cu_seqlens_k=cache_win(
                 "vid_seqlens_k", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
             ),
-            max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max().item()),
-            max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max().item()),
+            max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max()),
+            max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max()),
         ).type_as(vid_q)
 
         # text pooling

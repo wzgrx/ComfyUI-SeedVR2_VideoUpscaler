@@ -17,10 +17,30 @@ import types
 import torch
 import weakref
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from .memory_manager import clear_memory
 from .compatibility import call_rope_with_stability
 from ..common.distributed import get_device
+
+
+# Timing helpers marked to skip torch.compile tracing
+# These functions are excluded from Dynamo's graph tracing to avoid warnings
+# about non-traceable builtins like time.time(), but they still execute normally
+@torch._dynamo.disable
+def _get_swap_start_time(debug, enabled: bool) -> Optional[float]:
+    """Get start time for swap operation if debug is enabled."""
+    return time.time() if debug and enabled else None
+
+
+@torch._dynamo.disable  
+def _log_swap_timing(debug, t_start: Optional[float], component_id, component_type: str) -> None:
+    """Log swap timing if start time was captured."""
+    if debug and t_start is not None:
+        debug.log_swap_time(
+            component_id=component_id,
+            duration=time.time() - t_start,
+            component_type=component_type
+        )
 
 
 def get_module_memory_mb(module: torch.nn.Module) -> float:
@@ -228,7 +248,6 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: str,
 
 def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.Module, debug) -> None:
     """Wrap individual block forward to handle device movement using weak references to prevent leaks."""
-    
     if hasattr(block, '_original_forward'):
         return  # Already wrapped
 
@@ -253,7 +272,8 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
 
         # Check if block swap is active for this block
         if hasattr(model, 'blocks_to_swap') and self._block_idx <= model.blocks_to_swap:
-            t_start = time.time() if debug and debug.enabled else None
+            # Use dynamo-disabled helper to get start time (avoids compilation warnings)
+            t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
 
             # Only move to GPU if necessary
             current_device = next(self.parameters()).device
@@ -268,16 +288,11 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
             # Move back to offload device
             self.to(model.offload_device, non_blocking=False)
             
-            # Log timing if debug is available
-            if debug and t_start is not None:
-                debug.log_swap_time(
-                    component_id=self._block_idx,
-                    duration=time.time() - t_start,
-                    component_type="block"
-                )
+            # Use dynamo-disabled helper to log timing (avoids compilation warnings)
+            _log_swap_timing(debug, t_start, self._block_idx, "block")
 
             # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_block_forward")
+            clear_memory(debug=debug, deep=True, force=False, timer_name=f"blockswap_block_{self._block_idx}")
         else:
             output = original_forward(*args, **kwargs)
 
@@ -292,7 +307,6 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
 
 def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.Module, debug) -> None:
     """Wrap I/O component forward using weak references to prevent memory leaks."""
-    
     if hasattr(module, '_is_io_wrapped') and module._is_io_wrapped:
         debug.log(f"Reusing existing I/O wrapper for {module_name}", category="reuse")
         return  # Already wrapped
@@ -317,7 +331,8 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
             # Model has been garbage collected, fall back to original
             return self._original_forward(*args, **kwargs)
 
-        t_start = time.time() if debug and debug.enabled else None
+        # Use dynamo-disabled helper to get start time (avoids compilation warnings)
+        t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
         
         # Check current device to avoid unnecessary moves
         current_device = next(self.parameters()).device
@@ -333,16 +348,11 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
         # Move back to offload device
         self.to(model.offload_device, non_blocking=False)
         
-        # Log timing if debug is available
-        if debug and t_start is not None:
-            debug.log_swap_time(
-                component_id=self._module_name,
-                duration=time.time() - t_start,
-                component_type="I/O"
-            )
+        # Use dynamo-disabled helper to log timing (avoids compilation warnings)
+        _log_swap_timing(debug, t_start, self._module_name, "I/O")
 
         # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_io_forward")
+        clear_memory(debug=debug, deep=True, force=False, timer_name=f"blockswap_io_{self._module_name}")
 
         return output
     

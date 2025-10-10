@@ -128,6 +128,7 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         txt_k = rearrange(txt_k, "h L d -> L h d")
         return vid_q, vid_k, txt_q, txt_k
 
+    @torch._dynamo.disable  # Disable compilation: .tolist() is data-dependent and causes graph breaks
     def get_freqs(
         self,
         vid_shape: torch.LongTensor,
@@ -136,6 +137,15 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         torch.Tensor,
         torch.Tensor,
     ]:
+        """
+        Generate RoPE frequencies for video and text with adaptive dimensions.
+        
+        Note: This method uses @torch._dynamo.disable because .tolist() creates
+        data-dependent control flow that breaks torch.compile's computational graph.
+        Since this is only called during cache initialization (not in the hot path),
+        the performance impact is negligible while ensuring compilation compatibility
+        for the rest of the model.
+        """
         # Calculate actual max dimensions needed for this batch
         max_temporal = 0
         max_height = 0

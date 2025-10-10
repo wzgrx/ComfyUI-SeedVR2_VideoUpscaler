@@ -204,6 +204,9 @@ def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = 
                     debug.log(f"RAM pressure: {mem.available/(1024**3):.2f}GB free of {mem.total/(1024**3):.2f}GB", category="memory")
         
         if not should_clear:
+            # End timer before early return to keep stack clean
+            if debug:
+                debug.end_timer(main_timer)
             return
     
     # Determine cleanup level

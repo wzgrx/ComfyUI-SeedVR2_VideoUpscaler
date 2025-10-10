@@ -72,6 +72,7 @@ class Debug:
         self.timer_namespace: str = ""
         
 
+    @torch._dynamo.disable  # Skip tracing to avoid datetime.now() warnings
     def log(self, message: str, level: str = "INFO", category: str = "general", force: bool = False) -> None:
         """
         Log a categorized message with optional timestamp
@@ -108,6 +109,7 @@ class Debug:
         print(f"{prefix} {message}")
 
 
+    @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def start_timer(self, name: str, force: bool = False) -> None:
         """
         Start a named timer
@@ -136,6 +138,7 @@ class Debug:
             self.active_timer_stack.append(name)
     
 
+    @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def end_timer(self, name: str, message: Optional[str] = None, 
               force: bool = False, show_breakdown: bool = False,
               custom_children: Optional[Dict[str, float]] = None) -> float:
@@ -459,6 +462,7 @@ class Debug:
             self.log(f"  Memory changes: {', '.join(diffs)}", category="memory", force=force)
     
 
+    @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def _store_checkpoint(self, label: str, metrics: Dict[str, Any]) -> None:
         """Store checkpoint with memory limit to prevent leaks."""
         checkpoint = {

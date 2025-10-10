@@ -343,15 +343,17 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
                    encode_tile_overlap: Optional[Tuple[int, int]] = None,
                    decode_tiled: bool = False, decode_tile_size: Optional[Tuple[int, int]] = None,
                    decode_tile_overlap: Optional[Tuple[int, int]] = None,
+                   torch_compile_args_dit: Optional[Dict[str, Any]] = None,
+                   torch_compile_args_vae: Optional[Dict[str, Any]] = None,
                    cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
     """
     Prepare runner with model state management.
     Handles model changes and caching logic with independent DiT/VAE caching support.
     
     Args:
-        dit_model: Name of the DiT model to load
-        vae_model: Name of the VAE model to load
-        model_dir: Directory containing model files  
+        dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
+        vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
+        model_dir: Base directory containing model files
         preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
         debug: Debug instance for logging
         cache_model_dit: Whether to cache DiT model in RAM between runs
@@ -363,11 +365,20 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
         decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
         decode_tile_size: Tile size for decoding (height, width)
         decode_tile_overlap: Tile overlap for decoding (height, width)
-        cached_runner: Existing runner instance if caching (passed if either model is cached)
+        torch_compile_args_dit: Optional torch.compile configuration for DiT model
+        torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        cached_runner: Optional cached runner to reuse (passed if either model is cached)
         
     Returns:
-        tuple: (runner, model_changed) - configured runner instance and whether any model changed (DiT or VAE)
-    """   
+        Tuple[VideoDiffusionInfer, bool]: (configured runner, whether models changed)
+        
+    Features:
+        - Independent DiT and VAE caching for flexible memory management
+        - Dynamic model reloading when models change
+        - Optional torch.compile optimization for inference speedup
+        - Separate encode/decode tiling configuration for optimal performance
+        - Memory optimization and BlockSwap integration
+    """
     dit_changed = False
     vae_changed = False
     
@@ -418,6 +429,8 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
         decode_tiled=decode_tiled,
         decode_tile_size=decode_tile_size,
         decode_tile_overlap=decode_tile_overlap,
+        torch_compile_args_dit=torch_compile_args_dit,
+        torch_compile_args_vae=torch_compile_args_vae,
         cached_runner=cached_runner if (cache_model_dit or cache_model_vae) else None
     )
     
@@ -740,11 +753,6 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", str(ctx['dit_device']), runner.config, 
                             preserve_vram, debug)
-        # Check for pending BlockSwap on already-materialized cached models
-        elif hasattr(runner, '_pending_blockswap_config') and runner._pending_blockswap_config:
-            debug.log("Applying deferred BlockSwap to cached DiT", category="blockswap")
-            apply_block_swap_to_dit(runner, runner._pending_blockswap_config, debug)
-            runner._pending_blockswap_config = None
         
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=str(ctx['dit_device']), 

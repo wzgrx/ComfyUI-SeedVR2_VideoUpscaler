@@ -5,7 +5,7 @@
 import os
 import time
 import torch
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 from ..utils.constants import get_base_cache_dir, get_script_directory
 from ..utils.downloads import download_weight
@@ -141,7 +141,53 @@ class SeedVR2:
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
                 latent_noise_scale: float = 0.0, preserve_vram: bool = False,
                 enable_debug: bool = False) -> Tuple[torch.Tensor]:
-        """Execute SeedVR2 video upscaling with progress reporting"""
+        """
+        Execute SeedVR2 video upscaling with progress reporting
+        
+        Main entry point for ComfyUI node execution. Handles model downloads,
+        configuration unpacking, and delegates to internal execution pipeline.
+        
+        Args:
+            pixels: Input video frames as tensor (N, H, W, C) in [0, 1] range
+            dit: DiT model configuration from SeedVR2LoadDiTModel node containing:
+                - model: Model filename
+                - device: Target device
+                - blocks_to_swap: BlockSwap configuration
+                - offload_io_components: I/O component offload flag
+                - cache_in_ram: Model caching flag
+                - torch_compile_args: Optional compilation settings
+            vae: VAE model configuration from SeedVR2LoadVAEModel node containing:
+                - model: Model filename
+                - device: Target device
+                - encode_tiled: Enable tiled encoding
+                - encode_tile_size: Encoding tile size
+                - encode_tile_overlap: Encoding tile overlap
+                - decode_tiled: Enable tiled decoding
+                - decode_tile_size: Decoding tile size
+                - decode_tile_overlap: Decoding tile overlap
+                - cache_in_ram: Model caching flag
+                - torch_compile_args: Optional compilation settings
+            seed: Random seed for reproducible generation
+            new_resolution: Target resolution for shortest edge (maintains aspect ratio)
+            batch_size: Frames per batch (minimum 5 for temporal consistency)
+            color_correction: Color correction method ("wavelet", "adain", or "none")
+            input_noise_scale: Input noise injection scale [0.0-1.0]
+            latent_noise_scale: Latent noise injection scale [0.0-1.0]
+            preserve_vram: Offload models between pipeline phases to save VRAM
+            enable_debug: Enable detailed logging and memory tracking
+            
+        Returns:
+            Tuple containing upscaled video tensor (N, H', W', C) in [0, 1] range
+            
+        Raises:
+            ValueError: If model files cannot be downloaded or configuration is invalid
+            RuntimeError: If generation pipeline fails
+            
+        Note:
+            - Models are automatically downloaded on first use
+            - Minimum batch_size of 5 recommended for temporal consistency
+            - Higher batch_size improves quality but requires more VRAM
+        """
         
         # Unpack DiT configuration
         dit_model = dit["model"]
@@ -149,7 +195,8 @@ class SeedVR2:
         blocks_to_swap = dit.get("blocks_to_swap", 0)
         offload_io_components = dit.get("offload_io_components", False)
         cache_model_dit = dit.get("cache_in_ram", False)
-        
+        dit_torch_compile_args = dit.get("torch_compile_args", None)
+
         # Unpack VAE configuration
         vae_model = vae["model"]
         vae_device = vae["device"]
@@ -160,6 +207,7 @@ class SeedVR2:
         decode_tile_size = vae.get("decode_tile_size", 512)
         decode_tile_overlap = vae.get("decode_tile_overlap", 64)
         cache_model_vae = vae.get("cache_in_ram", False)
+        vae_torch_compile_args = vae.get("torch_compile_args", None)
         
         # Create block_swap_config if blocks_to_swap > 0
         block_swap_config = None
@@ -210,15 +258,22 @@ class SeedVR2:
                                         encode_tiled, encode_tile_size, encode_tile_overlap, 
                                         decode_tiled, decode_tile_size, decode_tile_overlap, 
                                         preserve_vram, temporal_overlap, 
-                                        cache_model_dit, cache_model_vae, dit_device, vae_device, block_swap_config)
+                                        cache_model_dit, cache_model_vae, dit_device, vae_device, 
+                                        dit_torch_compile_args, vae_torch_compile_args, block_swap_config)
         except Exception as e:
             self.cleanup(cache_model_dit=cache_model_dit, cache_model_vae=cache_model_vae, debug=self.debug)
             raise e
         
 
-    def cleanup(self, cache_model_dit: bool = False, cache_model_vae: bool = False, debug=None):
+    def cleanup(self, cache_model_dit: bool = False, cache_model_vae: bool = False, 
+               debug: Optional['Debug'] = None) -> None:
         """
         Cleanup runner and free memory
+        
+        Args:
+            cache_model_dit: If True, keep DiT model in RAM for future runs
+            cache_model_vae: If True, keep VAE model in RAM for future runs
+            debug: Optional debug instance for logging cleanup operations
         """
         # Clear progress bar if it exists
         if hasattr(self, '_pbar') and self._pbar is not None:
@@ -246,11 +301,86 @@ class SeedVR2:
             self.ctx = None
 
 
-    def _internal_execute(self, pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, batch_size,
-                color_correction, input_noise_scale, latent_noise_scale, encode_tiled, encode_tile_size, 
-                encode_tile_overlap, decode_tiled, decode_tile_size, decode_tile_overlap, 
-                preserve_vram, temporal_overlap, cache_model_dit, cache_model_vae, dit_device, vae_device, block_swap_config) -> Tuple[torch.Tensor]:
-        """Internal execution logic with progress tracking"""
+    def _internal_execute(
+        self, 
+        pixels: torch.Tensor, 
+        dit_model: str, 
+        vae_model: str, 
+        seed: int, 
+        new_resolution: int, 
+        cfg_scale: float, 
+        batch_size: int,
+        color_correction: str, 
+        input_noise_scale: float, 
+        latent_noise_scale: float, 
+        encode_tiled: bool, 
+        encode_tile_size: int, 
+        encode_tile_overlap: int, 
+        decode_tiled: bool, 
+        decode_tile_size: int, 
+        decode_tile_overlap: int, 
+        preserve_vram: bool, 
+        temporal_overlap: int, 
+        cache_model_dit: bool, 
+        cache_model_vae: bool, 
+        dit_device: str, 
+        vae_device: str,
+        dit_torch_compile_args: Optional[Dict[str, Any]], 
+        vae_torch_compile_args: Optional[Dict[str, Any]], 
+        block_swap_config: Optional[Dict[str, Any]]
+    ) -> Tuple[torch.Tensor]:
+        """
+        Internal execution logic with progress tracking and four-phase pipeline
+        
+        Implements the complete video upscaling pipeline:
+        1. Model preparation and device setup
+        2. Four-phase batch processing (encode → upscale → decode → postprocess)
+        3. Progress tracking and memory management
+        4. Cleanup and result finalization
+        
+        Args:
+            pixels: Input video frames tensor (N, H, W, C)
+            dit_model: DiT model filename
+            vae_model: VAE model filename
+            seed: Random seed for generation
+            new_resolution: Target resolution for shortest edge
+            cfg_scale: Classifier-free guidance scale (fixed at 1.0)
+            batch_size: Number of frames per batch
+            color_correction: Color correction method
+            input_noise_scale: Input noise injection scale
+            latent_noise_scale: Latent noise injection scale
+            encode_tiled: Enable VAE tiled encoding
+            encode_tile_size: VAE encoding tile size in pixels
+            encode_tile_overlap: VAE encoding tile overlap in pixels
+            decode_tiled: Enable VAE tiled decoding
+            decode_tile_size: VAE decoding tile size in pixels
+            decode_tile_overlap: VAE decoding tile overlap in pixels
+            preserve_vram: Offload models between phases
+            temporal_overlap: Overlap frames between batches (fixed at 0)
+            cache_model_dit: Keep DiT model in RAM after use
+            cache_model_vae: Keep VAE model in RAM after use
+            dit_device: Device string for DiT model
+            vae_device: Device string for VAE model
+            dit_torch_compile_args: Optional torch.compile settings for DiT
+            vae_torch_compile_args: Optional torch.compile settings for VAE
+            block_swap_config: Optional BlockSwap configuration for DiT
+            
+        Returns:
+            Tuple containing upscaled video tensor (N, H', W', C)
+            
+        Raises:
+            RuntimeError: If any pipeline phase fails
+            
+        Pipeline Phases:
+            Phase 1: VAE encoding - converts pixels to latent space
+            Phase 2: DiT upscaling - diffusion-based upscaling in latent space
+            Phase 3: VAE decoding - converts latents back to pixels
+            Phase 4: Post-processing - color correction and final assembly
+            
+        Note:
+            This method manages the complete lifecycle including model loading,
+            inference, and cleanup based on caching preferences.
+        """
         
         debug = self.debug
         
@@ -283,6 +413,8 @@ class SeedVR2:
             decode_tiled=decode_tiled,
             decode_tile_size=(decode_tile_size, decode_tile_size),
             decode_tile_overlap=(decode_tile_overlap, decode_tile_overlap),
+            torch_compile_args_dit=dit_torch_compile_args,
+            torch_compile_args_vae=vae_torch_compile_args,
             cached_runner=self.runner if (cache_model_dit or cache_model_vae) else None
         )
         self._dit_model_name = dit_model
@@ -401,8 +533,17 @@ class SeedVR2:
 
         return (sample,)
 
-    def _progress_callback(self, current_step, total_steps, current_batch_frames, phase_name=""):
-        """Progress callback for generation phases"""
+    def _progress_callback(self, current_step: int, total_steps: int, 
+                          current_batch_frames: int, phase_name: str = "") -> None:
+        """
+        Progress callback for generation phases
+        
+        Args:
+            current_step: Current step number within the phase
+            total_steps: Total steps in the current phase
+            current_batch_frames: Number of frames in current batch
+            phase_name: Name of the current phase (e.g., "Phase 1: Encoding")
+        """
         
         if not hasattr(self, '_pbar') or self._pbar is None:
             return
@@ -448,10 +589,21 @@ class SeedVR2:
 
 
 class SeedVR2LoadDiTModel:
-    """Configure DiT model and memory optimization settings"""
+    """
+    Configure DiT (Diffusion Transformer) model loader with memory optimization
+    
+    Provides configuration for:
+    - Model selection and device placement
+    - BlockSwap memory optimization for limited VRAM
+    - Model caching between runs
+    - Optional torch.compile integration
+    
+    Returns:
+        SEEDVR2_DIT configuration dictionary for main upscaler node
+    """
     
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
         devices = get_device_list()
         return {
             "required": {
@@ -480,6 +632,9 @@ class SeedVR2LoadDiTModel:
                     "default": False,
                     "tooltip": "Keep DiT model in RAM between runs for faster batch processing"
                 }),
+                "torch_compile_args": ("TORCH_COMPILE_ARGS", {
+                    "tooltip": "Optional torch.compile optimization settings from SeedVR2 Torch Compile Settings node"
+                }),
             }
         }
     
@@ -488,22 +643,51 @@ class SeedVR2LoadDiTModel:
     CATEGORY = "SEEDVR2"
     DESCRIPTION = "Configure DiT model loading and memory optimization settings"
     
-    def create_config(self, model, device, blocks_to_swap=0, offload_io_components=False, cache_in_ram=False):
+    def create_config(self, model: str, device: str, blocks_to_swap: int = 0, 
+                     offload_io_components: bool = False, cache_in_ram: bool = False, 
+                     torch_compile_args: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any]]:
+        """
+        Create DiT model configuration dictionary
+        
+        Args:
+            model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
+            device: Target device for DiT model (e.g., "cuda:0", "cpu")
+            blocks_to_swap: Number of transformer blocks to offload for BlockSwap (0=disabled)
+            offload_io_components: Whether to offload input/output layers to CPU
+            cache_in_ram: Whether to keep model in RAM between runs
+            torch_compile_args: Optional torch.compile configuration from settings node
+            
+        Returns:
+            Tuple containing configuration dictionary for SeedVR2 main node
+        """
         config = {
             "model": model,
             "device": device,
             "blocks_to_swap": blocks_to_swap,
             "offload_io_components": offload_io_components,
             "cache_in_ram": cache_in_ram,
+            "torch_compile_args": torch_compile_args,
         }
         return (config,)
 
 
 class SeedVR2LoadVAEModel:
-    """Configure VAE settings and tiling options"""
+    """
+    Configure VAE (Variational Autoencoder) model loader with tiling support
+    
+    Provides configuration for:
+    - Model selection and device placement
+    - Tiled encoding/decoding for VRAM reduction
+    - Tile size and overlap control
+    - Model caching between runs
+    - Optional torch.compile integration
+    
+    Returns:
+        SEEDVR2_VAE configuration dictionary for main upscaler node
+    """
     
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
         devices = get_device_list()
         return {
             "required": {
@@ -553,6 +737,9 @@ class SeedVR2LoadVAEModel:
                     "default": False,
                     "tooltip": "Keep VAE model in RAM between runs for faster batch processing"
                 }),
+                "torch_compile_args": ("TORCH_COMPILE_ARGS", {
+                    "tooltip": "Optional torch.compile optimization settings from SeedVR2 Torch Compile Settings node"
+                }),
             }
         }
     
@@ -561,9 +748,29 @@ class SeedVR2LoadVAEModel:
     CATEGORY = "SEEDVR2"
     DESCRIPTION = "Configure VAE settings and tiling options for memory optimization"
     
-    def create_config(self, model, device, encode_tiled=False, encode_tile_size=512, 
-                     encode_tile_overlap=64, decode_tiled=False, decode_tile_size=512,
-                     decode_tile_overlap=64, cache_in_ram=False):
+    def create_config(self, model: str, device: str, encode_tiled: bool = False, 
+                     encode_tile_size: int = 512, encode_tile_overlap: int = 64, 
+                     decode_tiled: bool = False, decode_tile_size: int = 512,
+                     decode_tile_overlap: int = 64, cache_in_ram: bool = False, 
+                     torch_compile_args: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any]]:
+        """
+        Create VAE model configuration dictionary
+        
+        Args:
+            model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
+            device: Target device for VAE model (e.g., "cuda:0", "cpu")
+            encode_tiled: Enable tiled encoding to reduce VRAM usage
+            encode_tile_size: Size of encoding tiles in pixels
+            encode_tile_overlap: Overlap between encoding tiles to reduce seams
+            decode_tiled: Enable tiled decoding to reduce VRAM usage
+            decode_tile_size: Size of decoding tiles in pixels
+            decode_tile_overlap: Overlap between decoding tiles to reduce seams
+            cache_in_ram: Whether to keep model in RAM between runs
+            torch_compile_args: Optional torch.compile configuration from settings node
+            
+        Returns:
+            Tuple containing configuration dictionary for SeedVR2 main node
+        """
         config = {
             "model": model,
             "device": device,
@@ -574,14 +781,122 @@ class SeedVR2LoadVAEModel:
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
             "cache_in_ram": cache_in_ram,
+            "torch_compile_args": torch_compile_args,
         }
         return (config,)
+
+class SeedVR2TorchCompileSettings:
+    """Configure torch.compile optimization for DiT and VAE models"""
+    
+class SeedVR2TorchCompileSettings:
+    """Configure torch.compile optimization for DiT and VAE models"""
+    
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "required": {
+                "backend": (["inductor", "cudagraphs"], {
+                    "default": "inductor",
+                    "tooltip": (
+                        "Compilation backend:\n"
+                        "• inductor: Full optimization with Triton kernel generation and fusion\n"
+                        "• cudagraphs: Lightweight, only wraps model with CUDA graphs, no kernel optimization"
+                    )
+                }),
+                "mode": (["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], {
+                    "default": "default",
+                    "tooltip": (
+                        "Optimization level (compilation time vs runtime speed):\n"
+                        "• default: Fast compile, good speedup, lowest memory\n"
+                        "• reduce-overhead: Fast compile, better speedup with CUDA graphs, +10-20% memory\n"
+                        "• max-autotune: Slow compile, best speedup, highest memory\n"
+                        "• max-autotune-no-cudagraphs: Like max-autotune but without CUDA graphs (more compatible)"
+                    )
+                }),
+                "fullgraph": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Compile entire model as single graph:\n"
+                        "• False: Allows graph breaks, compiles what it can, more compatible\n"
+                        "• True: Enforces no graph breaks, errors if any found, maximum optimization but fragile"
+                    )
+                }),
+                "dynamic": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Handle varying input shapes without recompilation:\n"
+                        "• False: Specialized for exact shapes, recompiles if shape changes\n"
+                        "• True: Creates dynamic kernels upfront, slower but handles shape variations"
+                    )
+                }),
+                "dynamo_cache_size_limit": ("INT", {
+                    "default": 64,
+                    "min": 0,
+                    "max": 1024,
+                    "step": 1,
+                    "tooltip": (
+                        "Max cached compiled versions per function (prevents memory bloat):\n"
+                        "Higher value = more variations cached = more memory used\n"
+                        "Lower value = more recompilation if inputs vary\n"
+                        "Default 64 is good for most cases. Increase if you see cache_size_limit warnings"
+                    )
+                }),
+            },
+            "optional": {
+                "dynamo_recompile_limit": ("INT", {
+                    "default": 128,
+                    "min": 0,
+                    "max": 1024,
+                    "step": 1,
+                    "tooltip": (
+                        "Max recompilation attempts before giving up (falls back to no compilation):\n"
+                        "Safety limit to prevent infinite recompilation loops\n"
+                        "Default 128 is sufficient. Only increase if you see recompile_limit warnings"
+                    )
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("TORCH_COMPILE_ARGS",)
+    FUNCTION = "create_args"
+    CATEGORY = "SEEDVR2"
+    DESCRIPTION = (
+        "Configure torch.compile optimization for DiT and VAE speedup. "
+        "Connect to DiT and/or VAE model loader. Requires PyTorch 2.0+ and Triton."
+    )
+    
+    def create_args(self, backend: str, mode: str, fullgraph: bool, dynamic: bool, 
+                   dynamo_cache_size_limit: int, dynamo_recompile_limit: int = 128) -> Tuple[Dict[str, Any]]:
+        """
+        Create torch.compile configuration for model optimization
+        
+        Args:
+            backend: Compilation backend ("inductor" or "cudagraphs")
+            mode: Optimization mode ("default", "reduce-overhead", "max-autotune", etc.)
+            fullgraph: Whether to compile entire model as single graph
+            dynamic: Whether to handle varying input shapes without recompilation
+            dynamo_cache_size_limit: Maximum cached compiled versions per function
+            dynamo_recompile_limit: Maximum recompilation attempts before fallback
+            
+        Returns:
+            Tuple containing torch.compile configuration dictionary
+        """
+        compile_args = {
+            "backend": backend,
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+            "dynamo_cache_size_limit": dynamo_cache_size_limit,
+            "dynamo_recompile_limit": dynamo_recompile_limit,
+        }
+        return (compile_args,)
         
 # ComfyUI Node Mappings
 NODE_CLASS_MAPPINGS = {
     "SeedVR2": SeedVR2,
     "SeedVR2LoadDiTModel": SeedVR2LoadDiTModel,
     "SeedVR2LoadVAEModel": SeedVR2LoadVAEModel,
+    "SeedVR2TorchCompileSettings": SeedVR2TorchCompileSettings,
 }
 
 # Human-readable node display names
@@ -589,6 +904,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2": "SeedVR2 Video Upscaler",
     "SeedVR2LoadDiTModel": "SeedVR2 (Down)Load DiT Model",
     "SeedVR2LoadVAEModel": "SeedVR2 (Down)Load VAE Model",
+    "SeedVR2TorchCompileSettings": "SeedVR2 Torch Compile Settings",
 }
 
 # Export version and metadata

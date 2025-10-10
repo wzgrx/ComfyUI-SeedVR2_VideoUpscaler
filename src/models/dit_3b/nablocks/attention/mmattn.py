@@ -127,8 +127,8 @@ class NaMMAttention(nn.Module):
             v=concat(vid_v, txt_v).bfloat16(),
             cu_seqlens_q=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
             cu_seqlens_k=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
-            max_seqlen_q=cache("mm_maxlen", lambda: all_len.max().item()),
-            max_seqlen_k=cache("mm_maxlen", lambda: all_len.max().item()),
+            max_seqlen_q=cache("mm_maxlen", lambda: all_len.max()),
+            max_seqlen_k=cache("mm_maxlen", lambda: all_len.max()),
         ).type_as(vid_q)
 
         attn = rearrange(attn, "l h d -> l (h d)")
@@ -248,8 +248,8 @@ class NaSwinAttention(NaMMAttention):
             cu_seqlens_k=cache_win(
                 "vid_seqlens_k", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
             ),
-            max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max().item()),
-            max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max().item()),
+            max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max()),
+            max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max()),
         ).type_as(vid_q)
 
         # text pooling

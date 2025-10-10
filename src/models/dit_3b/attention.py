@@ -15,15 +15,18 @@
 import torch
 import torch.nn.functional as F
 
-#from flash_attn import flash_attn_varlen_func
+from flash_attn import flash_attn_varlen_func
 
 from torch import nn
 
 
-def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0, softmax_scale=None, causal=False, deterministic=False):
+def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.0, softmax_scale=None, causal=False, deterministic=False):
     """
     A PyTorch-based implementation of variable-length attention to replace flash_attn_varlen_func.
     It processes each sequence in the batch individually.
+    
+    NOTE: max_seqlen_q and max_seqlen_k are accepted for API compatibility but not used.
+    PyTorch's scaled_dot_product_attention automatically handles variable sequence lengths.
     """
     # Create an empty tensor to store the output.
     output = torch.empty_like(q)
@@ -61,6 +64,36 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         
     return output
 
+
+@torch._dynamo.disable
+def _call_flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+    """
+    Wrapper for flash_attn_varlen_func that handles tensor-to-scalar conversion.
+    
+    This function is excluded from torch.compile because:
+    1. flash_attn is a C++ extension that can't be compiled anyway
+    2. It requires Python int scalars for max_seqlen parameters
+    3. Disabling compilation here keeps the rest of the model compilable
+    """
+    
+    # Convert tensor max_seqlen to Python int if needed
+    if torch.is_tensor(max_seqlen_q):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if torch.is_tensor(max_seqlen_k):
+        max_seqlen_k = int(max_seqlen_k.item())
+    
+    return flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        **kwargs
+    )
+
+
 class TorchAttention(nn.Module):
     def tflops(self, args, kwargs, output) -> float:
         assert len(args) == 0 or len(args) > 2, "query, key should both provided by args / kwargs"
@@ -75,6 +108,13 @@ class TorchAttention(nn.Module):
 
 
 class FlashAttentionVarlen(nn.Module):
+    """
+    Variable-length flash attention with automatic fallback to PyTorch.
+    
+    Compilation behavior:
+    - PyTorch fallback: Fully compilable, optimal performance
+    - Flash attention: Uses @torch._dynamo.disable wrapper (flash_attn is C++ anyway)
+    """
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
         cu_seqlens_k = kwargs["cu_seqlens_k"]
@@ -83,11 +123,18 @@ class FlashAttentionVarlen(nn.Module):
         seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]) / 1e6
         return h * (4 * d * (seqlens_q * seqlens_k).sum())
 
-    def forward(self, *args, **kwargs):
+    def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
+        
         try:
-            from flash_attn import flash_attn_varlen_func
-            return flash_attn_varlen_func(*args, **kwargs)
+            # Use flash_attn if available (via non-compiled wrapper)
+            return _call_flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, 
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )
         except ImportError:
-            return pytorch_varlen_attention(*args, **kwargs)
-
+            # Fall back to PyTorch implementation (fully compilable)
+            return pytorch_varlen_attention(
+                q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )

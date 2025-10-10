@@ -309,6 +309,30 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     # Reconstruct frames tensor
     frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
 
+    # Create torch compile args if enabled
+    torch_compile_args_dit = None
+    torch_compile_args_vae = None
+
+    if shared_args.get("compile_dit", False):
+        torch_compile_args_dit = {
+            "backend": shared_args.get("compile_backend", "inductor"),
+            "mode": shared_args.get("compile_mode", "default"),
+            "fullgraph": shared_args.get("compile_fullgraph", False),
+            "dynamic": shared_args.get("compile_dynamic", False),
+            "dynamo_cache_size_limit": shared_args.get("compile_dynamo_cache_size_limit", 64),
+            "dynamo_recompile_limit": shared_args.get("compile_dynamo_recompile_limit", 128),
+        }
+
+    if shared_args.get("compile_vae", False):
+        torch_compile_args_vae = {
+            "backend": shared_args.get("compile_backend", "inductor"),
+            "mode": shared_args.get("compile_mode", "default"),
+            "fullgraph": shared_args.get("compile_fullgraph", False),
+            "dynamic": shared_args.get("compile_dynamic", False),
+            "dynamo_cache_size_limit": shared_args.get("compile_dynamo_cache_size_limit", 64),
+            "dynamo_recompile_limit": shared_args.get("compile_dynamo_recompile_limit", 128),
+        }
+        
     # Prepare runner
     model_dir = shared_args["model_dir"]
     model_name = shared_args["model"]
@@ -328,6 +352,8 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         decode_tiled=shared_args["vae_decode_tiling_enabled"],
         decode_tile_size=shared_args["vae_decode_tile_size"],
         decode_tile_overlap=shared_args["vae_decode_tile_overlap"],
+        torch_compile_args_dit=torch_compile_args_dit,
+        torch_compile_args_vae=torch_compile_args_vae,
         cached_runner=None  # No caching in worker processes
     )
 
@@ -430,7 +456,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
             'blocks_to_swap': args.blocks_to_swap,
             'use_none_blocking': args.use_none_blocking,
             'offload_io_components': args.offload_io_components,
-            'cache_model': False, # No caching in CLI mode
+            'cache_model': False,
         },
         "vae_encode_tiling_enabled": args.vae_encode_tiling_enabled,
         "vae_encode_tile_size": args.vae_encode_tile_size,
@@ -438,6 +464,14 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "vae_decode_tiling_enabled": args.vae_decode_tiling_enabled,
         "vae_decode_tile_size": args.vae_decode_tile_size,
         "vae_decode_tile_overlap": args.vae_decode_tile_overlap,
+        "compile_dit": args.compile_dit,
+        "compile_vae": args.compile_vae,
+        "compile_backend": args.compile_backend,
+        "compile_mode": args.compile_mode,
+        "compile_fullgraph": args.compile_fullgraph,
+        "compile_dynamic": args.compile_dynamic,
+        "compile_dynamo_cache_size_limit": args.compile_dynamo_cache_size_limit,
+        "compile_dynamo_recompile_limit": args.compile_dynamo_recompile_limit,
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -575,6 +609,22 @@ def parse_arguments() -> argparse.Namespace:
                         help="VAE decode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
     parser.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE decode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
+    parser.add_argument("--compile_dit", action="store_true", 
+                        help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+)")
+    parser.add_argument("--compile_vae", action="store_true",
+                        help="Enable torch.compile for VAE model (15-25%% speedup, requires PyTorch 2.0+)")
+    parser.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
+                        help="Torch compile backend (default: inductor)")
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="Torch compile mode (default: default)")
+    parser.add_argument("--compile_fullgraph", action="store_true",
+                        help="Compile entire model as single graph. False allows graph breaks (more compatible), True enforces no breaks (maximum optimization but fragile). Default: False")
+    parser.add_argument("--compile_dynamic", action="store_true",
+                        help="Handle varying input shapes without recompilation. False specializes for exact shapes, True creates dynamic kernels. Default: False")
+    parser.add_argument("--compile_dynamo_cache_size_limit", type=int, default=64,
+                        help="Max cached compiled versions per function. Higher = more memory, lower = more recompilation. Default: 64")
+    parser.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
+                        help="Max recompilation attempts before falling back to uncompiled. Safety limit to prevent infinite loops. Default: 128")
     return parser.parse_args()
 
 
