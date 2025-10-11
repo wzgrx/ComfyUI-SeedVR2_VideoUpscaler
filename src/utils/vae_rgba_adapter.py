@@ -34,7 +34,7 @@ def adapt_vae_for_rgba(vae: nn.Module, debug: Optional[Any] = None) -> nn.Module
         Modified VAE with RGBA support
     """
     if debug:
-        debug.log("Adapting VAE to RGBA mode", category="setup", force=True)
+        debug.log("Adapting VAE to RGBA mode", category="setup")
     
     # Adapt encoder conv_in: 3 → 4 input channels
     if hasattr(vae, 'encoder') and hasattr(vae.encoder, 'conv_in'):
@@ -66,7 +66,7 @@ def adapt_vae_for_rgba(vae: nn.Module, debug: Optional[Any] = None) -> nn.Module
             conv_in.weight = nn.Parameter(new_weight, requires_grad=conv_in.weight.requires_grad)
             
             if debug:
-                debug.log("Adapted encoder conv_in: 3→4 channels", category="success")
+                debug.log("Adapted encoder conv_in: 3 → 4 channels", category="success")
     
     # Adapt decoder conv_out: 3 → 4 output channels  
     if hasattr(vae, 'decoder') and hasattr(vae.decoder, 'conv_out'):
@@ -107,7 +107,7 @@ def adapt_vae_for_rgba(vae: nn.Module, debug: Optional[Any] = None) -> nn.Module
                 conv_out.bias = nn.Parameter(new_bias, requires_grad=conv_out.bias.requires_grad)
             
             if debug:
-                debug.log("Adapted decoder conv_out: 3→4 channels", category="success")
+                debug.log("Adapted decoder conv_out: 3 → 4 channels", category="success")
     
     if debug:
         debug.log("Adapted VAE to RGBA mode", category="success")
@@ -129,7 +129,7 @@ def restore_vae_rgb_only(vae: nn.Module, debug: Optional[Any] = None) -> nn.Modu
         VAE restored to 3-channel mode
     """
     if debug:
-        debug.log("Restoring VAE to RGB-only mode", category="setup", force=True)
+        debug.log("Restoring VAE to RGB-only mode", category="setup")
     
     # Restore encoder conv_in to 3 channels
     if hasattr(vae, 'encoder') and hasattr(vae.encoder, 'conv_in'):

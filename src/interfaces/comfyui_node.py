@@ -25,6 +25,7 @@ from ..core.generation import (
     upscale_all_batches, 
     decode_all_batches,
     postprocess_all_batches,
+    prepare_video_transforms
 )
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
@@ -71,7 +72,9 @@ class SeedVR2:
         """
         return {
             "required": {
-                "pixels": ("IMAGE", ),
+                "pixels": ("IMAGE", {
+                    "tooltip": "Input video frames. Accepts both RGB (3-channel) and RGBA (4-channel) images. Output will match input format."
+                }),
                 "dit": ("SEEDVR2_DIT", {
                     "tooltip": "DiT model configuration from SeedVR2 Load DiT Model node"
                 }),
@@ -87,9 +90,6 @@ class SeedVR2:
                 }),
             },
             "optional": {
-                "mask": ("MASK", {
-                    "tooltip": "Optional Alpha channel mask for RGBA upscaling. When provided, RGB and Alpha are upscaled together for temporal consistency."
-                }),
                 "new_resolution": ("INT", {
                     "default": 1072, 
                     "min": 16, 
@@ -134,8 +134,7 @@ class SeedVR2:
         }
     
     # Define return types for ComfyUI
-    RETURN_NAMES = ("IMAGE", "MASK")
-    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_TYPES = ("IMAGE",)
     FUNCTION = "execute"
     CATEGORY = "SEEDVR2"
 
@@ -143,11 +142,12 @@ class SeedVR2:
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
                 latent_noise_scale: float = 0.0, preserve_vram: bool = False,
-                enable_debug: bool = False, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor]:
+                enable_debug: bool = False) -> Tuple[torch.Tensor]:
         """
         Execute SeedVR2 video upscaling with progress reporting
         
-        Main entry point for ComfyUI node execution. Handles model downloads,
+        Main entry point for ComfyUI node execution.
+        Automatically detects and preserves input format (RGB or RGBA). Handles model downloads,
         configuration unpacking, and delegates to internal execution pipeline.
         
         Args:
@@ -178,7 +178,6 @@ class SeedVR2:
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
             preserve_vram: Offload models between pipeline phases to save VRAM
             enable_debug: Enable detailed logging and memory tracking
-            mask: Optional alpha channel mask for RGBA upscaling
             
         Returns:
             Tuple containing upscaled video tensor (N, H', W', C) in [0, 1] range
@@ -257,25 +256,14 @@ class SeedVR2:
 
         cfg_scale = 1.0
         try:
-            # Prepare RGBA if mask is provided
-            if mask is not None:
-                # Validate frame counts match between pixels and mask
-                num_pixel_frames = pixels.shape[0]
-                num_mask_frames = mask.shape[0]
-                
-                if num_pixel_frames != num_mask_frames:
-                    raise ValueError(
-                        f"Frame count mismatch between pixels and mask:\n"
-                        f"  Pixels: {num_pixel_frames} frames\n"
-                        f"  Mask: {num_mask_frames} frames\n"
-                        f"Please ensure your mask has the same number of frames as your input video."
-                    )
-                
-                # ComfyUI mask is (N, H, W), pixels is (N, H, W, 3)
-                # Expand mask to (N, H, W, 1) and concatenate with pixels
-                mask_expanded = mask.unsqueeze(-1)  # (N, H, W, 1)
-                pixels = torch.cat([pixels, mask_expanded], dim=-1)  # (N, H, W, 4)
-
+            # Detect input format and handle alpha channel convention
+            if pixels.shape[-1] == 4:
+                # RGBA detected: ComfyUI inverts alpha when loading images
+                # (ComfyUI mask convention: 1=hidden, 0=visible vs standard alpha: 1=opaque, 0=transparent)
+                # Invert alpha in-place: multiply by -1 then add 1 (equivalent to 1.0 - alpha)
+                self.debug.log("RGBA input detected - inverting alpha channel to match mask convention", category="info")
+                pixels[..., 3].mul_(-1).add_(1)
+            
             return self._internal_execute(pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, 
                                         batch_size, color_correction, input_noise_scale, latent_noise_scale, 
                                         encode_tiled, encode_tile_size, encode_tile_overlap, 
@@ -450,11 +438,25 @@ class SeedVR2:
         debug.log("Starting video upscaling generation...", category="generation", force=True)
         debug.start_timer("generation")
        
-        # Track total frames for FPS calculation
+        # Track total frames and resolutions
         total_frames = len(pixels)
-        # Determine channel info for logging
+        input_h, input_w = pixels.shape[1], pixels.shape[2]
         channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
-        debug.log(f"  Total frames: {total_frames}, New resolution: {new_resolution}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True)
+        
+        # Create transform pipeline early and apply to first frame to get exact output dimensions
+        video_transform = prepare_video_transforms(new_resolution)
+        
+        # Apply transform to first frame to get exact output dimensions (reusing actual transform logic)
+        sample_frame = pixels[0].permute(2, 0, 1)  # HWC -> CHW for transform
+        sample_frame = sample_frame.unsqueeze(0)  # Add time dimension: CHW -> TCHW (T=1)
+        transformed_sample = video_transform(sample_frame)  # Apply full pipeline
+        # Transform outputs CTHW format, get dimensions from last two axes
+        output_h, output_w = transformed_sample.shape[-2:]  # Get actual output size
+        
+        debug.log(f"   Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True)
+        
+        # Store transform in context for reuse during encoding (avoids recreating it)
+        ctx['video_transform'] = video_transform
         
         # Phase 1: Encode all batches
         ctx = encode_all_batches(
@@ -502,23 +504,12 @@ class SeedVR2:
             color_correction=color_correction
         )
 
-        # Get final result
+        # Get final result - preserve channel format from input
         sample = ctx['final_video']
-
-        # Split RGBA
-        # sample is (N, H, W, 4) - split into RGB and Alpha
-        output_rgb = sample[..., :3]  # (N, H, W, 3)
-        output_alpha = sample[..., 3:4]  # (N, H, W, 1)
         
-        # Prepare mask output: remove channel dimension (N, H, W, 1) -> (N, H, W)
-        output_mask = output_alpha.squeeze(-1)
-        sample = output_rgb
-        
-        # Ensure both are on CPU (ComfyUI expects CPU tensors)
+        # Ensure output is on CPU (ComfyUI expects CPU tensors)
         if torch.is_tensor(sample) and sample.is_cuda:
             sample = sample.cpu()
-        if torch.is_tensor(output_mask) and output_mask.is_cuda:
-            output_mask = output_mask.cpu()
 
         debug.log("", category="none", force=True)
         debug.log("Video upscaling completed successfully!", category="generation", force=True)
@@ -567,7 +558,7 @@ class SeedVR2:
         self._pbar = None
         self.ctx = None
 
-        return (sample, output_mask)
+        return (sample,)
 
     def _progress_callback(self, current_step: int, total_steps: int, 
                           current_batch_frames: int, phase_name: str = "") -> None:
@@ -674,6 +665,7 @@ class SeedVR2LoadDiTModel:
             }
         }
     
+    # Define return types for ComfyUI
     RETURN_TYPES = ("SEEDVR2_DIT",)
     FUNCTION = "create_config"
     CATEGORY = "SEEDVR2"
@@ -779,6 +771,7 @@ class SeedVR2LoadVAEModel:
             }
         }
     
+    # Define return types for ComfyUI
     RETURN_TYPES = ("SEEDVR2_VAE",)
     FUNCTION = "create_config"
     CATEGORY = "SEEDVR2"
@@ -893,6 +886,7 @@ class SeedVR2TorchCompileSettings:
             }
         }
     
+    # Define return types for ComfyUI
     RETURN_TYPES = ("TORCH_COMPILE_ARGS",)
     FUNCTION = "create_args"
     CATEGORY = "SEEDVR2"

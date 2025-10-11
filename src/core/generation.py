@@ -515,6 +515,8 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         ctx['video_transform'] = prepare_video_transforms(res_w)
         debug.log(f"Initialized video transformation pipeline for {res_w}px", category="setup")
         debug.end_timer("video_transform", "Video transform pipeline initialization")
+    else:
+        debug.log(f"Reusing pre-initialized video transformation pipeline", category="setup")
     
     # Detect if input is RGBA (4 channels) - we'll adapt AFTER loading weights
     if images[0].shape[-1] == 4:  # RGBA detected
@@ -578,7 +580,6 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         # Adapt VAE for RGBA after weights are loaded
         if ctx.get('is_rgba', False):
             runner.vae = adapt_vae_for_rgba(runner.vae, debug)
-            debug.log("Adapted VAE to RGBA mode", category="success")
         
         debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
@@ -1093,7 +1094,7 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     alpha_channel = None
                     
                     if has_alpha:
-                        debug.log("  Splitting upscaled output: RGBA → RGB (for color correction) + Alpha (preserved)", category="video")
+                        debug.log("  RGBA color correction: preserving Alpha channel", category="video")
                         # Split in channels-first format: (T, 4, H, W) -> (T, 3, H, W) + (T, 1, H, W)
                         rgb_sample = sample[:, :3, :, :]  # RGB channels
                         alpha_channel = sample[:, 3:4, :, :]  # Alpha channel
@@ -1107,13 +1108,12 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     
                     # Adjust transformed video to handle cases when padding was applied during encoding
                     if transformed_video.shape[1] != sample.shape[0]:
-                        debug.log(f"  Trimming transformed video from {transformed_video.shape[1]} to {sample.shape[0]} frames to match original input", 
+                        debug.log(f"  Trimming reference from {transformed_video.shape[1]} to {sample.shape[0]} frames", 
                                 category="video")
                         transformed_video = transformed_video[:, :sample.shape[0]]
                     
                     # Split reference video to RGB if it's RGBA (for color correction)
                     if has_alpha and transformed_video.shape[0] == 4:  # Check channel dimension (C, T, H, W)
-                        debug.log("  Extracting RGB from reference input (discarding original Alpha for color matching)", category="video")
                         transformed_video = transformed_video[:3, ...]  # Keep only RGB channels
                     
                     input_video = [optimized_single_video_rearrange(transformed_video)]
@@ -1136,17 +1136,10 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     ctx['all_transformed_videos'][video_idx] = None
                     del input_video, transformed_video
 
-                    # Recombine with Alpha or add blank Alpha
+                    # Recombine with Alpha if it was present in input
                     if has_alpha and alpha_channel is not None:
-                        debug.log("  Merging color-corrected RGB with preserved Alpha → final RGBA output", category="video")
                         # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
                         sample = torch.cat([sample, alpha_channel], dim=1)
-                    else:
-                        # No Alpha channel input - add blank Alpha (all ones = fully opaque)
-                        debug.log("  Adding opaque Alpha channel since no input mask was provided (RGB input → RGBA output)", category="video")
-                        blank_alpha = torch.ones((sample.shape[0], 1, sample.shape[2], sample.shape[3]), 
-                                                dtype=sample.dtype, device=sample.device)
-                        sample = torch.cat([sample, blank_alpha], dim=1)
                 
                 else:
                     debug.log("  Color correction disabled (set to none)", category="video")
@@ -1195,7 +1188,9 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                 final_shape = ctx['final_video'].shape
                 Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
 
-                debug.log(f"Final video assembled: Total frames: {total_frames}, shape per frame: {Hf}x{Wf}x{Cf}", category="video", force=True)
+                # Format channel info for readability
+                channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
+                debug.log(f"Final video assembled: Total frames: {total_frames}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", category="video", force=True)
             else:
                 ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
                 debug.log("No frame to assemble", level="WARNING", category="video", force=True)
