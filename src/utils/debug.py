@@ -31,20 +31,20 @@ class Debug:
     # Icon mapping for different categories
     CATEGORY_ICONS = {
         "general": "🔄",      # General operations/processing
-        "timing": "⚡",       # Performance timing
+        "timing": "⚡",        # Performance timing
         "memory": "📊",       # Memory usage tracking
         "cache": "💾",        # Cache operations
         "cleanup": "🧹",      # Cleanup operations
         "setup": "🔧",        # Configuration/setup
         "generation": "🎬",   # Generation process
-        "dit": "🚀",        # Model loading/operations
+        "dit": "🚀",          # Model loading/operations
         "blockswap": "🔀",    # BlockSwap operations
         "download": "📥",     # Download operations
         "success": "✅",      # Successful completion
         "warning": "⚠️",      # Warnings
         "error": "❌",        # Errors
         "info": "ℹ️",         # Statistics/info
-        "tip" :"💡",           # Tip/suggestion
+        "tip" :"💡",          # Tip/suggestion
         "video": "📹",        # Video/sequence info
         "reuse": "♻️",        # Reusing/recycling
         "runner": "🏃",       # Runner operations
@@ -53,6 +53,8 @@ class Debug:
         "precision": "🎯",    # Precision
         "device": "🖥️",       # Device info
         "file": "📂",         # File operations
+        "star": "⭐",         # Star
+        "dialogue": "💬",     # Dialogue
         "none" : "",
     }
     
@@ -220,7 +222,7 @@ class Debug:
                                 grandchild_duration = self.timer_durations.get(grandchild, 0)
                                 if grandchild_duration >= 0.01:  # Only show if >= 10ms
                                     grandchild_message = self.timer_messages.get(grandchild, grandchild)
-                                    self.log(f"      └─ {grandchild_message}: {grandchild_duration:.2f}s", category="timing", force=force)
+                                    self.log(f"    └─ {grandchild_message}: {grandchild_duration:.2f}s", category="timing", force=force)
             
             if unaccounted > 0.01:  # Show if more than 10ms unaccounted
                 self.log(f"  └─ (other operations): {unaccounted:.2f}s", category="timing", force=force)
@@ -411,18 +413,18 @@ class Debug:
             # Show top 5 largest
             largest = sorted(details['gpu_tensors'], key=lambda x: x['size_mb'], reverse=True)[:5]
             for t in largest:
-                self.log(f"    {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
+                self.log(f"  {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
         
         # Large CPU tensors
         if details['large_cpu_tensors']:
             cpu_large_gb = sum(t['size_mb'] for t in details['large_cpu_tensors']) / 1024
             self.log(f"  Large CPU tensors (>10MB):", category="memory", force=force)
-            self.log(f"    {len(details['large_cpu_tensors'])} using {cpu_large_gb:.2f}GB", category="memory", force=force)
+            self.log(f"  {len(details['large_cpu_tensors'])} using {cpu_large_gb:.2f}GB", category="memory", force=force)
             
             # Show top 3 largest
             largest = sorted(details['large_cpu_tensors'], key=lambda x: x['size_mb'], reverse=True)[:3]
             for t in largest:
-                self.log(f"    {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
+                self.log(f"  {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
         
         # Common shape patterns
         if details['shape_patterns']:
@@ -432,7 +434,7 @@ class Debug:
                 self.log("  Common tensor shapes:", category="memory", force=force)
                 for shape, count in common_shapes:
                     if count > 1:
-                        self.log(f"    {shape}: {count} instances", category="memory", force=force)
+                        self.log(f"  {shape}: {count} instances", category="memory", force=force)
         
         # Module instances
         if details['module_types']:
@@ -440,7 +442,7 @@ class Debug:
             if multi_instance:
                 self.log("  Multiple module instances:", category="memory", force=force)
                 for mtype, count in sorted(multi_instance, key=lambda x: x[1], reverse=True)[:5]:
-                    self.log(f"    {mtype}: {count} instances", category="memory", force=force)
+                    self.log(f"  {mtype}: {count} instances", category="memory", force=force)
     
 
     def _log_memory_diff(self, current_metrics: Dict[str, Any], force: bool = False) -> None:

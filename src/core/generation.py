@@ -1190,7 +1190,7 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
 
                 # Format channel info for readability
                 channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
-                debug.log(f"Final video assembled: Total frames: {total_frames}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", category="video", force=True)
+                debug.log(f"Final video assembled: Total frames: {total_frames}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", category="generation", force=True)
             else:
                 ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
                 debug.log("No frame to assemble", level="WARNING", category="video", force=True)

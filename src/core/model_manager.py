@@ -93,13 +93,16 @@ def _describe_blockswap_config(config: Optional[Dict[str, Any]]) -> str:
     if config is None:
         return "disabled"
     
-    blocks = config.get("blocks_to_swap", 0)
-    if blocks <= 0:
+    blocks_to_swap = config.get("blocks_to_swap", 0)
+    swap_io_components = config.get("swap_io_components", False)
+    
+    # Early return only if both block swap and I/O swap are disabled
+    if blocks_to_swap <= 0 and not swap_io_components:
         return "disabled"
     
-    block_text = "block" if blocks == 1 else "blocks"
-    parts = [f"{blocks} {block_text}"]
-    if config.get("swap_io_components", False):
+    block_text = "block" if blocks_to_swap <= 1 else "blocks"
+    parts = [f"{blocks_to_swap} {block_text}"]
+    if swap_io_components:
         parts.append("I/O offload")
     
     return f"enabled ({', '.join(parts)})"
@@ -338,11 +341,17 @@ def _update_dit_config_inplace(
     if blockswap_changed:
         # Determine change type from config comparison
         old_blocks = cached_blockswap_config.get("blocks_to_swap", 0) if cached_blockswap_config else 0
+        old_swap_io = cached_blockswap_config.get("swap_io_components", False) if cached_blockswap_config else False
         new_blocks = block_swap_config.get("blocks_to_swap", 0) if block_swap_config else 0
+        new_swap_io = block_swap_config.get("swap_io_components", False) if block_swap_config else False
         
-        # If old config had BlockSwap, clean it up first
-        if old_blocks > 0:
-            if new_blocks == 0:
+        # Check if old config had ANY BlockSwap features (blocks or I/O components)
+        had_blockswap = old_blocks > 0 or old_swap_io
+        has_blockswap = new_blocks > 0 or new_swap_io
+        
+        # If old config had BlockSwap features, clean them up first
+        if had_blockswap:
+            if not has_blockswap:
                 # Disabling BlockSwap completely
                 debug.log("Disabling BlockSwap completely", category="blockswap")
                 cleanup_blockswap(runner=cached_runner, keep_state_for_cache=False)
@@ -354,7 +363,8 @@ def _update_dit_config_inplace(
         cached_runner._blockswap_active = False
     
     # Apply new BlockSwap if configured (before torch.compile)
-    if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
+    if block_swap_config and (block_swap_config.get("blocks_to_swap", 0) > 0 or 
+                              block_swap_config.get("swap_io_components", False)):
         cached_runner.dit = model  # Temporarily set for BlockSwap
         apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
         model = cached_runner.dit  # Get potentially wrapped model
@@ -735,7 +745,7 @@ def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
         
         # Progress reporting
         if (i + 1) % 100 == 0:
-            debug.log(f"    Loaded {i+1}/{total_tensors} tensors...", category="dit")
+            debug.log(f"  Loaded {i+1}/{total_tensors} tensors...", category="dit")
 
     debug.log(f"Successfully loaded {len(state_dict)} tensors to {device}", category="success")
 
@@ -842,9 +852,9 @@ class GGUFTensor(torch.Tensor):
             return final_result
         except Exception as e:
             self.debug.log(f"Numpy fallback also failed: {e}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"   Tensor type: {self.tensor_type}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"   Shape: {self.shape}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"   Target shape: {self.tensor_shape}", level="WARNING", category="dit", force=True)
+            self.debug.log(f"  Tensor type: {self.tensor_type}", level="WARNING", category="dit", force=True)
+            self.debug.log(f"  Shape: {self.shape}", level="WARNING", category="dit", force=True)
+            self.debug.log(f"  Target shape: {self.tensor_shape}", level="WARNING", category="dit", force=True)
             traceback.print_exc()
             
             # Return regular tensor as last resort
@@ -1405,14 +1415,14 @@ def _report_parameter_mismatches(state: Dict[str, torch.Tensor],
     if unmatched:
         debug.log(f"Warning: {len(unmatched)} parameters from GGUF not found in model", 
                  level="WARNING", category="dit", force=True)
-        debug.log(f"   First few unmatched: {unmatched[:5]}", level="WARNING", category="dit", force=True)
+        debug.log(f"  First few unmatched: {unmatched[:5]}", level="WARNING", category="dit", force=True)
     
     # Check for missing model parameters  
     missing = [name for name in model_state if name not in loaded_names]
     if missing:
         debug.log(f"Warning: {len(missing)} model parameters not loaded from GGUF", 
                  level="WARNING", category="dit", force=True)
-        debug.log(f"   First few missing: {missing[:5]}", level="WARNING", category="dit", force=True)
+        debug.log(f"  First few missing: {missing[:5]}", level="WARNING", category="dit", force=True)
 
 
 def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: str, debug: Debug) -> None:

@@ -79,7 +79,10 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
         return
 
     blocks_to_swap = block_swap_config.get("blocks_to_swap", 0)
-    if blocks_to_swap <= 0:
+    swap_io_components = block_swap_config.get("swap_io_components", False)
+    
+    # Early return only if both block swap and I/O swap are disabled
+    if blocks_to_swap <= 0 and not swap_io_components:
         return
     
     if debug is None:
@@ -100,48 +103,50 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     offload_device = "cpu"
 
     configs = []
-    blocks_to_swap = block_swap_config.get("blocks_to_swap", 0)
     if blocks_to_swap > 0:
-        block_text = "block" if blocks_to_swap == 1 else "blocks"
+        block_text = "block" if blocks_to_swap <= 1 else "blocks"
         configs.append(f"{blocks_to_swap} {block_text}")
-    if block_swap_config.get("swap_io_components", False):
+    if swap_io_components:
         configs.append("I/O components")
     debug.log(f"BlockSwap configured: {', '.join(configs)}", category="blockswap", force=True)
-    debug.log("BlockSwap will swap blocks to GPU during inference", category="info", force=True)
-        
-    # Validate model structure
+    
+    # Validate model structure for block operations
     if not hasattr(model, "blocks"):
         debug.log("Model doesn't have 'blocks' attribute for BlockSwap", level="ERROR", category="blockswap")
         return
 
     total_blocks = len(model.blocks)
     debug.log(f"Model has {total_blocks} blocks total", category="blockswap")
-    blocks_to_swap = min(blocks_to_swap, total_blocks)
-
+    
     # Configure model with blockswap attributes
-    model.blocks_to_swap = blocks_to_swap - 1  # Convert to 0-indexed
+    if blocks_to_swap > 0:
+        blocks_to_swap = min(blocks_to_swap, total_blocks)
+        model.blocks_to_swap = blocks_to_swap - 1  # Convert to 0-indexed
+        debug.log(f"Configuring: {blocks_to_swap}/{total_blocks} blocks for swapping", category="blockswap")
+        debug.log("BlockSwap will swap blocks to GPU during inference", category="info", force=True)
+    else:
+        # No block swapping, set to -1 so no blocks match the swap condition
+        model.blocks_to_swap = -1
+        debug.log("Block swapping disabled (blocks_to_swap=0)", category="blockswap")
+    
     model.main_device = device
     model.offload_device = offload_device
 
-    debug.log(f"Configuring: {blocks_to_swap}/{total_blocks} blocks for swapping", category="blockswap")
-    
     # Configure I/O components
-    swap_io_components = block_swap_config.get("swap_io_components", False)
     io_components_offloaded = _configure_io_components(model, device, offload_device, 
                                                        swap_io_components, debug)
-
-    # Configure block placement and memory tracking
     memory_stats = _configure_blocks(model, device, offload_device, debug)
     memory_stats['io_components'] = io_components_offloaded
 
-     # Log memory summary
+    # Log memory summary
     _log_memory_summary(memory_stats, offload_device, device, swap_io_components, 
                        debug)
     
-    # Wrap block forward methods for dynamic swapping
-    for b, block in enumerate(model.blocks):
-        if b <= model.blocks_to_swap:
-            _wrap_block_forward(block, b, model, debug)
+    # Wrap block forward methods for dynamic swapping (only if blocks_to_swap > 0)
+    if blocks_to_swap > 0:
+        for b, block in enumerate(model.blocks):
+            if b <= model.blocks_to_swap:
+                _wrap_block_forward(block, b, model, debug)
 
     # Patch RoPE modules for robust error handling
     _patch_rope_for_blockswap(model, debug)
