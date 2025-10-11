@@ -657,6 +657,13 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     Returns:
         bool: True if model was moved
     """
+    # Check if model is on meta device - can't move meta tensors
+    if current_device.type == 'meta':
+        if debug:
+            debug.log(f"{model_name} is on meta device - skipping movement (will materialize when needed)", 
+                     category=model_name.lower())
+        return False
+    
     # Determine reason for movement
     if not reason:
         reason = "preserve_vram" if preserve_vram else "inference requirement"
@@ -806,9 +813,17 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = Fal
     
     # 2. Handle model movement/cleanup based on caching preference
     if keep_model_in_ram:
-        # Move to CPU while BlockSwap is still active (if applicable)
-        manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", 
-                           preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+        # Check if model is on meta device
+        try:
+            param_device = next(runner.dit.parameters()).device
+            if param_device.type != 'meta':
+                # Only move if not on meta device
+                manage_model_device(model=runner.dit, target_device='cpu', model_name="DiT", 
+                                   preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+            elif debug:
+                debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
+        except StopIteration:
+            pass
     
     # 3. Clean BlockSwap after model movement
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
@@ -823,15 +838,17 @@ def cleanup_dit(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = Fal
         runner.dit = None
         if debug:
             debug.log("DiT model deleted", category="cleanup")
+        
+        # Clear DiT config attributes - not needed when model is not cached (will be recreated)
+        if hasattr(runner, '_dit_compile_args'):
+            delattr(runner, '_dit_compile_args')
+        if hasattr(runner, '_dit_block_swap_config'):
+            delattr(runner, '_dit_block_swap_config')
     
     # 5. Clear DiT-related components and temporary attributes
-    dit_components = [
-        'sampler', 'sampling_timesteps', 'schedule',
-        '_dit_checkpoint', '_dit_block_swap_config'
-    ]
-    for component in dit_components:
-        if hasattr(runner, component):
-            setattr(runner, component, None)
+    runner.sampler = None
+    runner.sampling_timesteps = None
+    runner.schedule = None
 
 
 def cleanup_vae(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = False) -> None:
@@ -861,21 +878,30 @@ def cleanup_vae(runner: Any, debug: Optional[Any], keep_model_in_ram: bool = Fal
     
     # 2. Handle VAE model based on caching preference
     if keep_model_in_ram:
-        # Move to CPU but keep structure
-        manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", 
-                           preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+        # Check if model is on meta device
+        try:
+            param_device = next(runner.vae.parameters()).device
+            if param_device.type != 'meta':
+                # Only move if not on meta device
+                manage_model_device(model=runner.vae, target_device='cpu', model_name="VAE", 
+                               preserve_vram=True, debug=debug, reason="model caching", runner=runner)
+            elif debug:
+                debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
+        except StopIteration:
+            pass
     else:
         # Full cleanup - release memory and delete
         release_model_memory(model=runner.vae, debug=debug)
         runner.vae = None
         if debug:
             debug.log("VAE model deleted", category="cleanup")
+        
+        # Clear VAE-related temporary attributes that are not needed when caching is disabled
+        runner._vae_compile_args = None
     
     # 3. Clear VAE temporary attributes
-    vae_attributes = ['_vae_checkpoint', '_vae_dtype_override']
-    for attr in vae_attributes:
-        if hasattr(runner, attr):
-            setattr(runner, attr, None)
+    runner._vae_checkpoint = None
+    runner._vae_dtype_override = None
 
 
 def complete_cleanup(runner: Any, debug: Optional[Any], keep_dit_in_ram: bool = False, keep_vae_in_ram: bool = False) -> None:
@@ -918,32 +944,17 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_dit_in_ram: bool = 
     # 2. Clear remaining runtime caches
     clear_runtime_caches(runner=runner, debug=debug)
     
-    # 3. Clear config and other non-model components
+    # 3. Clear config and other non-model components when fully releasing runner
     if not (keep_dit_in_ram or keep_vae_in_ram):
-        if hasattr(runner, 'config'):
-            setattr(runner, 'config', None)
+        # Full cleanup - clear config and model tracking
+        runner.config = None
+        runner._dit_model_name = None
+        runner._vae_model_name = None
     
-    # 4. Clear all temporary loading/configuration attributes
-    temp_attributes = [
-        '_dit_checkpoint', '_dit_block_swap_config',
-        '_vae_checkpoint', '_vae_dtype_override'
-    ]
-    for attr in temp_attributes:
-        if hasattr(runner, attr):
-            setattr(runner, attr, None)
-    
-    # Preserve model name tracking if either model is being cached for future change detection
-    if not (keep_dit_in_ram or keep_vae_in_ram):
-        # Only clear model names if neither model is cached
-        if hasattr(runner, '_dit_model_name'):
-            setattr(runner, '_dit_model_name', None)
-        if hasattr(runner, '_vae_model_name'):
-            setattr(runner, '_vae_model_name', None)
-    
-    # 5. Final memory cleanup
+    # 4. Final memory cleanup
     clear_memory(debug=debug, deep=True, force=True, timer_name="complete_cleanup")
     
-    # 6. Clear cuBLAS workspaces
+    # 5. Clear cuBLAS workspaces
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None
     
     # Log what models are cached for next run

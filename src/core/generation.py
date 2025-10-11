@@ -52,6 +52,7 @@ from ..common.seed import set_seed
 from ..data.image.transforms.divisible_crop import DivisibleCrop
 from ..data.image.transforms.na_resize import NaResize
 from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normalization
+from ..utils.vae_rgba_adapter import adapt_vae_for_rgba, restore_vae_rgb_only
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
@@ -515,20 +516,26 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         debug.log(f"Initialized video transformation pipeline for {res_w}px", category="setup")
         debug.end_timer("video_transform", "Video transform pipeline initialization")
     
+    # Detect if input is RGBA (4 channels) - we'll adapt AFTER loading weights
+    if images[0].shape[-1] == 4:  # RGBA detected
+        ctx['is_rgba'] = True
+    else:
+        ctx['is_rgba'] = False
+    
     # Display batch optimization tips
     if total_frames > 0:
         batch_params = calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap)
         if batch_params['padding_waste'] > 0:
             debug.log("", category="none", force=True)
             debug.log(f"Padding waste: {batch_params['padding_waste']}", category="info", force=True)
-            debug.log(f"   Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True)
-            debug.log(f"   Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True)
-            debug.log(f"   This increases memory usage and processing time unnecessarily", category="info", force=True)
+            debug.log(f"  Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True)
+            debug.log(f"  Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True)
+            debug.log(f"  This increases memory usage and processing time unnecessarily", category="info", force=True)
         
         if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
             debug.log("", category="none", force=True)
             debug.log(f"For {total_frames} frames, use batch_size={batch_params['best_batch']} for better efficiency", category="tip", force=True)
-            debug.log(f"   Consider larger batches: better temporal coherence BUT uses more memory", category="tip", force=True)
+            debug.log(f"  Consider larger batches: better temporal coherence BUT uses more memory", category="tip", force=True)
         
         if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
             debug.log("", category="none", force=True)
@@ -567,6 +574,11 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
+    
+        # Adapt VAE for RGBA after weights are loaded
+        if ctx.get('is_rgba', False):
+            runner.vae = adapt_vae_for_rgba(runner.vae, debug)
+            debug.log("Adapted VAE to RGBA mode", category="success")
         
         debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
@@ -599,7 +611,7 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
 
             # Apply input noise if requested (to reduce artifacts at high resolutions)
             if input_noise_scale > 0:
-                debug.log(f"Applying input noise (scale: {input_noise_scale:.2f})", category="video")
+                debug.log(f"  Applying input noise (scale: {input_noise_scale:.2f})", category="video")
                 
                 # Generate noise matching the video shape
                 noise = torch.randn_like(transformed_video)
@@ -619,13 +631,13 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
             
             # Log sequence info
             t = transformed_video.size(1)
-            debug.log(f"Sequence of {t} frames", category="video", force=True)
+            debug.log(f"  Sequence of {t} frames", category="video", force=True)
 
             # Handle 4n+1 constraint
             if t % 4 != 1:
                 target = ((t-1)//4+1)*4+1
                 padding_frames = target - t
-                debug.log(f"Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
+                debug.log(f"  Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
                 transformed_video = cut_videos(transformed_video)
             
             # Store original length for proper trimming later
@@ -994,6 +1006,11 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
+        # Always restore VAE to RGB (3-channel) state before cleanup
+        if hasattr(runner, 'vae') and runner.vae is not None:
+            if hasattr(runner.vae, 'encoder') and runner.vae.encoder.conv_in.in_channels == 4:
+                runner.vae = restore_vae_rgb_only(runner.vae, debug)
+        
         # Cleanup VAE as it's no longer needed
         cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=cache_model)
         
@@ -1069,8 +1086,19 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
                 
-                # Apply color correction if enabled
+                # Apply color correction if enabled (RGB only)
                 if color_correction != "none" and ctx.get('all_transformed_videos') is not None:
+                    # Check if RGBA (samples are in T, C, H, W format at this point)
+                    has_alpha = ctx.get('is_rgba', False)
+                    alpha_channel = None
+                    
+                    if has_alpha:
+                        debug.log("  Splitting upscaled output: RGBA → RGB (for color correction) + Alpha (preserved)", category="video")
+                        # Split in channels-first format: (T, 4, H, W) -> (T, 3, H, W) + (T, 1, H, W)
+                        rgb_sample = sample[:, :3, :, :]  # RGB channels
+                        alpha_channel = sample[:, 3:4, :, :]  # Alpha channel
+                        sample = rgb_sample
+                        
                     # Get transformed video from CPU
                     transformed_video = ctx['all_transformed_videos'][video_idx]
                     
@@ -1079,9 +1107,14 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     
                     # Adjust transformed video to handle cases when padding was applied during encoding
                     if transformed_video.shape[1] != sample.shape[0]:
-                        debug.log(f"Trimming transformed video from {transformed_video.shape[1]} to {sample.shape[0]} frames to match original input", 
+                        debug.log(f"  Trimming transformed video from {transformed_video.shape[1]} to {sample.shape[0]} frames to match original input", 
                                 category="video")
                         transformed_video = transformed_video[:, :sample.shape[0]]
+                    
+                    # Split reference video to RGB if it's RGBA (for color correction)
+                    if has_alpha and transformed_video.shape[0] == 4:  # Check channel dimension (C, T, H, W)
+                        debug.log("  Extracting RGB from reference input (discarding original Alpha for color matching)", category="video")
+                        transformed_video = transformed_video[:3, ...]  # Keep only RGB channels
                     
                     input_video = [optimized_single_video_rearrange(transformed_video)]
                     
@@ -1089,22 +1122,34 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     debug.start_timer(f"color_correction_{color_correction}")
                     
                     if color_correction == "wavelet":
-                        debug.log("Applying wavelet color reconstruction", category="video")
+                        debug.log("  Applying wavelet color reconstruction", category="video")
                         sample = wavelet_reconstruction(sample, input_video[0], debug)
                     elif color_correction == "adain":
-                        debug.log("Applying AdaIN color correction", category="video")
+                        debug.log("  Applying AdaIN color correction", category="video")
                         sample = adaptive_instance_normalization(sample, input_video[0])
                     else:
-                        debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
+                        debug.log(f"  Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
                     
                     debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                     
                     # Free the transformed video
                     ctx['all_transformed_videos'][video_idx] = None
                     del input_video, transformed_video
+
+                    # Recombine with Alpha or add blank Alpha
+                    if has_alpha and alpha_channel is not None:
+                        debug.log("  Merging color-corrected RGB with preserved Alpha → final RGBA output", category="video")
+                        # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
+                        sample = torch.cat([sample, alpha_channel], dim=1)
+                    else:
+                        # No Alpha channel input - add blank Alpha (all ones = fully opaque)
+                        debug.log("  Adding opaque Alpha channel since no input mask was provided (RGB input → RGBA output)", category="video")
+                        blank_alpha = torch.ones((sample.shape[0], 1, sample.shape[2], sample.shape[3]), 
+                                                dtype=sample.dtype, device=sample.device)
+                        sample = torch.cat([sample, blank_alpha], dim=1)
                 
                 else:
-                    debug.log("Color correction disabled (set to none)", category="video")
+                    debug.log("  Color correction disabled (set to none)", category="video")
                 
                 # Free the original length entry
                 if 'all_ori_lengths' in ctx and video_idx < len(ctx['all_ori_lengths']):

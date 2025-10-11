@@ -44,15 +44,104 @@ except ImportError:
     GGMLQuantizationType = None
 
 from ..utils.constants import get_script_directory, find_model_file, suppress_tensor_warnings
-from ..optimization.memory_manager import clear_memory
+from ..optimization.memory_manager import clear_memory, cleanup_dit, cleanup_vae
 from ..optimization.compatibility import FP8CompatibleDiT
 from ..common.config import load_config, create_object
 from .infer import VideoDiffusionInfer
 from ..optimization.blockswap import apply_block_swap_to_dit, cleanup_blockswap
 from ..common.distributed import get_device
+from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
 
 # Get script directory for config paths
 script_directory = get_script_directory()
+
+
+def _configs_equal(config1: Optional[Dict[str, Any]], config2: Optional[Dict[str, Any]]) -> bool:
+    """
+    Compare two configuration dictionaries for equality.
+    Handles None values properly.
+    
+    Args:
+        config1: First configuration dict (can be None)
+        config2: Second configuration dict (can be None)
+        
+    Returns:
+        True if configs are equivalent, False otherwise
+    """
+    # Both None = equal
+    if config1 is None and config2 is None:
+        return True
+    
+    # One None, one not = different
+    if (config1 is None) != (config2 is None):
+        return False
+    
+    # Compare dictionary contents
+    return config1 == config2
+
+
+def _describe_blockswap_config(config: Optional[Dict[str, Any]]) -> str:
+    """
+    Generate human-readable description of BlockSwap configuration.
+    
+    Args:
+        config: BlockSwap configuration dictionary
+        
+    Returns:
+        Human-readable description string
+    """
+    if config is None:
+        return "disabled"
+    
+    blocks = config.get("blocks_to_swap", 0)
+    if blocks <= 0:
+        return "disabled"
+    
+    block_text = "block" if blocks == 1 else "blocks"
+    parts = [f"{blocks} {block_text}"]
+    if config.get("swap_io_components", False):
+        parts.append("I/O offload")
+    
+    return f"enabled ({', '.join(parts)})"
+
+
+def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
+    """
+    Generate human-readable description of torch.compile configuration.
+    
+    Args:
+        config: torch.compile configuration dictionary
+        
+    Returns:
+        Human-readable description string
+    """
+    if config is None or not config:
+        return "disabled"
+    
+    # Core parameters
+    mode = config.get("mode", "default")
+    backend = config.get("backend", "inductor")
+    
+    parts = [f"{mode} mode"]
+    
+    # Optional flags
+    if backend != "inductor":
+        parts.append(f"{backend} backend")
+    if config.get("fullgraph", False):
+        parts.append("fullgraph")
+    if config.get("dynamic", False):
+        parts.append("dynamic")
+    
+    # Dynamo tuning parameters (show if non-default)
+    cache_limit = config.get("dynamo_cache_size_limit", 64)
+    recompile_limit = config.get("dynamo_recompile_limit", 128)
+    
+    if cache_limit != 64:
+        parts.append(f"cache_limit={cache_limit}")
+    if recompile_limit != 128:
+        parts.append(f"recompile_limit={recompile_limit}")
+    
+    return f"enabled ({', '.join(parts)})"
 
 
 def _check_model_reload_status(cached_runner: VideoDiffusionInfer, 
@@ -92,6 +181,7 @@ def _reload_missing_models(cached_runner: VideoDiffusionInfer,
                           debug: Debug) -> Optional[VideoDiffusionInfer]:
     """
     Reload models that are missing from cache.
+    Cleanup old materialized models before creating new meta structures.
     
     Returns:
         cached_runner if successful, None if config is missing and full recreation needed
@@ -106,14 +196,23 @@ def _reload_missing_models(cached_runner: VideoDiffusionInfer,
     
     config = cached_runner.config
     
-    # Reload DiT if needed
+    # Cleanup old models BEFORE creating new ones
+    # This releases old materialized models so new meta structures can be created cleanly
+    if need_reload_dit and hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
+        debug.log("Cleaning old DiT model before reload", category="cache", force=True)
+        cleanup_dit(runner=cached_runner, debug=debug, keep_model_in_ram=False)
+    
+    if need_reload_vae and hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
+        debug.log("Cleaning old VAE model before reload", category="cache", force=True)
+        cleanup_vae(runner=cached_runner, debug=debug, keep_model_in_ram=False)
+    
+    # Now create new meta structures (old models are cleaned up)
     if need_reload_dit:
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         debug.log(f"Preparing DiT structure: {dit_model}", category="dit")
         cached_runner = prepare_model_structure(cached_runner, "dit", dit_checkpoint_path, 
                                                config, block_swap_config, debug)
     
-    # Reload VAE if needed
     if need_reload_vae:
         vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
         debug.log(f"Preparing VAE structure: {vae_model}", category="vae")
@@ -123,44 +222,207 @@ def _reload_missing_models(cached_runner: VideoDiffusionInfer,
     return cached_runner
 
 
-def _handle_blockswap_config(cached_runner: VideoDiffusionInfer,
-                             block_swap_config: Optional[Dict[str, Any]],
-                             debug: Debug) -> None:
-    """Handle BlockSwap configuration changes for cached runner."""
-    # Normalize configurations
-    desired_config = None
+def _update_model_configs_inplace(
+    cached_runner: 'VideoDiffusionInfer',
+    dit_model: str,
+    vae_model: str,
+    block_swap_config: Optional[Dict[str, Any]],
+    torch_compile_args_dit: Optional[Dict[str, Any]],
+    torch_compile_args_vae: Optional[Dict[str, Any]],
+    base_cache_dir: str,
+    debug: Debug
+) -> Optional['VideoDiffusionInfer']:
+    """
+    Update model configurations in-place without recreating models when possible.
+    Only returns None if the actual model files changed (requiring full recreation).
+    
+    Args:
+        cached_runner: Existing runner with cached models
+        dit_model: DiT model filename
+        vae_model: VAE model filename  
+        block_swap_config: BlockSwap configuration
+        torch_compile_args_dit: DiT torch.compile args
+        torch_compile_args_vae: VAE torch.compile args
+        base_cache_dir: Base directory for models
+        debug: Debug instance
+        
+    Returns:
+        cached_runner if configs updated successfully, None if models need recreation
+    """
+    if not cached_runner or not hasattr(cached_runner, 'config'):
+        return None
+    
+    # Check if model FILES changed (this requires full recreation)
+    current_dit = getattr(cached_runner, '_dit_model_name', None)
+    current_vae = getattr(cached_runner, '_vae_model_name', None)
+    
+    if current_dit != dit_model or current_vae != vae_model:
+        return None
+    
+    # Handle DiT configuration updates
+    if hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
+        dit_updated = _update_dit_config_inplace(
+            cached_runner, block_swap_config, torch_compile_args_dit, debug
+        )
+        if not dit_updated:
+            return None
+    
+    # Handle VAE configuration updates  
+    if hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
+        vae_updated = _update_vae_config_inplace(
+            cached_runner, torch_compile_args_vae, debug
+        )
+        if not vae_updated:
+            return None
+    
+    return cached_runner
+
+
+def _update_dit_config_inplace(
+    cached_runner: 'VideoDiffusionInfer',
+    block_swap_config: Optional[Dict[str, Any]],
+    torch_compile_args: Optional[Dict[str, Any]],
+    debug: Debug
+) -> bool:
+    """Update DiT configuration in-place. Returns True if successful."""
+    model = cached_runner.dit
+    
+    # Check if model is on meta device (not materialized yet)
+    try:
+        param_device = next(model.parameters()).device
+        if param_device.type == 'meta':
+            debug.log("DiT on meta device, materializing before config update", category="dit")
+            materialize_model(cached_runner, "dit", "cpu", cached_runner.config, 
+                            preserve_vram=True, debug=debug)
+            model = cached_runner.dit
+    except StopIteration:
+        pass
+    
+    # Get cached configurations
+    cached_compile_args = getattr(cached_runner, '_dit_compile_args', None)
+    cached_blockswap_config = getattr(cached_runner, '_dit_block_swap_config', None)
+    
+    # Check if configurations changed
+    compile_changed = not _configs_equal(cached_compile_args, torch_compile_args)
+    blockswap_changed = not _configs_equal(cached_blockswap_config, block_swap_config)
+
+    # If nothing changed, reuse model as-is
+    if not compile_changed and not blockswap_changed:
+        debug.log("DiT configuration unchanged, reusing cached model", category="dit")
+        return True
+    
+    # Build detailed configuration change description
+    config_changes = []
+    if compile_changed:
+        old_desc = _describe_compile_config(cached_compile_args)
+        new_desc = _describe_compile_config(torch_compile_args)
+        config_changes.append(f"torch.compile: {old_desc} → {new_desc}")
+    if blockswap_changed:
+        old_desc = _describe_blockswap_config(cached_blockswap_config)
+        new_desc = _describe_blockswap_config(block_swap_config)
+        config_changes.append(f"BlockSwap: {old_desc} → {new_desc}")
+    
+    debug.log(f"DiT configuration changed, updating in-place:", category="dit", force=True)
+    for change in config_changes:
+        debug.log(f"  {change}", category="dit", force=True)
+    
+    # Remove existing torch.compile wrapper if present and compile config changed
+    if compile_changed and hasattr(model, '_orig_mod'):
+        debug.log("Removing existing torch.compile from DiT", category="setup")
+        model = model._orig_mod
+    
+    # Get base model through FP8 wrapper if present
+    base_model = model.dit_model if hasattr(model, 'dit_model') else model
+    
+    # Handle BlockSwap configuration changes
+    if blockswap_changed:
+        # Determine change type from config comparison
+        old_blocks = cached_blockswap_config.get("blocks_to_swap", 0) if cached_blockswap_config else 0
+        new_blocks = block_swap_config.get("blocks_to_swap", 0) if block_swap_config else 0
+        
+        # If old config had BlockSwap, clean it up first
+        if old_blocks > 0:
+            if new_blocks == 0:
+                # Disabling BlockSwap completely
+                debug.log("Disabling BlockSwap completely", category="blockswap")
+                cleanup_blockswap(runner=cached_runner, keep_state_for_cache=False)
+            else:
+                # Reconfiguring BlockSwap (will reapply below)
+                debug.log("Reconfiguring BlockSwap", category="blockswap")
+                cleanup_blockswap(runner=cached_runner, keep_state_for_cache=True)
+        
+        cached_runner._blockswap_active = False
+    
+    # Apply new BlockSwap if configured (before torch.compile)
     if block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0:
-        desired_config = (
-            block_swap_config.get("blocks_to_swap"),
-            block_swap_config.get("swap_io_components", False)
-        )
+        cached_runner.dit = model  # Temporarily set for BlockSwap
+        apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
+        model = cached_runner.dit  # Get potentially wrapped model
     
-    current_config = None
-    if hasattr(cached_runner, "_block_swap_config"):
-        current_config = (
-            cached_runner._block_swap_config.get("blocks_swapped"),
-            cached_runner._block_swap_config.get("swap_io_components", False)
-        )
+    # Apply torch.compile if configured (after BlockSwap)
+    if torch_compile_args:
+        model = _apply_torch_compile(model, torch_compile_args, "DiT", debug)
     
-    # Apply changes if needed
-    if desired_config != current_config:
-        fmt_curr = "disabled" if current_config is None else f"blocks={current_config[0]}, I/O={current_config[1]}"
-        fmt_new = "disabled" if desired_config is None else f"blocks={desired_config[0]}, I/O={desired_config[1]}"
-        debug.log(f"BlockSwap config changed: {fmt_curr} → {fmt_new}", category="blockswap", force=True)
-        
-        cleanup_blockswap(cached_runner, keep_state_for_cache=False)
-        
-        if desired_config:
-            # Apply BlockSwap immediately since model is already materialized
-            apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
-        else:
-            # Clear any pending config
-            cached_runner._dit_block_swap_config = None
-            
-    elif desired_config and hasattr(cached_runner, "_blockswap_active") and not cached_runner._blockswap_active:
-        cached_runner._blockswap_active = True
-        debug.log(f"BlockSwap reactivated: blocks={desired_config[0]}, I/O={desired_config[1]}", 
-                 category="blockswap", force=True)
+    cached_runner.dit = model
+    cached_runner._dit_compile_args = torch_compile_args
+    cached_runner._dit_block_swap_config = block_swap_config
+    return True
+
+
+def _update_vae_config_inplace(
+    cached_runner: 'VideoDiffusionInfer',
+    torch_compile_args: Optional[Dict[str, Any]],
+    debug: Debug
+) -> bool:
+    """Update VAE configuration in-place. Returns True if successful."""
+    model = cached_runner.vae
+    
+    # Check if model is on meta device
+    try:
+        param_device = next(model.parameters()).device
+        if param_device.type == 'meta':
+            debug.log("VAE on meta device, materializing before config update", category="vae")
+            materialize_model(cached_runner, "vae", "cpu", cached_runner.config, 
+                            preserve_vram=True, debug=debug)
+            model = cached_runner.vae
+    except StopIteration:
+        pass
+    
+    # Get cached configuration
+    cached_compile_args = getattr(cached_runner, '_vae_compile_args', None)
+    
+    # Check if configuration changed
+    compile_changed = not _configs_equal(cached_compile_args, torch_compile_args)
+    
+    # If nothing changed, reuse model as-is
+    if not compile_changed:
+        debug.log("VAE configuration unchanged, reusing cached model", category="vae")
+        cached_runner._vae_compile_args = torch_compile_args
+        return True
+    
+    # Build detailed configuration change description
+    old_desc = _describe_compile_config(cached_compile_args)
+    new_desc = _describe_compile_config(torch_compile_args)
+    
+    debug.log(f"VAE configuration changed, updating in-place:", category="vae", force=True)
+    debug.log(f"  torch.compile: {old_desc} → {new_desc}", category="vae", force=True)
+    
+    # Unwrap compiled VAE submodules if present
+    if hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod'):
+        debug.log("Unwrapping compiled VAE encoder", category="setup")
+        model.encoder = model.encoder._orig_mod
+    
+    if hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod'):
+        debug.log("Unwrapping compiled VAE decoder", category="setup")
+        model.decoder = model.decoder._orig_mod
+    
+    # Reapply torch.compile with new configuration if configured
+    if torch_compile_args:
+        model = _apply_vae_submodule_compile(model, torch_compile_args, debug)
+    
+    cached_runner.vae = model
+    cached_runner._vae_compile_args = torch_compile_args
+    return True
 
 
 def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preserve_vram: bool, debug: Debug,
@@ -215,7 +477,7 @@ def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preser
     if cached_runner and (cache_model_dit or cache_model_vae):
         debug.start_timer("cache_reuse")
         
-        # Update runtime parameters
+        # 1. Update VAE tiling parameters (runtime, no reload needed)
         for key, value in {
             'encode_tiled': encode_tiled,
             'encode_tile_size': encode_tile_size,
@@ -226,28 +488,55 @@ def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preser
         }.items():
             setattr(cached_runner, key, value)
         
-        # Check what needs reloading and log status
+        # 2. Check model status first (for logging purposes)
         need_reload_dit, need_reload_vae = _check_model_reload_status(
             cached_runner, cache_model_dit, cache_model_vae, 
             dit_model, vae_model, debug
         )
-        
-        # Reload missing models
-        cached_runner = _reload_missing_models(
-            cached_runner, need_reload_dit, need_reload_vae,
-            dit_model, vae_model, base_cache_dir, block_swap_config, debug
-        )
-        
-        # Proceed only if we have a valid runner
-        if cached_runner is not None:
-            # Handle BlockSwap configuration
-            _handle_blockswap_config(cached_runner, block_swap_config, debug)
+
+        # 3. Try to update configurations in-place if models are the same files
+        if not need_reload_dit and not need_reload_vae:
+            updated_runner = _update_model_configs_inplace(
+                cached_runner, dit_model, vae_model, block_swap_config,
+                torch_compile_args_dit, torch_compile_args_vae, base_cache_dir, debug
+            )
             
-            # Store debug instance
-            cached_runner.debug = debug
-            debug.end_timer("cache_reuse", "Cache reuse complete")
+            if updated_runner is not None:
+                # Configs updated successfully without reloading
+                updated_runner.debug = debug
+                debug.end_timer("cache_reuse", "Cache reuse with in-place config updates")
+                return updated_runner
+        
+        # 4. Reload models that are missing or changed
+        if need_reload_dit or need_reload_vae:
+            cached_runner = _reload_missing_models(
+                cached_runner, need_reload_dit, need_reload_vae,
+                dit_model, vae_model, base_cache_dir, block_swap_config, debug
+            )
             
-            return cached_runner
+            if cached_runner is not None:
+                # Update configurations for models that DIDN'T reload
+                # This ensures consistent logging for unchanged models
+                if not need_reload_dit and hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
+                    _update_dit_config_inplace(
+                        cached_runner, block_swap_config, torch_compile_args_dit, debug
+                    )
+                else:
+                    # Model was reloaded, just set config attributes
+                    cached_runner._dit_compile_args = torch_compile_args_dit
+                    cached_runner._dit_block_swap_config = block_swap_config
+                
+                if not need_reload_vae and hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
+                    _update_vae_config_inplace(
+                        cached_runner, torch_compile_args_vae, debug
+                    )
+                else:
+                    # Model was reloaded, just set config attributes
+                    cached_runner._vae_compile_args = torch_compile_args_vae
+                
+                cached_runner.debug = debug
+                debug.end_timer("cache_reuse", "Cache reuse complete")
+                return cached_runner
     
     # Full runner creation
     debug.log(f"Creating new runner: DiT={dit_model}, VAE={vae_model}", 
@@ -746,10 +1035,11 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
     
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
-    # Clean up stored configs
+    # Clean up checkpoint paths (no longer needed after weights are loaded)
+    # Note: Config attributes (_dit_block_swap_config, _dit_compile_args) are preserved
+    # for configuration change detection on subsequent runs
     if is_dit:
         runner._dit_checkpoint = None
-        runner._dit_block_swap_config = None
     else:
         runner._vae_checkpoint = None
         runner._vae_dtype_override = None
@@ -1326,6 +1616,17 @@ def _apply_torch_compile(model: torch.nn.Module, compile_args: Dict[str, Any],
         return model
 
 
+def _disable_compile_for_dynamic_modules(module: torch.nn.Module) -> None:
+    """
+    Mark modules with dynamic shapes to be excluded from torch.compile.
+    This prevents recompilation issues with variable tensor sizes.
+    """
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, InflatedCausalConv3d):
+            # Mark module to skip compilation
+            submodule._dynamo_disable = True
+
+
 def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str, Any], 
                                  debug: Optional[Debug]) -> torch.nn.Module:
     """
@@ -1357,11 +1658,15 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
         debug.start_timer("vae_submodule_compile")
         
         if hasattr(model, 'encoder') and model.encoder is not None:
+            # Disable compilation for InflatedCausalConv3d modules due to dynamic shapes
+            _disable_compile_for_dynamic_modules(model.encoder)
             model.encoder = torch.compile(model.encoder, **settings)
             compiled_modules.append('encoder')
             debug.log(f"  VAE encoder found and added to compilation queue", category="success")
-        
+
         if hasattr(model, 'decoder') and model.decoder is not None:
+            # Disable compilation for InflatedCausalConv3d modules due to dynamic shapes  
+            _disable_compile_for_dynamic_modules(model.decoder)
             model.decoder = torch.compile(model.decoder, **settings)
             compiled_modules.append('decoder')
             debug.log(f"  VAE decoder found and added to compilation queue", category="success")

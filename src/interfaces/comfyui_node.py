@@ -87,6 +87,9 @@ class SeedVR2:
                 }),
             },
             "optional": {
+                "mask": ("MASK", {
+                    "tooltip": "Optional Alpha channel mask for RGBA upscaling. When provided, RGB and Alpha are upscaled together for temporal consistency."
+                }),
                 "new_resolution": ("INT", {
                     "default": 1072, 
                     "min": 16, 
@@ -131,8 +134,8 @@ class SeedVR2:
         }
     
     # Define return types for ComfyUI
-    RETURN_NAMES = ("IMAGE", )
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE", "MASK")
+    RETURN_TYPES = ("IMAGE", "MASK")
     FUNCTION = "execute"
     CATEGORY = "SEEDVR2"
 
@@ -140,7 +143,7 @@ class SeedVR2:
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
                 latent_noise_scale: float = 0.0, preserve_vram: bool = False,
-                enable_debug: bool = False) -> Tuple[torch.Tensor]:
+                enable_debug: bool = False, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor]:
         """
         Execute SeedVR2 video upscaling with progress reporting
         
@@ -175,6 +178,7 @@ class SeedVR2:
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
             preserve_vram: Offload models between pipeline phases to save VRAM
             enable_debug: Enable detailed logging and memory tracking
+            mask: Optional alpha channel mask for RGBA upscaling
             
         Returns:
             Tuple containing upscaled video tensor (N, H', W', C) in [0, 1] range
@@ -253,6 +257,25 @@ class SeedVR2:
 
         cfg_scale = 1.0
         try:
+            # Prepare RGBA if mask is provided
+            if mask is not None:
+                # Validate frame counts match between pixels and mask
+                num_pixel_frames = pixels.shape[0]
+                num_mask_frames = mask.shape[0]
+                
+                if num_pixel_frames != num_mask_frames:
+                    raise ValueError(
+                        f"Frame count mismatch between pixels and mask:\n"
+                        f"  Pixels: {num_pixel_frames} frames\n"
+                        f"  Mask: {num_mask_frames} frames\n"
+                        f"Please ensure your mask has the same number of frames as your input video."
+                    )
+                
+                # ComfyUI mask is (N, H, W), pixels is (N, H, W, 3)
+                # Expand mask to (N, H, W, 1) and concatenate with pixels
+                mask_expanded = mask.unsqueeze(-1)  # (N, H, W, 1)
+                pixels = torch.cat([pixels, mask_expanded], dim=-1)  # (N, H, W, 4)
+
             return self._internal_execute(pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, 
                                         batch_size, color_correction, input_noise_scale, latent_noise_scale, 
                                         encode_tiled, encode_tile_size, encode_tile_overlap, 
@@ -429,7 +452,9 @@ class SeedVR2:
        
         # Track total frames for FPS calculation
         total_frames = len(pixels)
-        debug.log(f"   Total frames: {total_frames}, New resolution: {new_resolution}, Batch size: {batch_size}", category="generation", force=True)
+        # Determine channel info for logging
+        channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
+        debug.log(f"  Total frames: {total_frames}, New resolution: {new_resolution}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True)
         
         # Phase 1: Encode all batches
         ctx = encode_all_batches(
@@ -480,10 +505,21 @@ class SeedVR2:
         # Get final result
         sample = ctx['final_video']
 
-        # Ensure sample is on CPU (ComfyUI expects CPU tensors)
+        # Split RGBA
+        # sample is (N, H, W, 4) - split into RGB and Alpha
+        output_rgb = sample[..., :3]  # (N, H, W, 3)
+        output_alpha = sample[..., 3:4]  # (N, H, W, 1)
+        
+        # Prepare mask output: remove channel dimension (N, H, W, 1) -> (N, H, W)
+        output_mask = output_alpha.squeeze(-1)
+        sample = output_rgb
+        
+        # Ensure both are on CPU (ComfyUI expects CPU tensors)
         if torch.is_tensor(sample) and sample.is_cuda:
             sample = sample.cpu()
-        
+        if torch.is_tensor(output_mask) and output_mask.is_cuda:
+            output_mask = output_mask.cpu()
+
         debug.log("", category="none", force=True)
         debug.log("Video upscaling completed successfully!", category="generation", force=True)
 
@@ -531,7 +567,7 @@ class SeedVR2:
         self._pbar = None
         self.ctx = None
 
-        return (sample,)
+        return (sample, output_mask)
 
     def _progress_callback(self, current_step: int, total_steps: int, 
                           current_batch_frames: int, phase_name: str = "") -> None:

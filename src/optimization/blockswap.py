@@ -102,7 +102,8 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     configs = []
     blocks_to_swap = block_swap_config.get("blocks_to_swap", 0)
     if blocks_to_swap > 0:
-        configs.append(f"{blocks_to_swap} blocks")
+        block_text = "block" if blocks_to_swap == 1 else "blocks"
+        configs.append(f"{blocks_to_swap} {block_text}")
     if block_swap_config.get("swap_io_components", False):
         configs.append("I/O components")
     debug.log(f"BlockSwap configured: {', '.join(configs)}", category="blockswap", force=True)
