@@ -94,9 +94,9 @@ class SeedVR2VideoUpscaler:
                     "step": 4,
                     "tooltip": "Frames processed per batch. At least 5 for temporal consistency. Higher = better quality but more VRAM."
                 }),
-                "color_correction": (["wavelet", "adain", "none"], {
-                    "default": "wavelet",
-                    "tooltip": "Color correction method: wavelet=natural, adain=stylistic, none=raw output"
+                "color_correction": (["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], {
+                    "default": "lab",
+                    "tooltip": "Color correction method:\n• lab - Full perceptual color matching with detail preservation (recommended)\n• wavelet - Frequency-based transfer preserving high-frequency details\n• wavelet_adaptive - Wavelet base + targeted saturation correction for oversaturated regions\n• hsv - Hue-conditional saturation histogram matching\n• adain - Statistical style transfer (mean/std matching)\n• none - No color correction applied"
                 }),
                 "input_noise_scale": ("FLOAT", {
                     "default": 0.0,

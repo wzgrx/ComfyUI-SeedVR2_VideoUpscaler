@@ -572,9 +572,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
                         help="Output format: 'video' (mp4) or 'png' images (default: video)")
-    parser.add_argument("--color_correction", type=str, default="wavelet", 
-                        choices=["wavelet", "adain", "none"],
-                        help="Color correction method: 'wavelet' (natural, recommended), 'adain' (stylistic), 'none' (no correction)")
+    parser.add_argument("--color_correction", type=str, default="lab", 
+                    choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
+                    help="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)")
     parser.add_argument("--input_noise_scale", type=float, default=0.0,
                         help="Input noise scale (0.0-1.0) to reduce artifacts at high resolutions. (default: 0.0)")
     parser.add_argument("--latent_noise_scale", type=float, default=0.0,

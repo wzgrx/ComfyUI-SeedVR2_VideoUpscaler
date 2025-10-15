@@ -48,7 +48,13 @@ from ..optimization.performance import (
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
-from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normalization
+from ..utils.color_fix import (
+    lab_color_transfer,
+    wavelet_adaptive_color_correction,
+    hsv_saturation_histogram_match, 
+    wavelet_reconstruction,
+    adaptive_instance_normalization
+)
 from ..utils.constants import get_script_directory
 from ..utils.debug import Debug
 
@@ -1271,11 +1277,20 @@ def postprocess_all_batches(
                     # Apply selected color correction method
                     debug.start_timer(f"color_correction_{color_correction}")
                     
-                    if color_correction == "wavelet":
-                        debug.log("  Applying wavelet color reconstruction", category="video")
+                    if color_correction == "lab":
+                        debug.log("  Applying LAB perceptual color transfer", category="video", force=True)
+                        sample = lab_color_transfer(sample, input_video[0], debug, luminance_weight=0.8)
+                    elif color_correction == "wavelet_adaptive":
+                        debug.log("  Applying wavelet with adaptive saturation correction", category="video", force=True)
+                        sample = wavelet_adaptive_color_correction(sample, input_video[0], debug)
+                    elif color_correction == "wavelet":
+                        debug.log("  Applying wavelet color reconstruction", category="video", force=True)
                         sample = wavelet_reconstruction(sample, input_video[0], debug)
+                    elif color_correction == "hsv":
+                        debug.log("  Applying HSV hue-conditional saturation matching", category="video", force=True)
+                        sample = hsv_saturation_histogram_match(sample, input_video[0], debug)
                     elif color_correction == "adain":
-                        debug.log("  Applying AdaIN color correction", category="video")
+                        debug.log("  Applying AdaIN color correction", category="video", force=True)
                         sample = adaptive_instance_normalization(sample, input_video[0])
                     else:
                         debug.log(f"  Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
