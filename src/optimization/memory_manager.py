@@ -10,8 +10,7 @@ import gc
 import sys
 import time
 import psutil
-from typing import Tuple, Dict, Any, Optional, List, Union
-from ..common.cache import Cache 
+from typing import Tuple, Dict, Any, Optional, List
 from ..common.distributed import get_device
     
 
@@ -382,6 +381,39 @@ def release_tensor_memory(tensor: Optional[torch.Tensor]) -> None:
         tensor.grad = None
 
 
+def release_tensor_collection(collection: Any, recursive: bool = True) -> None:
+    """
+    Release GPU memory from tensors in any collection (list, tuple, dict, or single tensor).
+    
+    Args:
+        collection: Tensor, list, tuple, dict, or nested structure to release
+        recursive: If True, handle nested structures recursively
+        
+    Examples:
+        release_tensor_collection(tensor)                    # Single tensor
+        release_tensor_collection([tensor1, tensor2])        # List of tensors
+        release_tensor_collection([[t1, t2], [t3, t4]])     # Nested lists
+        release_tensor_collection({'a': tensor})             # Dict values
+    """
+    if collection is None:
+        return
+    
+    if torch.is_tensor(collection):
+        release_tensor_memory(collection)
+    elif isinstance(collection, dict):
+        for value in collection.values():
+            if recursive:
+                release_tensor_collection(value, recursive=True)
+            elif torch.is_tensor(value):
+                release_tensor_memory(value)
+    elif isinstance(collection, (list, tuple)):
+        for item in collection:
+            if recursive:
+                release_tensor_collection(item, recursive=True)
+            elif torch.is_tensor(item):
+                release_tensor_memory(item)
+
+
 def release_text_embeddings(*embeddings: torch.Tensor, debug: Optional[Any] = None, names: Optional[List[str]] = None) -> None:
     """
     Release memory for text embeddings
@@ -492,12 +524,21 @@ def manage_model_device(model: Optional[torch.nn.Module], target_device: str,
     # Check if this is a BlockSwap-enabled DiT model
     is_blockswap_model = False
     actual_model = model
-    if runner and model_name == "DiT" and hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-        is_blockswap_model = True
-        # Get the actual model (handle FP8CompatibleDiT wrapper)
-        if hasattr(model, "dit_model"):
-            actual_model = model.dit_model
-    
+    if runner and model_name == "DiT":
+        # Import here to avoid circular dependency
+        from .blockswap import is_blockswap_enabled
+        # Check if BlockSwap config exists and is enabled
+        has_blockswap_config = (
+            hasattr(runner, '_dit_block_swap_config') and 
+            is_blockswap_enabled(runner._dit_block_swap_config)
+        )
+        
+        if has_blockswap_config:
+            is_blockswap_model = True
+            # Get the actual model (handle FP8CompatibleDiT wrapper)
+            if hasattr(model, "dit_model"):
+                actual_model = model.dit_model
+
     # Get current device
     try:
         current_device = next(model.parameters()).device
@@ -550,14 +591,22 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
     Returns:
         bool: True if model was moved
     """
-    # Import BlockSwap function (avoid circular import)
+    # Import here to avoid circular dependency
     from .blockswap import set_blockswap_bypass
-    
+
     if target_type == "cpu":
         # Moving to CPU (offload)
+        # Check if any parameter is on GPU (for accurate logging)
+        actual_source_device = None
+        for param in model.parameters():
+            if param.device.type in ['cuda', 'mps']:
+                actual_source_device = param.device
+                break
+        
+        source_device_desc = str(actual_source_device).upper() if actual_source_device else "CPU"
+        
         if debug:
-            current_device_str = str(current_device).upper()
-            debug.log(f"Moving {model_name} from {current_device_str} to {target_device.upper()} ({reason or 'preserve_vram'})", category="general")
+            debug.log(f"Moving {model_name} from {source_device_desc} to CPU ({reason or 'model caching'})", category="general")
         
         # Enable bypass to allow movement
         set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
@@ -627,6 +676,9 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
                 else:
                     debug.log("BlockSwap blocks restored to configured devices", category="success")
 
+        
+        # Reactivate BlockSwap now that blocks are restored to their configured devices
+        runner._blockswap_active = True
         
         # Disable bypass, re-enable protection
         set_blockswap_bypass(runner=runner, bypass=False, debug=debug)
@@ -719,15 +771,19 @@ def clear_runtime_caches(runner: Any, debug: Optional[Any]) -> int:
 
         cache_entries = len(runner.cache.cache)
         
-        # Properly release tensor memory
-        for key, value in list(runner.cache.cache.items()):
+        # Properly release tensor memory and delete as we go
+        for key in list(runner.cache.cache.keys()):
+            value = runner.cache.cache[key]
             if torch.is_tensor(value):
                 release_tensor_memory(value)
             elif isinstance(value, (list, tuple)):
                 for item in value:
                     if torch.is_tensor(item):
                         release_tensor_memory(item)
-        
+            # Delete immediately to release reference
+            del runner.cache.cache[key]
+
+        # Final clear for safety
         runner.cache.cache.clear()
         cleaned_items += cache_entries
 
@@ -967,7 +1023,7 @@ def complete_cleanup(runner: Any, debug: Optional[Any], keep_dit_in_ram: bool = 
         
         if cached_models:
             models_str = " and ".join(cached_models)
-            debug.log(f"Models cached in RAM for next run: {models_str}", category="store", force=True)
+            debug.log(f"Models cached in RAM for next run: {models_str}", category="cache", force=True)
     
     if debug:
         debug.log(f"Completed {cleanup_type}", category="success")

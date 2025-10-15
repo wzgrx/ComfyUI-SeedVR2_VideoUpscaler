@@ -11,7 +11,6 @@ import gc
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 from ..optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
-from contextlib import contextmanager
 
 
 class Debug:
@@ -48,11 +47,11 @@ class Debug:
         "video": "📹",        # Video/sequence info
         "reuse": "♻️",        # Reusing/recycling
         "runner": "🏃",       # Runner operations
-        "vae": "🎨",          # VAE operations
-        "store": "📦",        # Storing
+        "vae": "🎨",          # VAE operations\
         "precision": "🎯",    # Precision
         "device": "🖥️",       # Device info
         "file": "📂",         # File operations
+        "alpha": "👻",        # Alpha operations
         "star": "⭐",         # Star
         "dialogue": "💬",     # Dialogue
         "none" : "",

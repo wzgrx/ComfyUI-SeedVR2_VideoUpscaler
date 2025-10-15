@@ -56,6 +56,9 @@ class SeedVR2LoadDiTModel:
                 "torch_compile_args": ("TORCH_COMPILE_ARGS", {
                     "tooltip": "Optional torch.compile settings from SeedVR2 Torch Compile Settings node for speedup"
                 }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
             }
         }
     
@@ -69,7 +72,8 @@ class SeedVR2LoadDiTModel:
     
     def create_config(self, model: str, device: str, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, cache_in_ram: bool = False,
-                     torch_compile_args: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
+                     torch_compile_args: Dict[str, Any] = None, unique_id: int = 0
+                     ) -> Tuple[Dict[str, Any]]:
         """
         Create DiT model configuration for SeedVR2 main node
         
@@ -80,6 +84,7 @@ class SeedVR2LoadDiTModel:
             swap_io_components: Whether to offload I/O components to CPU
             cache_in_ram: Whether to keep model in RAM between runs
             torch_compile_args: Optional torch.compile configuration from settings node
+            unique_id: Node instance ID for caching
             
         Returns:
             Tuple containing configuration dictionary for SeedVR2 main node
@@ -91,5 +96,6 @@ class SeedVR2LoadDiTModel:
             "swap_io_components": swap_io_components,
             "cache_in_ram": cache_in_ram,
             "torch_compile_args": torch_compile_args,
+            "node_id": unique_id,
         }
         return (config,)

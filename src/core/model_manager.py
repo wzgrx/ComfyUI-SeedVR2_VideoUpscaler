@@ -19,7 +19,7 @@ import os
 import torch
 import numpy as np
 from omegaconf import OmegaConf
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Any, Optional, Tuple, Union, Callable
 
 # Import SafeTensors with fallback
 try:
@@ -42,15 +42,16 @@ try:
 except ImportError:
     GGUF_AVAILABLE = False
     GGMLQuantizationType = None
-
-from ..utils.constants import get_script_directory, find_model_file, suppress_tensor_warnings
-from ..optimization.memory_manager import clear_memory, cleanup_dit, cleanup_vae
-from ..optimization.compatibility import FP8CompatibleDiT
-from ..common.config import load_config, create_object
+    
 from .infer import VideoDiffusionInfer
-from ..optimization.blockswap import apply_block_swap_to_dit, cleanup_blockswap
+from .model_cache import get_global_cache
+from ..common.config import load_config, create_object
 from ..common.distributed import get_device
 from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
+from ..optimization.compatibility import FP8CompatibleDiT
+from ..optimization.blockswap import is_blockswap_enabled, apply_block_swap_to_dit, cleanup_blockswap
+from ..optimization.memory_manager import cleanup_dit, cleanup_vae
+from ..utils.constants import get_script_directory, find_model_file, suppress_tensor_warnings
 
 # Get script directory for config paths
 script_directory = get_script_directory()
@@ -90,15 +91,11 @@ def _describe_blockswap_config(config: Optional[Dict[str, Any]]) -> str:
     Returns:
         Human-readable description string
     """
-    if config is None:
+    if not is_blockswap_enabled(config):
         return "disabled"
     
     blocks_to_swap = config.get("blocks_to_swap", 0)
     swap_io_components = config.get("swap_io_components", False)
-    
-    # Early return only if both block swap and I/O swap are disabled
-    if blocks_to_swap <= 0 and not swap_io_components:
-        return "disabled"
     
     block_text = "block" if blocks_to_swap <= 1 else "blocks"
     parts = [f"{blocks_to_swap} {block_text}"]
@@ -147,315 +144,357 @@ def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
     return f"enabled ({', '.join(parts)})"
 
 
-def _check_model_reload_status(cached_runner: VideoDiffusionInfer, 
-                               cache_dit: bool, cache_vae: bool,
-                               dit_model: str, vae_model: str,
-                               debug: Debug) -> Tuple[bool, bool]:
+def _describe_tiling_config(encode_tiled: bool, encode_tile_size: Optional[Tuple[int, int]], 
+                           encode_tile_overlap: Optional[Tuple[int, int]],
+                           decode_tiled: bool, decode_tile_size: Optional[Tuple[int, int]], 
+                           decode_tile_overlap: Optional[Tuple[int, int]]) -> str:
     """
-    Determine which models need reloading.
-    
-    Returns:
-        Tuple[bool, bool]: (need_reload_dit, need_reload_vae)
-    """
-    need_reload_dit = not cache_dit or not hasattr(cached_runner, 'dit') or cached_runner.dit is None
-    need_reload_vae = not cache_vae or not hasattr(cached_runner, 'vae') or cached_runner.vae is None
-    
-    if need_reload_dit:
-        reason = "cache disabled" if not cache_dit else "not in memory"
-        debug.log(f"DiT will be reloaded ({reason}): {dit_model}", category="cache", force=True)
-    else:
-        cached_dit_name = getattr(cached_runner, '_dit_model_name', dit_model)
-        debug.log(f"DiT cached in RAM - reusing: {cached_dit_name}", category="reuse", force=True)
-        
-    if need_reload_vae:
-        reason = "cache disabled" if not cache_vae else "not in memory"
-        debug.log(f"VAE will be reloaded ({reason}): {vae_model}", category="cache", force=True)
-    else:
-        cached_vae_name = getattr(cached_runner, '_vae_model_name', vae_model)
-        debug.log(f"VAE cached in RAM - reusing: {cached_vae_name}", category="reuse", force=True)
-    
-    return need_reload_dit, need_reload_vae
-
-
-def _reload_missing_models(cached_runner: VideoDiffusionInfer,
-                          need_reload_dit: bool, need_reload_vae: bool,
-                          dit_model: str, vae_model: str, base_cache_dir: str,
-                          block_swap_config: Optional[Dict[str, Any]],
-                          debug: Debug) -> Optional[VideoDiffusionInfer]:
-    """
-    Reload models that are missing from cache.
-    Cleanup old materialized models before creating new meta structures.
-    
-    Returns:
-        cached_runner if successful, None if config is missing and full recreation needed
-    """
-    if not (need_reload_dit or need_reload_vae):
-        return cached_runner
-    
-    # Verify config exists
-    if not hasattr(cached_runner, 'config') or cached_runner.config is None:
-        debug.log("Config missing - full runner recreation required", category="cache", force=True)
-        return None
-    
-    config = cached_runner.config
-    
-    # Cleanup old models BEFORE creating new ones
-    # This releases old materialized models so new meta structures can be created cleanly
-    if need_reload_dit and hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
-        debug.log("Cleaning old DiT model before reload", category="cache", force=True)
-        cleanup_dit(runner=cached_runner, debug=debug, keep_model_in_ram=False)
-    
-    if need_reload_vae and hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
-        debug.log("Cleaning old VAE model before reload", category="cache", force=True)
-        cleanup_vae(runner=cached_runner, debug=debug, keep_model_in_ram=False)
-    
-    # Now create new meta structures (old models are cleaned up)
-    if need_reload_dit:
-        dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
-        debug.log(f"Preparing DiT structure: {dit_model}", category="dit")
-        cached_runner = prepare_model_structure(cached_runner, "dit", dit_checkpoint_path, 
-                                               config, block_swap_config, debug)
-    
-    if need_reload_vae:
-        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
-        debug.log(f"Preparing VAE structure: {vae_model}", category="vae")
-        cached_runner = prepare_model_structure(cached_runner, "vae", vae_checkpoint_path, 
-                                               config, None, debug)
-    
-    return cached_runner
-
-
-def _update_model_configs_inplace(
-    cached_runner: 'VideoDiffusionInfer',
-    dit_model: str,
-    vae_model: str,
-    block_swap_config: Optional[Dict[str, Any]],
-    torch_compile_args_dit: Optional[Dict[str, Any]],
-    torch_compile_args_vae: Optional[Dict[str, Any]],
-    base_cache_dir: str,
-    debug: Debug
-) -> Optional['VideoDiffusionInfer']:
-    """
-    Update model configurations in-place without recreating models when possible.
-    Only returns None if the actual model files changed (requiring full recreation).
+    Generate human-readable description of VAE tiling configuration.
     
     Args:
-        cached_runner: Existing runner with cached models
-        dit_model: DiT model filename
-        vae_model: VAE model filename  
-        block_swap_config: BlockSwap configuration
-        torch_compile_args_dit: DiT torch.compile args
-        torch_compile_args_vae: VAE torch.compile args
-        base_cache_dir: Base directory for models
+        encode_tiled: Whether encode tiling is enabled
+        encode_tile_size: Tile size for encoding
+        encode_tile_overlap: Tile overlap for encoding
+        decode_tiled: Whether decode tiling is enabled
+        decode_tile_size: Tile size for decoding
+        decode_tile_overlap: Tile overlap for decoding
+        
+    Returns:
+        Human-readable description string
+    """
+    if not encode_tiled and not decode_tiled:
+        return "disabled"
+    
+    parts = []
+    if encode_tiled:
+        parts.append(f"encode Tile: {encode_tile_size}, Overlap: {encode_tile_overlap}")
+    if decode_tiled:
+        parts.append(f"decode Tile: {decode_tile_size}, Overlap: {decode_tile_overlap}")
+    
+    return "; ".join(parts)
+
+    
+def _update_model_config(
+    runner: 'VideoDiffusionInfer',
+    model_attr: str,
+    model_type: str,
+    new_configs: Dict[str, Any],
+    cached_config_attrs: Dict[str, str],
+    config_describers: Dict[str, Callable],
+    special_handlers: Optional[Dict[str, Callable]] = None,
+    debug: Debug = None
+) -> bool:
+    """
+    Update model configuration uniformly for DiT or VAE.
+    
+    This generic function handles config comparison, logging, and attribute updates
+    for both DiT and VAE models, reducing code duplication.
+    
+    Args:
+        runner: VideoDiffusionInfer instance
+        model_attr: Attribute name for the model ('dit' or 'vae')
+        model_type: Model type string for logging ('DiT' or 'VAE')
+        new_configs: Dict mapping config names to new values
+                    e.g., {'torch_compile': ..., 'block_swap': ...}
+        cached_config_attrs: Dict mapping config names to runner attribute names
+                           e.g., {'torch_compile': '_dit_compile_args', ...}
+        config_describers: Dict mapping config names to description functions
+                          e.g., {'torch_compile': _describe_compile_config, ...}
+        special_handlers: Optional dict of config-specific handlers
+                         e.g., {'block_swap': handle_blockswap_change}
         debug: Debug instance
         
     Returns:
-        cached_runner if configs updated successfully, None if models need recreation
+        True if successful
     """
-    if not cached_runner or not hasattr(cached_runner, 'config'):
-        return None
-    
-    # Check if model FILES changed (this requires full recreation)
-    current_dit = getattr(cached_runner, '_dit_model_name', None)
-    current_vae = getattr(cached_runner, '_vae_model_name', None)
-    
-    if current_dit != dit_model or current_vae != vae_model:
-        return None
-    
-    # Handle DiT configuration updates
-    if hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
-        dit_updated = _update_dit_config_inplace(
-            cached_runner, block_swap_config, torch_compile_args_dit, debug
-        )
-        if not dit_updated:
-            return None
-    
-    # Handle VAE configuration updates  
-    if hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
-        vae_updated = _update_vae_config_inplace(
-            cached_runner, torch_compile_args_vae, debug
-        )
-        if not vae_updated:
-            return None
-    
-    return cached_runner
-
-
-def _update_dit_config_inplace(
-    cached_runner: 'VideoDiffusionInfer',
-    block_swap_config: Optional[Dict[str, Any]],
-    torch_compile_args: Optional[Dict[str, Any]],
-    debug: Debug
-) -> bool:
-    """Update DiT configuration in-place. Returns True if successful."""
-    model = cached_runner.dit
+    model = getattr(runner, model_attr)
     
     # Check if model is on meta device (not materialized yet)
     try:
         param_device = next(model.parameters()).device
         if param_device.type == 'meta':
-            debug.log("DiT on meta device, materializing before config update", category="dit")
-            materialize_model(cached_runner, "dit", "cpu", cached_runner.config, 
-                            preserve_vram=True, debug=debug)
-            model = cached_runner.dit
+            # Model not yet materialized - just update config attributes
+            for config_name, attr_name in cached_config_attrs.items():
+                setattr(runner, attr_name, new_configs.get(config_name))
+            # Store on model so config travels with the model when cached
+            for config_name, attr_name in cached_config_attrs.items():
+                model_attr_name = f'_config_{config_name.split("_")[-1]}'
+                setattr(model, model_attr_name, new_configs.get(config_name))
+            return True
     except StopIteration:
         pass
     
-    # Get cached configurations
-    cached_compile_args = getattr(cached_runner, '_dit_compile_args', None)
-    cached_blockswap_config = getattr(cached_runner, '_dit_block_swap_config', None)
+    # Get cached configurations and check what changed
+    config_changes = []
+    changes_detected = {}
     
-    # Check if configurations changed
-    compile_changed = not _configs_equal(cached_compile_args, torch_compile_args)
-    blockswap_changed = not _configs_equal(cached_blockswap_config, block_swap_config)
-
+    for config_name, attr_name in cached_config_attrs.items():
+        cached_value = getattr(runner, attr_name, None)
+        new_value = new_configs.get(config_name)
+        changed = not _configs_equal(cached_value, new_value)
+        changes_detected[config_name] = changed
+        
+        if changed:
+            # Get description function for this config type
+            desc_func = config_describers.get(config_name)
+            if desc_func:
+                if config_name == 'tiling':
+                    # Special case for tiling which needs multiple params
+                    old_cfg = cached_value or {}
+                    new_cfg = new_value or {}
+                    old_desc = desc_func(
+                        old_cfg.get('encode_tiled', False),
+                        old_cfg.get('encode_tile_size'),
+                        old_cfg.get('encode_tile_overlap'),
+                        old_cfg.get('decode_tiled', False),
+                        old_cfg.get('decode_tile_size'),
+                        old_cfg.get('decode_tile_overlap')
+                    )
+                    new_desc = desc_func(
+                        new_cfg.get('encode_tiled', False),
+                        new_cfg.get('encode_tile_size'),
+                        new_cfg.get('encode_tile_overlap'),
+                        new_cfg.get('decode_tiled', False),
+                        new_cfg.get('decode_tile_size'),
+                        new_cfg.get('decode_tile_overlap')
+                    )
+                else:
+                    old_desc = desc_func(cached_value)
+                    new_desc = desc_func(new_value)
+                
+                # Format config name for display
+                display_name = config_name.replace('_', ' ').title()
+                if config_name == 'torch_compile':
+                    display_name = 'torch.compile'
+                elif config_name == 'block_swap':
+                    display_name = 'BlockSwap'
+                    
+                config_changes.append(f"{display_name}: {old_desc} → {new_desc}")
+    
     # If nothing changed, reuse model as-is
-    if not compile_changed and not blockswap_changed:
-        debug.log("DiT configuration unchanged, reusing cached model", category="dit")
+    if not any(changes_detected.values()):
+        debug.log(f"{model_type} configuration unchanged, reusing cached model", category=model_type.lower())
+        # Still update attributes to ensure consistency
+        for config_name, attr_name in cached_config_attrs.items():
+            setattr(runner, attr_name, new_configs.get(config_name))
         return True
     
-    # Build detailed configuration change description
-    config_changes = []
-    if compile_changed:
-        old_desc = _describe_compile_config(cached_compile_args)
-        new_desc = _describe_compile_config(torch_compile_args)
-        config_changes.append(f"torch.compile: {old_desc} → {new_desc}")
-    if blockswap_changed:
-        old_desc = _describe_blockswap_config(cached_blockswap_config)
-        new_desc = _describe_blockswap_config(block_swap_config)
-        config_changes.append(f"BlockSwap: {old_desc} → {new_desc}")
-    
-    debug.log(f"DiT configuration changed, updating in-place:", category="dit", force=True)
+    # Log configuration changes
+    debug.log(f"{model_type} configuration changed:", category=model_type.lower(), force=True)
     for change in config_changes:
-        debug.log(f"  {change}", category="dit", force=True)
+        debug.log(f"  {change}", category=model_type.lower(), force=True)
     
-    # Remove existing torch.compile wrapper if present and compile config changed
-    if compile_changed and hasattr(model, '_orig_mod'):
-        debug.log("Removing existing torch.compile from DiT", category="setup")
-        model = model._orig_mod
+    # Handle torch.compile unwrapping if needed
+    if changes_detected.get('torch_compile', False):
+        if model_attr == 'dit' and hasattr(model, '_orig_mod'):
+            debug.log(f"Removing torch.compile from {model_type}", category="setup")
+            model = model._orig_mod
+            setattr(runner, model_attr, model)
+        elif model_attr == 'vae':
+            # Unwrap compiled VAE submodules if present
+            if hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod'):
+                debug.log(f"Removing torch.compile from {model_type} encoder", category="setup")
+                model.encoder = model.encoder._orig_mod
+            if hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod'):
+                debug.log(f"Removing torch.compile from {model_type} decoder", category="setup")
+                model.decoder = model.decoder._orig_mod
     
-    # Get base model through FP8 wrapper if present
-    base_model = model.dit_model if hasattr(model, 'dit_model') else model
+    # Execute special handlers for config-specific logic
+    if special_handlers:
+        for config_name, handler in special_handlers.items():
+            if changes_detected.get(config_name, False):
+                handler(runner, cached_config_attrs[config_name], 
+                       new_configs[config_name], debug)
     
-    # Handle BlockSwap configuration changes
-    if blockswap_changed:
-        # Determine change type from config comparison
-        old_blocks = cached_blockswap_config.get("blocks_to_swap", 0) if cached_blockswap_config else 0
-        old_swap_io = cached_blockswap_config.get("swap_io_components", False) if cached_blockswap_config else False
-        new_blocks = block_swap_config.get("blocks_to_swap", 0) if block_swap_config else 0
-        new_swap_io = block_swap_config.get("swap_io_components", False) if block_swap_config else False
-        
-        # Check if old config had ANY BlockSwap features (blocks or I/O components)
-        had_blockswap = old_blocks > 0 or old_swap_io
-        has_blockswap = new_blocks > 0 or new_swap_io
-        
-        # If old config had BlockSwap features, clean them up first
-        if had_blockswap:
-            if not has_blockswap:
-                # Disabling BlockSwap completely
-                debug.log("Disabling BlockSwap completely", category="blockswap")
-                cleanup_blockswap(runner=cached_runner, keep_state_for_cache=False)
-            else:
-                # Reconfiguring BlockSwap (will reapply below)
-                debug.log("Reconfiguring BlockSwap", category="blockswap")
-                cleanup_blockswap(runner=cached_runner, keep_state_for_cache=True)
-        
-        cached_runner._blockswap_active = False
+    # Update config attributes
+    setattr(runner, model_attr, model)
+    for config_name, attr_name in cached_config_attrs.items():
+        setattr(runner, attr_name, new_configs.get(config_name))
     
-    # Apply new BlockSwap if configured (before torch.compile)
-    if block_swap_config and (block_swap_config.get("blocks_to_swap", 0) > 0 or 
-                              block_swap_config.get("swap_io_components", False)):
-        cached_runner.dit = model  # Temporarily set for BlockSwap
-        apply_block_swap_to_dit(cached_runner, block_swap_config, debug)
-        model = cached_runner.dit  # Get potentially wrapped model
+    # Store on model so config travels with the model when cached
+    for config_name, attr_name in cached_config_attrs.items():
+        model_attr_name = f'_config_{config_name.split("_")[-1]}'
+        setattr(model, model_attr_name, new_configs.get(config_name))
     
-    # Apply torch.compile if configured (after BlockSwap)
-    if torch_compile_args:
-        model = _apply_torch_compile(model, torch_compile_args, "DiT", debug)
+    # Mark that configs need to be applied
+    config_needs_app_attr = f'_{model_attr}_config_needs_application'
+    setattr(runner, config_needs_app_attr, True)
     
-    cached_runner.dit = model
-    cached_runner._dit_compile_args = torch_compile_args
-    cached_runner._dit_block_swap_config = block_swap_config
     return True
 
 
-def _update_vae_config_inplace(
-    cached_runner: 'VideoDiffusionInfer',
+def _handle_blockswap_change(
+    runner: 'VideoDiffusionInfer',
+    attr_name: str,
+    new_config: Optional[Dict[str, Any]],
+    debug: Debug
+) -> None:
+    """
+    Handle BlockSwap-specific configuration changes with proper cleanup.
+    
+    Called by _update_model_config when BlockSwap configuration changes are detected.
+    Manages transition between BlockSwap states (enabled/disabled/reconfigured) with
+    proper cleanup to avoid memory leaks and state corruption.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with DiT model
+        attr_name: Runner attribute name storing cached config (e.g., '_dit_block_swap_config')
+        new_config: New BlockSwap configuration dict or None to disable
+        debug: Debug instance for logging
+    """
+    cached_config = getattr(runner, attr_name, None)
+    
+    # Determine BlockSwap status from configs
+    had_blockswap = is_blockswap_enabled(cached_config)
+    has_blockswap = is_blockswap_enabled(new_config)
+    
+    # If old config had BlockSwap features, clean them up first
+    if had_blockswap and not has_blockswap:
+        # Disabling BlockSwap completely
+        debug.log("Disabling BlockSwap completely", category="blockswap")
+        cleanup_blockswap(runner=runner, keep_state_for_cache=False)
+    
+    # Mark as inactive so the new config can be applied
+    runner._blockswap_active = False
+
+
+def _update_dit_config(
+    runner: 'VideoDiffusionInfer',
+    block_swap_config: Optional[Dict[str, Any]],
     torch_compile_args: Optional[Dict[str, Any]],
     debug: Debug
 ) -> bool:
-    """Update VAE configuration in-place. Returns True if successful."""
-    model = cached_runner.vae
-    
-    # Check if model is on meta device
-    try:
-        param_device = next(model.parameters()).device
-        if param_device.type == 'meta':
-            debug.log("VAE on meta device, materializing before config update", category="vae")
-            materialize_model(cached_runner, "vae", "cpu", cached_runner.config, 
-                            preserve_vram=True, debug=debug)
-            model = cached_runner.vae
-    except StopIteration:
-        pass
-    
-    # Get cached configuration
-    cached_compile_args = getattr(cached_runner, '_vae_compile_args', None)
-    
-    # Check if configuration changed
-    compile_changed = not _configs_equal(cached_compile_args, torch_compile_args)
-    
-    # If nothing changed, reuse model as-is
-    if not compile_changed:
-        debug.log("VAE configuration unchanged, reusing cached model", category="vae")
-        cached_runner._vae_compile_args = torch_compile_args
-        return True
-    
-    # Build detailed configuration change description
-    old_desc = _describe_compile_config(cached_compile_args)
-    new_desc = _describe_compile_config(torch_compile_args)
-    
-    debug.log(f"VAE configuration changed, updating in-place:", category="vae", force=True)
-    debug.log(f"  torch.compile: {old_desc} → {new_desc}", category="vae", force=True)
-    
-    # Unwrap compiled VAE submodules if present
-    if hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod'):
-        debug.log("Unwrapping compiled VAE encoder", category="setup")
-        model.encoder = model.encoder._orig_mod
-    
-    if hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod'):
-        debug.log("Unwrapping compiled VAE decoder", category="setup")
-        model.decoder = model.decoder._orig_mod
-    
-    # Reapply torch.compile with new configuration if configured
-    if torch_compile_args:
-        model = _apply_vae_submodule_compile(model, torch_compile_args, debug)
-    
-    cached_runner.vae = model
-    cached_runner._vae_compile_args = torch_compile_args
-    return True
-
-
-def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preserve_vram: bool, debug: Debug,
-                    cache_model_dit: bool = False, cache_model_vae: bool = False,
-                    block_swap_config: Optional[Dict[str, Any]] = None,
-                    encode_tiled: bool = False, encode_tile_size: Optional[Tuple[int, int]] = None,
-                    encode_tile_overlap: Optional[Tuple[int, int]] = None,
-                    decode_tiled: bool = False, decode_tile_size: Optional[Tuple[int, int]] = None,
-                    decode_tile_overlap: Optional[Tuple[int, int]] = None,
-                    torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-                    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
-                    cached_runner: Optional['VideoDiffusionInfer'] = None) -> 'VideoDiffusionInfer':
     """
-    Configure SeedVR2 inference runner with model loading and optimization.
+    Update DiT model configuration when reusing cached model.
+    
+    Compares new configuration settings against cached config to detect changes.
+    Handles BlockSwap and torch.compile configuration updates with proper cleanup
+    and reapplication when settings change.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with cached DiT model
+        block_swap_config: New BlockSwap configuration dict with keys:
+            - blocks_to_swap: int - Number of transformer blocks to offload
+            - swap_io_components: bool - Whether to offload I/O components
+        torch_compile_args: New torch.compile configuration dict with keys:
+            - backend: str - Compiler backend (default: "inductor")
+            - mode: str - Compilation mode (default: "default")
+            - fullgraph: bool - Require single graph compilation
+            - dynamic: bool - Enable dynamic shapes
+            - dynamo_cache_size_limit: int - Cache size limit
+            - dynamo_recompile_limit: int - Recompilation limit
+        debug: Debug instance for logging
+        
+    Returns:
+        bool: True if configuration was successfully updated
+    """
+    return _update_model_config(
+        runner=runner,
+        model_attr='dit',
+        model_type='DiT',
+        new_configs={
+            'torch_compile': torch_compile_args,
+            'block_swap': block_swap_config
+        },
+        cached_config_attrs={
+            'torch_compile': '_dit_compile_args',
+            'block_swap': '_dit_block_swap_config'
+        },
+        config_describers={
+            'torch_compile': _describe_compile_config,
+            'block_swap': _describe_blockswap_config
+        },
+        special_handlers={
+            'block_swap': _handle_blockswap_change
+        },
+        debug=debug
+    )
+
+
+def _update_vae_config(
+    runner: 'VideoDiffusionInfer',
+    torch_compile_args: Optional[Dict[str, Any]],
+    debug: Debug
+) -> bool:
+    """
+    Update VAE model configuration when reusing cached model.
+    
+    Compares new configuration settings against cached config to detect changes.
+    Handles torch.compile and tiling configuration updates with proper cleanup
+    and reapplication when settings change.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with cached VAE model
+        torch_compile_args: New torch.compile configuration dict with keys:
+            - backend: str - Compiler backend (default: "inductor")
+            - mode: str - Compilation mode (default: "default")
+            - fullgraph: bool - Require single graph compilation
+            - dynamic: bool - Enable dynamic shapes
+            - dynamo_cache_size_limit: int - Cache size limit
+            - dynamo_recompile_limit: int - Recompilation limit
+        debug: Debug instance for logging
+        
+    Returns:
+        bool: True if configuration was successfully updated
+    """
+    new_tiling_config = getattr(runner, '_new_vae_tiling_config', None)
+    
+    return _update_model_config(
+        runner=runner,
+        model_attr='vae',
+        model_type='VAE',
+        new_configs={
+            'torch_compile': torch_compile_args,
+            'tiling': new_tiling_config
+        },
+        cached_config_attrs={
+            'torch_compile': '_vae_compile_args',
+            'tiling': '_vae_tiling_config'
+        },
+        config_describers={
+            'torch_compile': _describe_compile_config,
+            'tiling': _describe_tiling_config
+        },
+        special_handlers=None,
+        debug=debug
+    )
+
+
+def configure_runner(
+    dit_model: str,
+    vae_model: str,
+    base_cache_dir: str,
+    preserve_vram: bool = False,
+    debug: Optional[Debug] = None,
+    dit_cache: bool = False,
+    vae_cache: bool = False,
+    dit_id: Optional[int] = None,
+    vae_id: Optional[int] = None,
+    block_swap_config: Optional[Dict[str, Any]] = None,
+    encode_tiled: bool = False,
+    encode_tile_size: Optional[Tuple[int, int]] = None,
+    encode_tile_overlap: Optional[Tuple[int, int]] = None,
+    decode_tiled: bool = False,
+    decode_tile_size: Optional[Tuple[int, int]] = None,
+    decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    torch_compile_args_dit: Optional[Dict[str, Any]] = None,
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
+    """
+    Configure VideoDiffusionInfer runner with model loading and settings.
+    
+    Handles model changes and caching logic with independent DiT/VAE caching support.
     
     Args:
         dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         base_cache_dir: Base directory containing model files
         preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
-        debug: Debug instance for logging
-        cache_model_dit: Whether to cache DiT model in RAM between runs
-        cache_model_vae: Whether to cache VAE model in RAM between runs
+        debug: Debug instance for logging (required)
+        dit_cache: Whether to cache DiT model in RAM between runs
+        vae_cache: Whether to cache VAE model in RAM between runs
+        dit_id: Node instance ID for DiT model caching (required if dit_cache=True)
+        vae_id: Node instance ID for VAE model caching (required if vae_cache=True)
         block_swap_config: Optional BlockSwap configuration for DiT memory optimization
         encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
         encode_tile_size: Tile size for encoding (height, width)
@@ -465,174 +504,543 @@ def configure_runner(dit_model: str, vae_model: str, base_cache_dir: str, preser
         decode_tile_overlap: Tile overlap for decoding (height, width)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
-        cached_runner: Optional cached runner to reuse (passed if either model is cached)
         
     Returns:
-        VideoDiffusionInfer: Configured runner instance ready for inference
+        Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
         
     Features:
         - Independent DiT and VAE caching for flexible memory management
-        - Dynamic config loading based on model type (3B vs 7B)
-        - Automatic import path resolution for different environments
-        - Optional torch.compile optimization for 20-40% speedup
+        - Dynamic model reloading when models change
+        - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
-        - Memory optimization and RoPE cache pre-initialization
-        - BlockSwap integration for large model support on limited VRAM
+        - Memory optimization and BlockSwap integration
+        
+    Raises:
+        ValueError: If debug instance is not provided
     """
-    # Check if debug instance is available
+    
     if debug is None:
         raise ValueError("Debug instance must be provided to configure_runner")
     
-    # Check if we can reuse the cached runner (if either model is cached)
-    if cached_runner and (cache_model_dit or cache_model_vae):
-        debug.start_timer("cache_reuse")
-        
-        # 1. Update VAE tiling parameters (runtime, no reload needed)
-        for key, value in {
-            'encode_tiled': encode_tiled,
-            'encode_tile_size': encode_tile_size,
-            'encode_tile_overlap': encode_tile_overlap,
-            'decode_tiled': decode_tiled,
-            'decode_tile_size': decode_tile_size,
-            'decode_tile_overlap': decode_tile_overlap
-        }.items():
-            setattr(cached_runner, key, value)
-        
-        # 2. Check model status first (for logging purposes)
-        need_reload_dit, need_reload_vae = _check_model_reload_status(
-            cached_runner, cache_model_dit, cache_model_vae, 
-            dit_model, vae_model, debug
-        )
-
-        # 3. Try to update configurations in-place if models are the same files
-        if not need_reload_dit and not need_reload_vae:
-            updated_runner = _update_model_configs_inplace(
-                cached_runner, dit_model, vae_model, block_swap_config,
-                torch_compile_args_dit, torch_compile_args_vae, base_cache_dir, debug
-            )
-            
-            if updated_runner is not None:
-                # Configs updated successfully without reloading
-                updated_runner.debug = debug
-                debug.end_timer("cache_reuse", "Cache reuse with in-place config updates")
-                return updated_runner
-        
-        # 4. Reload models that are missing or changed
-        if need_reload_dit or need_reload_vae:
-            cached_runner = _reload_missing_models(
-                cached_runner, need_reload_dit, need_reload_vae,
-                dit_model, vae_model, base_cache_dir, block_swap_config, debug
-            )
-            
-            if cached_runner is not None:
-                # Update configurations for models that DIDN'T reload
-                # This ensures consistent logging for unchanged models
-                if not need_reload_dit and hasattr(cached_runner, 'dit') and cached_runner.dit is not None:
-                    _update_dit_config_inplace(
-                        cached_runner, block_swap_config, torch_compile_args_dit, debug
-                    )
-                else:
-                    # Model was reloaded, just set config attributes
-                    cached_runner._dit_compile_args = torch_compile_args_dit
-                    cached_runner._dit_block_swap_config = block_swap_config
-                
-                if not need_reload_vae and hasattr(cached_runner, 'vae') and cached_runner.vae is not None:
-                    _update_vae_config_inplace(
-                        cached_runner, torch_compile_args_vae, debug
-                    )
-                else:
-                    # Model was reloaded, just set config attributes
-                    cached_runner._vae_compile_args = torch_compile_args_vae
-                
-                cached_runner.debug = debug
-                debug.end_timer("cache_reuse", "Cache reuse complete")
-                return cached_runner
+    # Phase 1: Initialize cache and get cached models
+    cache_context = _initialize_cache_context(
+        dit_cache, vae_cache, dit_id, vae_id, 
+        dit_model, vae_model, debug
+    )
     
-    # Full runner creation
+    # Phase 2: Get or create runner
+    runner = _acquire_runner(
+        cache_context, dit_model, vae_model, 
+        base_cache_dir, debug
+    )
+    
+    # Phase 3: Configure runner settings
+    _configure_runner_settings(
+        runner, 
+        encode_tiled, encode_tile_size, encode_tile_overlap,
+        decode_tiled, decode_tile_size, decode_tile_overlap,
+        torch_compile_args_dit, torch_compile_args_vae,
+        block_swap_config, debug
+    )
+    
+    # Phase 4: Setup models (load from cache or create new)
+    _setup_models(
+        runner, cache_context, dit_model, vae_model, 
+        base_cache_dir, block_swap_config, debug
+    )
+    
+    return runner, cache_context
+
+
+def _initialize_cache_context(
+    dit_cache: bool,
+    vae_cache: bool,
+    dit_id: Optional[int],
+    vae_id: Optional[int],
+    dit_model: str,
+    vae_model: str,
+    debug: Debug
+) -> Dict[str, Any]:
+    """
+    Initialize cache context with global cache lookups and model name validation.
+    
+    Checks the global cache for existing DiT/VAE models and validates that cached
+    models match the requested model names. Removes stale cache entries when model
+    names don't match.
+    
+    Args:
+        dit_cache: Whether DiT caching is enabled
+        vae_cache: Whether VAE caching is enabled
+        dit_id: Node ID for DiT model lookup
+        vae_id: Node ID for VAE model lookup
+        dit_model: Requested DiT model filename for validation
+        vae_model: Requested VAE model filename for validation
+        debug: Debug instance for logging
+        
+    Returns:
+        Dict[str, Any]: Cache context dictionary containing:
+            - global_cache: GlobalModelCache instance
+            - dit_cache: DiT caching enabled flag
+            - vae_cache: VAE caching enabled flag
+            - dit_id: DiT node ID
+            - vae_id: VAE node ID
+            - dit_model: DiT model name
+            - vae_model: VAE model name
+            - cached_dit: Cached DiT model instance (if found and valid)
+            - cached_vae: Cached VAE model instance (if found and valid)
+            - dit_newly_cached: Flag indicating if DiT was just cached
+            - vae_newly_cached: Flag indicating if VAE was just cached
+            - reusing_runner: Flag indicating if runner template is reused
+            
+    Note:
+        Automatically removes stale cache entries when model names don't match
+        the cached model's stored name (_model_name attribute).
+    """
+    global_cache = get_global_cache()
+    context = {
+        'global_cache': global_cache,
+        'dit_cache': dit_cache,
+        'vae_cache': vae_cache,
+        'dit_id': dit_id,
+        'vae_id': vae_id,
+        'dit_model': dit_model,
+        'vae_model': vae_model,
+        'cached_dit': None,
+        'cached_vae': None,
+        'dit_newly_cached': False,
+        'vae_newly_cached': False,
+        'reusing_runner': False
+    }
+    
+    # Check for cached DiT model with model name validation
+    # Model name validation prevents stale cache when user switches models in UI
+    if dit_cache and dit_model and dit_id is not None:
+        cached_model = global_cache.get_dit({'node_id': dit_id, 'cache_in_ram': True}, debug)
+        if cached_model:
+            # Verify cached model matches requested model by checking _model_name attribute
+            cached_model_name = getattr(cached_model, '_model_name', None)
+            if cached_model_name == dit_model:
+                # Cache hit with valid model - reuse it
+                context['cached_dit'] = cached_model
+            else:
+                # Model changed - remove stale cache and log the change
+                if cached_model_name:
+                    debug.log(f"DiT model changed in cache ({cached_model_name} → {dit_model}), "
+                             f"removing stale cached model", category="cache", force=True)
+                global_cache.remove_dit({'node_id': dit_id}, debug)
+    else:
+        # Caching disabled or no ID - clean up any existing cache for this node
+        if dit_id is not None:
+            global_cache.remove_dit({'node_id': dit_id}, debug)
+
+    # Check for cached VAE model with model name validation
+    if vae_cache and vae_model and vae_id is not None:
+        cached_model = global_cache.get_vae({'node_id': vae_id, 'cache_in_ram': True}, debug)
+        if cached_model:
+            # Verify cached model matches requested model by checking _model_name attribute
+            cached_model_name = getattr(cached_model, '_model_name', None)
+            if cached_model_name == vae_model:
+                context['cached_vae'] = cached_model
+            else:
+                # Model changed - remove stale cache and log the change
+                if cached_model_name:
+                    debug.log(f"VAE model changed in cache ({cached_model_name} → {vae_model}), "
+                             f"removing stale cached model", category="cache", force=True)
+                global_cache.remove_vae({'node_id': vae_id}, debug)
+    else:
+        if vae_id is not None:
+            global_cache.remove_vae({'node_id': vae_id}, debug)
+    
+    return context
+
+
+def _acquire_runner(
+    cache_context: Dict[str, Any],
+    dit_model: str,
+    vae_model: str,
+    base_cache_dir: str,
+    debug: Debug
+) -> VideoDiffusionInfer:
+    """
+    Get or create VideoDiffusionInfer runner instance using unified caching approach.
+    
+    Checks global cache for existing runner template matching the DiT/VAE node ID pair.
+    If found and model names match, reuses the template. Otherwise creates new runner.
+    
+    Args:
+        cache_context: Cache context dict from _initialize_cache_context containing:
+            - global_cache: GlobalModelCache instance
+            - dit_id: DiT node ID for cache lookup
+            - vae_id: VAE node ID for cache lookup
+            - reusing_runner: Flag to be updated if template is reused
+        dit_model: DiT model filename for validation (e.g., "seedvr2_ema_3b_fp16.safetensors")
+        vae_model: VAE model filename for validation (e.g., "ema_vae_fp16.safetensors")
+        base_cache_dir: Base directory for model files
+        debug: Debug instance for logging
+        
+    Returns:
+        VideoDiffusionInfer: Runner instance (cached template or newly created)
+    """
+    # Try to get runner template from global cache
+    template = cache_context['global_cache'].get_runner(
+        cache_context['dit_id'], cache_context['vae_id'], debug
+    )
+    
+    if template:
+        # We have a template - check if we can use it
+        current_dit = getattr(template, '_dit_model_name', None)
+        current_vae = getattr(template, '_vae_model_name', None)
+        models_match = (current_dit == dit_model and current_vae == vae_model)
+        
+        if models_match:
+            # Perfect match - reuse template directly
+            runner_key = f"{cache_context['dit_id']}+{cache_context['vae_id']}"
+            debug.log(f"Reusing cached runner template: nodes {runner_key}", category="reuse", force=True)
+            cache_context['reusing_runner'] = True
+            return template
+        else:
+            # Template exists but models changed and no cached models - create new
+            return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
+    else:
+        # No template - create new runner
+        return _create_new_runner(dit_model, vae_model, base_cache_dir, debug)
+
+
+def _create_new_runner(
+    dit_model: str,
+    vae_model: str,
+    base_cache_dir: str,
+    debug: Debug
+) -> VideoDiffusionInfer:
+    """
+    Create a new VideoDiffusionInfer runner instance from scratch.
+    
+    Loads appropriate configuration file based on model size (3B or 7B), creates
+    runner instance, and initializes with default settings. Called when no cached
+    runner template is available or when model selection changes.
+    
+    Args:
+        dit_model: DiT model filename (determines config selection)
+                  - Contains "7b" → loads configs_7b/main.yaml
+                  - Otherwise → loads configs_3b/main.yaml
+        vae_model: VAE model filename (stored for reference, not used in config selection)
+        base_cache_dir: Base directory for model files (not used directly but passed for context)
+        debug: Debug instance for logging and timing
+        
+    Returns:
+        VideoDiffusionInfer: Newly created runner with:
+            - Loaded OmegaConf configuration
+            - Initialized diffusion sampler and schedule
+            - Config set to mutable (readonly=False)
+            - No models loaded (structure only)
+    """
     debug.log(f"Creating new runner: DiT={dit_model}, VAE={vae_model}", 
              category="runner", force=True)
     
-    # If we reach here, create a new runner
     debug.start_timer("config_load")
-
-    # Select config based on model type   
-    if "7b" in dit_model:
-        config_path = os.path.join(script_directory, './configs_7b', 'main.yaml')
-    else:
-        config_path = os.path.join(script_directory, './configs_3b', 'main.yaml')
-    
+    config_path = os.path.join(script_directory, 
+                              './configs_7b' if "7b" in dit_model else './configs_3b', 
+                              'main.yaml')
     config = load_config(config_path)
     debug.end_timer("config_load", "Config loading")
-
-    # Load and configure VAE with additional parameters
-    vae_config_path = os.path.join(script_directory, 'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
-    debug.start_timer("vae_config_load")
-    vae_config = OmegaConf.load(vae_config_path)
-    debug.end_timer("vae_config_load", "VAE configuration YAML parsed from disk")
-    
-    debug.start_timer("vae_config_set")
-    # Configure VAE parameters
-    spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
-    temporal_downsample_factor = vae_config.get('temporal_downsample_factor', 4)
-    vae_config.spatial_downsample_factor = spatial_downsample_factor
-    vae_config.temporal_downsample_factor = temporal_downsample_factor
-    debug.end_timer("vae_config_set", f"VAE downsample factors configuration")
-    
-    # Merge additional VAE config with main config (preserving __object__ from main config)
-    debug.start_timer("vae_config_merge")
-    config.vae.model = OmegaConf.merge(config.vae.model, vae_config)
-    debug.end_timer("vae_config_merge", "VAE config merged with main pipeline config")
     
     debug.start_timer("runner_video_infer")
-    # Create runner
-    runner = VideoDiffusionInfer(config, debug, 
-                                encode_tiled=encode_tiled, 
-                                encode_tile_size=encode_tile_size, 
-                                encode_tile_overlap=encode_tile_overlap,
-                                decode_tiled=decode_tiled,
-                                decode_tile_size=decode_tile_size,
-                                decode_tile_overlap=decode_tile_overlap)
+    runner = VideoDiffusionInfer(config, debug)
     OmegaConf.set_readonly(runner.config, False)
-    runner._dit_compile_args = torch_compile_args_dit
-    runner._vae_compile_args = torch_compile_args_vae
     debug.end_timer("runner_video_infer", "Video diffusion inference runner initialization")
     
-    # Set device
-    device = str(get_device())
-    #if torch.mps.is_available():
-    #    device = "mps"
+    return runner
+
+
+def _configure_runner_settings(
+    runner: VideoDiffusionInfer,
+    encode_tiled: bool,
+    encode_tile_size: Optional[Tuple[int, int]],
+    encode_tile_overlap: Optional[Tuple[int, int]],
+    decode_tiled: bool,
+    decode_tile_size: Optional[Tuple[int, int]],
+    decode_tile_overlap: Optional[Tuple[int, int]],
+    torch_compile_args_dit: Optional[Dict[str, Any]],
+    torch_compile_args_vae: Optional[Dict[str, Any]],
+    block_swap_config: Optional[Dict[str, Any]],
+    debug: Debug
+) -> None:
+    """
+    Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
     
+    Stores configuration settings on runner for later comparison and application.
+    Settings are stored in temporary "_new_*" attributes and later validated/applied
+    in _setup_models phase. This separation allows configuration change detection
+    when reusing cached models.
+    
+    Args:
+        runner: VideoDiffusionInfer instance to configure
+        encode_tiled: Enable tiled VAE encoding to reduce VRAM during encoding
+        encode_tile_size: Tile dimensions (height, width) for encoding in pixels
+        encode_tile_overlap: Overlap dimensions (height, width) between encoding tiles
+        decode_tiled: Enable tiled VAE decoding to reduce VRAM during decoding
+        decode_tile_size: Tile dimensions (height, width) for decoding in pixels
+        decode_tile_overlap: Overlap dimensions (height, width) between decoding tiles
+        torch_compile_args_dit: torch.compile configuration for DiT model or None
+        torch_compile_args_vae: torch.compile configuration for VAE model or None
+        block_swap_config: BlockSwap configuration for DiT model or None
+        debug: Debug instance (stored on runner for model access)
+    """
+    # VAE tiling settings
+    runner.encode_tiled = encode_tiled
+    runner.encode_tile_size = encode_tile_size
+    runner.encode_tile_overlap = encode_tile_overlap
+    runner.decode_tiled = decode_tiled
+    runner.decode_tile_size = decode_tile_size
+    runner.decode_tile_overlap = decode_tile_overlap
+    
+    # Store the new configs temporarily for later comparison
+    # Don't set them as attributes yet - let the update functions handle that
+    runner._new_dit_compile_args = torch_compile_args_dit
+    runner._new_vae_compile_args = torch_compile_args_vae
+    runner._new_dit_block_swap_config = block_swap_config
+    runner._new_vae_tiling_config = {
+        'encode_tiled': encode_tiled,
+        'encode_tile_size': encode_tile_size,
+        'encode_tile_overlap': encode_tile_overlap,
+        'decode_tiled': decode_tiled,
+        'decode_tile_size': decode_tile_size,
+        'decode_tile_overlap': decode_tile_overlap
+    }
+    
+    runner.debug = debug
+
+
+def _setup_models(
+    runner: VideoDiffusionInfer,
+    cache_context: Dict[str, Any],
+    dit_model: str,
+    vae_model: str,
+    base_cache_dir: str,
+    block_swap_config: Optional[Dict[str, Any]],
+    debug: Debug
+) -> None:
+    """
+    Setup DiT and VAE models from cache or create new structures.
+    
+    Central orchestration function that:
+    1. Sets up DiT model (cached or new structure)
+    2. Sets up VAE model (cached or new structure)
+    3. Validates and updates configurations for cached models
+    4. Stores initial configurations for new models
+    5. Cleans up temporary configuration attributes
+    
+    This function coordinates the complex interaction between model caching,
+    configuration management, and the meta device initialization strategy.
+    
+    Args:
+        runner: VideoDiffusionInfer instance to setup
+        cache_context: Cache context from _initialize_cache_context with keys:
+            - cached_dit, cached_vae: Cached model instances (or None)
+            - dit_id, vae_id: Node IDs for caching
+            - Other cache state flags
+        dit_model: DiT model filename for loading/validation
+        vae_model: VAE model filename for loading/validation
+        base_cache_dir: Base directory containing model files
+        block_swap_config: BlockSwap configuration (passed to DiT setup)
+        debug: Debug instance for logging and timing
+    """
     debug.start_timer("model_structures")
-    # Prepare DiT structure
-    dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
-    runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, config, 
-                                    block_swap_config, debug)
     
-    # Set VAE dtype for MPS compatibility
-    if torch.mps.is_available():
-        original_vae_dtype = config.vae.dtype
-        config.vae.dtype = "bfloat16"
-        debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {config.vae.dtype} for compatibility", 
-                    category="precision", force=True)
+    # Setup DiT
+    dit_created = _setup_dit_model(runner, cache_context, dit_model, base_cache_dir, 
+                                   block_swap_config, debug)
     
-    # Prepare VAE structure
-    vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
-    runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, config, 
-                                    None, debug)
+    # Only update DiT config if model was cached/reused (not newly created)
+    if not dit_created and hasattr(runner, 'dit') and runner.dit is not None:
+        _update_dit_config(runner, runner._new_dit_block_swap_config, 
+                         runner._new_dit_compile_args, debug)
+    elif dit_created:
+        # For newly created models, just set initial config attributes (no comparison needed)
+        runner._dit_compile_args = runner._new_dit_compile_args
+        runner._dit_block_swap_config = runner._new_dit_block_swap_config
+        # Also store on model so config travels with the model when cached
+        if hasattr(runner, 'dit') and runner.dit:
+            runner.dit._config_compile = runner._new_dit_compile_args
+            runner.dit._config_swap = runner._new_dit_block_swap_config
     
-    debug.log(f"VAE downsample factors configured (spatial: {spatial_downsample_factor}x, temporal: {temporal_downsample_factor}x)", category="vae")
+    # Setup VAE
+    vae_created = _setup_vae_model(runner, cache_context, vae_model, base_cache_dir, debug)
+    
+    # Only update VAE config if model was cached/reused (not newly created)
+    if not vae_created and hasattr(runner, 'vae') and runner.vae is not None:
+        _update_vae_config(runner, runner._new_vae_compile_args, debug)
+    elif vae_created:
+        # For newly created models, just set initial config attributes (no comparison needed)
+        runner._vae_compile_args = runner._new_vae_compile_args
+        runner._vae_tiling_config = runner._new_vae_tiling_config
+        # Also store on model so config travels with the model when cached
+        if hasattr(runner, 'vae') and runner.vae:
+            runner.vae._config_compile = runner._new_vae_compile_args
+            runner.vae._config_tiling = runner._new_vae_tiling_config
+    
+    # Clean up temporary attributes
+    for attr in ['_new_dit_compile_args', '_new_vae_compile_args', '_new_dit_block_swap_config', '_new_vae_tiling_config']:
+        if hasattr(runner, attr):
+            delattr(runner, attr)
     
     debug.end_timer("model_structures", "Model structures prepared")
+
+
+def _setup_dit_model(
+    runner: VideoDiffusionInfer,
+    cache_context: Dict[str, Any],
+    dit_model: str,
+    base_cache_dir: str,
+    block_swap_config: Optional[Dict[str, Any]],
+    debug: Debug
+) -> bool:
+    """
+    Setup DiT model from cache or create new meta device structure.
     
-    debug.start_timer("vae_memory_limit")
-    if hasattr(runner.vae, "set_memory_limit"):
-        runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
-    debug.end_timer("vae_memory_limit", "VAE memory limit set")
+    Handles three scenarios:
+    1. Model changed: Cleanup old model, create new structure
+    2. Cached model available: Reuse cached model, restore config
+    3. No model exists: Create new meta device structure
     
-    # Store debug instance on runner for consistent access
-    runner.debug = debug
+    Args:
+        runner: VideoDiffusionInfer instance to setup
+        cache_context: Cache context dict with keys:
+            - cached_dit: Cached DiT model instance (or None)
+            - dit_id: Node ID for cache operations
+        dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
+        base_cache_dir: Base directory containing model files
+        block_swap_config: BlockSwap configuration to store (not applied here)
+        debug: Debug instance for logging
+        
+    Returns:
+        bool: True if new model structure was created, False if cached model reused
+    """
     
-    return runner
+    # Check if model changed - clean up old model if different
+    current_dit_name = getattr(runner, '_dit_model_name', None)
+    if current_dit_name and current_dit_name != dit_model:
+        if hasattr(runner, 'dit') and runner.dit is not None:
+            debug.log(f"DiT model changed ({current_dit_name} → {dit_model}), cleaning old model", 
+                     category="cache", force=True)
+            cleanup_dit(runner=runner, debug=debug, keep_model_in_ram=False)
+    
+    if cache_context['cached_dit'] is not None:
+        # Reuse cached DiT model
+        debug.log(f"Reusing cached DiT ({cache_context['dit_id']}): {dit_model}", 
+                category="reuse", force=True)
+        runner.dit = cache_context['cached_dit']
+        runner._dit_checkpoint = find_model_file(dit_model, base_cache_dir)
+        runner._dit_model_name = dit_model
+        
+        # Restore config attributes from model to runner (config travels with model)
+        runner._dit_compile_args = getattr(runner.dit, '_config_compile', None)
+        runner._dit_block_swap_config = getattr(runner.dit, '_config_swap', None)
+        
+        # blockswap_active will be set by apply_block_swap_to_dit
+        # when the model is materialized to the inference device
+        runner._blockswap_active = False
+        
+        return False
+    elif not hasattr(runner, 'dit') or runner.dit is None:
+        # Create new DiT model
+        dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
+        runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
+                                        runner.config, block_swap_config, debug)
+        runner._dit_model_name = dit_model
+        return True
+    else:
+        # Model already exists from previous run with same runner
+        runner._dit_model_name = dit_model
+        return False
+
+
+def _setup_vae_model(
+    runner: VideoDiffusionInfer,
+    cache_context: Dict[str, Any],
+    vae_model: str,
+    base_cache_dir: str,
+    debug: Debug
+) -> bool:
+    """
+    Setup VAE model from cache or create new meta device structure.
+    
+    Handles three scenarios:
+    1. Model changed: Cleanup old model, configure and create new structure
+    2. Cached model available: Reuse cached model, restore config
+    3. No model exists: Configure VAE settings, create new meta device structure
+    
+    Args:
+        runner: VideoDiffusionInfer instance to setup
+        cache_context: Cache context dict with keys:
+            - cached_vae: Cached VAE model instance (or None)
+            - vae_id: Node ID for cache operations
+        vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
+        base_cache_dir: Base directory containing model files
+        debug: Debug instance for logging
+        
+    Returns:
+        bool: True if new model structure was created, False if cached model reused
+    """
+    
+    # Check if model changed - clean up old model if different
+    current_vae_name = getattr(runner, '_vae_model_name', None)
+    if current_vae_name and current_vae_name != vae_model:
+        if hasattr(runner, 'vae') and runner.vae is not None:
+            debug.log(f"VAE model changed ({current_vae_name} → {vae_model}), cleaning old model", 
+                     category="cache", force=True)
+            cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=False)
+    
+    if cache_context['cached_vae'] is not None:
+        # Reuse cached VAE model
+        debug.log(f"Reusing cached VAE ({cache_context['vae_id']}): {vae_model}", 
+                category="reuse", force=True)
+        runner.vae = cache_context['cached_vae']
+        runner._vae_checkpoint = find_model_file(vae_model, base_cache_dir)
+        runner._vae_model_name = vae_model
+        
+        # Restore config attributes from model to runner (config travels with model)
+        runner._vae_compile_args = getattr(runner.vae, '_config_compile', None)
+        runner._vae_tiling_config = getattr(runner.vae, '_config_tiling', None)
+        
+        return False
+    elif not hasattr(runner, 'vae') or runner.vae is None:
+        # Create new VAE model
+        # Configure VAE
+        vae_config_path = os.path.join(script_directory, 
+                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
+        vae_config = load_config(vae_config_path)
+        
+        spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
+        temporal_downsample_factor = vae_config.get('temporal_downsample_factor', 4)
+        vae_config.spatial_downsample_factor = spatial_downsample_factor
+        vae_config.temporal_downsample_factor = temporal_downsample_factor
+
+        runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
+        
+        if torch.mps.is_available():
+            original_vae_dtype = runner.config.vae.dtype
+            runner.config.vae.dtype = "bfloat16"
+            debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {runner.config.vae.dtype} for compatibility", 
+                    category="precision", force=True)
+        
+        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+        runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
+                                        runner.config, None, debug)
+        
+        debug.log(
+            f"VAE downsample factors configured "
+            f"(spatial: {spatial_downsample_factor}x, "
+            f"temporal: {temporal_downsample_factor}x)",
+            category="vae"
+        )
+
+        runner._vae_model_name = vae_model
+        return True
+    else:
+        # Model already exists from previous run with same runner
+        runner._vae_model_name = vae_model
+        return False
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: Optional[Debug] = None) -> Dict[str, torch.Tensor]:
@@ -1019,7 +1427,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
         return
     
     # Determine target device
-    blockswap_active = is_dit and block_swap_config and block_swap_config.get("blocks_to_swap", 0) > 0
+    # For DiT, check if BlockSwap is active; for VAE, blockswap is never active
+    blockswap_active = is_dit and hasattr(runner, '_blockswap_active') and runner._blockswap_active
     use_cpu = preserve_vram or blockswap_active
     target_device = "cpu" if use_cpu else device
     
@@ -1041,7 +1450,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
                                model_type_upper, cpu_reason, debug, override_dtype) 
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
-    model = _apply_model_specific_config(model, runner, config, is_dit, debug)
+    model = apply_model_specific_config(model, runner, config, is_dit, debug)
     
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
@@ -1475,13 +1884,17 @@ def _initialize_meta_buffers(model: torch.nn.Module, target_device: str, debug: 
     return initialized_count
 
 
-def _apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionInfer, 
+def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionInfer, 
                                 config: OmegaConf, is_dit: bool, 
                                 debug: Optional[Debug]) -> torch.nn.Module:
     """
-    Apply model-specific configurations and attach to runner.
+    Apply model-specific configurations (FP8, BlockSwap, torch.compile).
     
-    For DiT, BlockSwap must be applied BEFORE torch.compile.
+    This function is idempotent and can be safely called on both newly materialized
+    and already-configured models. It checks state flags to determine what needs
+    to be applied.
+    
+    Critical: For DiT, BlockSwap must be applied BEFORE torch.compile.
     torch.compile captures the computational graph, so any wrapping done
     after compilation (like BlockSwap's forward wrapping) won't work.
     
@@ -1496,49 +1909,81 @@ def _apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionI
         Configured model with BlockSwap and torch.compile applied if configured
     """
     if is_dit:
-        # DiT-specific: Apply FP8 compatibility wrapper
+        # DiT-specific
+        # Apply FP8 compatibility wrapper 
         if not isinstance(model, FP8CompatibleDiT):
             debug.log("Applying FP8/RoPE compatibility wrapper to DiT model", category="setup")
             debug.start_timer("FP8CompatibleDiT")
             model = FP8CompatibleDiT(model, skip_conversion=False, debug=debug)
             debug.end_timer("FP8CompatibleDiT", "FP8/RoPE compatibility wrapper application")
-        
-        # Apply BlockSwap BEFORE torch.compile
+        else:
+            debug.log("Reusing existing FP8/RoPE compatibility wrapper", category="reuse")
+
+        # Apply BlockSwap before torch.compile (only if not already active)
         # BlockSwap wraps forward methods, and torch.compile needs to capture the wrapped version
         if hasattr(runner, '_dit_block_swap_config') and runner._dit_block_swap_config:
-            runner.dit = model
-            apply_block_swap_to_dit(runner, runner._dit_block_swap_config, debug)
+            # Check if BlockSwap needs to be applied
+            needs_blockswap = not (hasattr(runner, '_blockswap_active') and runner._blockswap_active)
+            if needs_blockswap:
+                runner.dit = model
+                apply_block_swap_to_dit(runner, runner._dit_block_swap_config, debug)
+                # Mark as active after successful application
+                runner._blockswap_active = True
         
-        # Apply torch.compile AFTER BlockSwap so it compiles the wrapped forwards
+        # Apply torch.compile after BlockSwap (only if not already compiled)
+        # Check: model has _orig_mod attribute means it's already torch.compiled
         if hasattr(runner, '_dit_compile_args') and runner._dit_compile_args:
-            model = _apply_torch_compile(model, runner._dit_compile_args, "DiT", debug)
+            if not hasattr(model, '_orig_mod'):
+                model = _apply_torch_compile(model, runner._dit_compile_args, "DiT", debug)
         
         runner.dit = model
+
+        # Clear the config application flag after successful application
+        if hasattr(runner, '_dit_config_needs_application'):
+            runner._dit_config_needs_application = False
         
     else:
         # VAE-specific configurations
-        
         # Set to eval mode (no gradients needed for inference)
-        debug.log("VAE model set to eval mode (gradients disabled)", category="vae")
-        debug.start_timer("model_requires_grad")
-        model.requires_grad_(False).eval()
-        debug.end_timer("model_requires_grad", "VAE model set to eval mode")
+        if model.training:
+            debug.log("VAE model set to eval mode (gradients disabled)", category="vae")
+            debug.start_timer("model_requires_grad")
+            model.requires_grad_(False).eval()
+            debug.end_timer("model_requires_grad", "VAE model set to eval mode")
         
-        # Configure causal slicing if available
+        # Configure causal slicing if available - always apply as it's lightweight
         if hasattr(model, "set_causal_slicing") and hasattr(config.vae, "slicing"):
             debug.log("Configuring VAE causal slicing for temporal processing", category="vae")
             debug.start_timer("vae_set_causal_slicing")
             model.set_causal_slicing(**config.vae.slicing)
             debug.end_timer("vae_set_causal_slicing", "VAE causal slicing configuration")
         
-        # Apply torch.compile if configured
+        # Set memory limits if available - always apply to ensure limits are set
+        if hasattr(model, "set_memory_limit") and hasattr(config.vae, "memory_limit"):
+            debug.log("Configuring VAE memory limits for causal convolutions", category="vae")
+            debug.start_timer("vae_set_memory_limit")
+            model.set_memory_limit(**config.vae.memory_limit)
+            debug.end_timer("vae_set_memory_limit", "VAE memory limits configured")
+
+        # Apply torch.compile if configured (only if not already compiled)
         if hasattr(runner, '_vae_compile_args') and runner._vae_compile_args:
-            model = _apply_vae_submodule_compile(model, runner._vae_compile_args, debug)
+            # Check if encoder/decoder already compiled (have _orig_mod)
+            encoder_compiled = hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod')
+            decoder_compiled = hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod')
+            
+            if not (encoder_compiled and decoder_compiled):
+                model = _apply_vae_submodule_compile(model, runner._vae_compile_args, debug)
+            else:
+                debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")
         
         # Propagate debug instance to submodules
         model.debug = debug
         _propagate_debug_to_modules(model, debug)
         runner.vae = model
+        
+        # Clear the config application flag after successful application
+        if hasattr(runner, '_vae_config_needs_application'):
+            runner._vae_config_needs_application = False
     
     return model
 

@@ -337,14 +337,16 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     model_dir = shared_args["model_dir"]
     model_name = shared_args["model"]
 
-    runner, _ = prepare_runner(
+    runner, _, _ = prepare_runner(
         dit_model=model_name,
         vae_model=DEFAULT_VAE,
         model_dir=model_dir,
         preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug,
-        cache_model_dit=False,
-        cache_model_vae=False,
+        dit_cache=False, # No caching in CLI
+        vae_cache=False, # No caching in CLI
+        dit_id=None,  # No caching in CLI
+        vae_id=None,  # No caching in CLI
         block_swap_config=shared_args["block_swap_config"],
         encode_tiled=shared_args["vae_encode_tiling_enabled"],
         encode_tile_size=shared_args["vae_encode_tile_size"],
@@ -353,8 +355,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         decode_tile_size=shared_args["vae_decode_tile_size"],
         decode_tile_overlap=shared_args["vae_decode_tile_overlap"],
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae,
-        cached_runner=None  # No caching in worker processes
+        torch_compile_args_vae=torch_compile_args_vae
     )
 
     # Phase 1: Encode all batches
@@ -382,7 +383,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         cfg_scale=shared_args["cfg_scale"],
         seed=shared_args["seed"],
         latent_noise_scale=shared_args["latent_noise_scale"],
-        cache_model=False
+        cache_model=False # No caching in CLI
     )
 
     # Phase 3: Decode all batches
@@ -392,7 +393,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug, 
         progress_callback=None,
-        cache_model=shared_args["cache_model"]
+        cache_model=False # No caching in CLI
     )
     
     # Phase 4: Post-processing and final assembly
@@ -454,9 +455,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "temporal_overlap": args.temporal_overlap,
         "block_swap_config": {
             'blocks_to_swap': args.blocks_to_swap,
-            'use_none_blocking': args.use_none_blocking,
             'swap_io_components': args.swap_io_components,
-            'cache_model': False,
         },
         "vae_encode_tiling_enabled": args.vae_encode_tiling_enabled,
         "vae_encode_tile_size": args.vae_encode_tile_size,

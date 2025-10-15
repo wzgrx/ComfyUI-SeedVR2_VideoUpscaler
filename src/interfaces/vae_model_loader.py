@@ -78,6 +78,9 @@ class SeedVR2LoadVAEModel:
                 "torch_compile_args": ("TORCH_COMPILE_ARGS", {
                     "tooltip": "Optional torch.compile settings from SeedVR2 Torch Compile Settings node for speedup"
                 }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
             }
         }
     
@@ -93,7 +96,8 @@ class SeedVR2LoadVAEModel:
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, cache_in_ram: bool = False,
-                     torch_compile_args: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
+                     torch_compile_args: Dict[str, Any] = None, unique_id: int = 0
+                     ) -> Tuple[Dict[str, Any]]:
         """
         Create VAE model configuration for SeedVR2 main node
         
@@ -108,6 +112,7 @@ class SeedVR2LoadVAEModel:
             decode_tile_overlap: Tile overlap for decoding
             cache_in_ram: Whether to keep model in RAM between runs
             torch_compile_args: Optional torch.compile configuration from settings node
+            unique_id: Node instance ID for caching
             
         Returns:
             Tuple containing configuration dictionary for SeedVR2 main node
@@ -123,5 +128,6 @@ class SeedVR2LoadVAEModel:
             "decode_tile_overlap": decode_tile_overlap,
             "cache_in_ram": cache_in_ram,
             "torch_compile_args": torch_compile_args,
+            "node_id": unique_id,
         }
         return (config,)

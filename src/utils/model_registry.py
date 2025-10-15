@@ -4,7 +4,7 @@ Central registry for model definitions, repositories, and metadata
 """
 
 import os
-from typing import Dict, List, Optional, Any
+from typing import List, Optional
 from dataclasses import dataclass
 from .constants import get_all_model_files
 
@@ -28,7 +28,7 @@ class ModelInfo:
     precision: str = "fp16"  # 'fp16', 'fp8_e4m3fn', 'Q4_K_M', etc.
     size: str = "3B"  # '3B', '7B', etc.
     variant: Optional[str] = None  # 'sharp', etc.
-    sha256: Optional[str] = None  # Add this field for cached hash
+    sha256: Optional[str] = None  # Cached hash
 
 # Model registry with metadata
 MODEL_REGISTRY = {

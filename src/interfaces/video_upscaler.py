@@ -11,6 +11,7 @@ from ..utils.downloads import download_weight
 from ..utils.debug import Debug
 from ..core.generation import (
     setup_device_environment,
+    setup_video_transform,
     prepare_generation_context, 
     prepare_runner,
     encode_all_batches, 
@@ -167,8 +168,10 @@ class SeedVR2VideoUpscaler:
         vae_model = vae["model"]
         dit_device = dit["device"]
         vae_device = vae["device"]
-        cache_model_dit = dit["cache_in_ram"]
-        cache_model_vae = vae["cache_in_ram"]
+        dit_cache = dit["cache_in_ram"]
+        vae_cache = vae["cache_in_ram"]
+        dit_id = dit.get("node_id")
+        vae_id = vae.get("node_id")
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
@@ -221,23 +224,37 @@ class SeedVR2VideoUpscaler:
 
         cfg_scale = 1.0
         try:
-            # Detect input format and handle alpha channel convention
-            if pixels.shape[-1] == 4:
-                # RGBA detected: ComfyUI inverts alpha when loading images
-                # (ComfyUI mask convention: 1=hidden, 0=visible vs standard alpha: 1=opaque, 0=transparent)
-                # Invert alpha in-place: multiply by -1 then add 1 (equivalent to 1.0 - alpha)
-                debug.log("RGBA input detected - inverting alpha channel to match mask convention", category="info")
-                pixels[..., 3].mul_(-1).add_(1)
-            
-            return self._internal_execute(pixels, dit_model, vae_model, seed, new_resolution, cfg_scale, 
-                                        batch_size, color_correction, input_noise_scale, latent_noise_scale, 
-                                        encode_tiled, encode_tile_size, encode_tile_overlap, 
-                                        decode_tiled, decode_tile_size, decode_tile_overlap, 
-                                        preserve_vram, temporal_overlap, 
-                                        cache_model_dit, cache_model_vae, dit_device, vae_device, 
-                                        dit_torch_compile_args, vae_torch_compile_args, block_swap_config)
+            return self._internal_execute(
+                pixels=pixels,
+                dit_model=dit_model,
+                vae_model=vae_model,
+                seed=seed,
+                new_resolution=new_resolution,
+                cfg_scale=cfg_scale,
+                batch_size=batch_size,
+                color_correction=color_correction,
+                input_noise_scale=input_noise_scale,
+                latent_noise_scale=latent_noise_scale,
+                encode_tiled=encode_tiled,
+                encode_tile_size=encode_tile_size,
+                encode_tile_overlap=encode_tile_overlap,
+                decode_tiled=decode_tiled,
+                decode_tile_size=decode_tile_size,
+                decode_tile_overlap=decode_tile_overlap,
+                preserve_vram=preserve_vram,
+                temporal_overlap=temporal_overlap,
+                dit_cache=dit_cache,
+                vae_cache=vae_cache,
+                dit_id=dit_id,
+                vae_id=vae_id,
+                dit_device=dit_device,
+                vae_device=vae_device,
+                dit_torch_compile_args=dit_torch_compile_args,
+                vae_torch_compile_args=vae_torch_compile_args,
+                block_swap_config=block_swap_config
+            )
         except Exception as e:
-            self.cleanup(cache_model_dit=cache_model_dit, cache_model_vae=cache_model_vae, debug=debug)
+            self.cleanup(dit_cache=dit_cache, vae_cache=vae_cache, debug=debug)
             raise e
 
     def _internal_execute(
@@ -260,8 +277,10 @@ class SeedVR2VideoUpscaler:
         decode_tile_overlap: int, 
         preserve_vram: bool, 
         temporal_overlap: int, 
-        cache_model_dit: bool, 
-        cache_model_vae: bool, 
+        dit_cache: bool, 
+        vae_cache: bool, 
+        dit_id: int,
+        vae_id: int,
         dit_device: str, 
         vae_device: str,
         dit_torch_compile_args: Optional[Dict[str, Any]], 
@@ -296,8 +315,10 @@ class SeedVR2VideoUpscaler:
             decode_tile_overlap: VAE decoding tile overlap in pixels
             preserve_vram: Offload models between phases
             temporal_overlap: Overlap frames between batches (fixed at 0)
-            cache_model_dit: Keep DiT model in RAM after use
-            cache_model_vae: Keep VAE model in RAM after use
+            dit_cache: Keep DiT model in RAM after use
+            vae_cache: Keep VAE model in RAM after use
+            dit_id: Node instance ID for DiT model caching
+            vae_id: Node instance ID for VAE model caching
             dit_device: Device string for DiT model
             vae_device: Device string for VAE model
             dit_torch_compile_args: Optional torch.compile settings for DiT
@@ -335,15 +356,17 @@ class SeedVR2VideoUpscaler:
         ctx = prepare_generation_context(dit_device=dit_device, vae_device=vae_device, debug=debug)
         self.ctx = ctx
 
-        # Prepare runner with model state management
-        self.runner, model_changed = prepare_runner(
+        # Prepare runner with model state management and global cache
+        self.runner, model_changed, cache_context = prepare_runner(
             dit_model=dit_model, 
             vae_model=vae_model, 
             model_dir=get_base_cache_dir(),
             preserve_vram=preserve_vram,
             debug=debug,
-            cache_model_dit=cache_model_dit,
-            cache_model_vae=cache_model_vae,
+            dit_cache=dit_cache,
+            vae_cache=vae_cache,
+            dit_id=dit_id,
+            vae_id=vae_id,
             block_swap_config=block_swap_config,
             encode_tiled=encode_tiled,
             encode_tile_size=(encode_tile_size, encode_tile_size),
@@ -352,11 +375,13 @@ class SeedVR2VideoUpscaler:
             decode_tile_size=(decode_tile_size, decode_tile_size),
             decode_tile_overlap=(decode_tile_overlap, decode_tile_overlap),
             torch_compile_args_dit=dit_torch_compile_args,
-            torch_compile_args_vae=vae_torch_compile_args,
-            cached_runner=self.runner if (cache_model_dit or cache_model_vae) else None
+            torch_compile_args_vae=vae_torch_compile_args
         )
         self._dit_model_name = dit_model
         self._vae_model_name = vae_model
+        
+        # Store cache context in ctx for use in generation phases
+        ctx['cache_context'] = cache_context
 
         debug.log_memory_state("After model preparation", show_tensors=False, detailed_tensors=False)
         debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
@@ -371,19 +396,16 @@ class SeedVR2VideoUpscaler:
         channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
         
         # Create transform pipeline early and apply to first frame to get exact output dimensions
-        video_transform = prepare_video_transforms(new_resolution)
-        
+        setup_video_transform(ctx, new_resolution, debug)
+
         # Apply transform to first frame to get exact output dimensions (reusing actual transform logic)
         sample_frame = pixels[0].permute(2, 0, 1)  # HWC -> CHW for transform
         sample_frame = sample_frame.unsqueeze(0)  # Add time dimension: CHW -> TCHW (T=1)
-        transformed_sample = video_transform(sample_frame)  # Apply full pipeline
+        transformed_sample = ctx['video_transform'](sample_frame)  # Apply full pipeline
         # Transform outputs CTHW format, get dimensions from last two axes
         output_h, output_w = transformed_sample.shape[-2:]  # Get actual output size
         
         debug.log(f"  Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True)
-        
-        # Store transform in context for reuse during encoding (avoids recreating it)
-        ctx['video_transform'] = video_transform
 
         # Phase 1: Encode all batches
         ctx = encode_all_batches(
@@ -410,7 +432,7 @@ class SeedVR2VideoUpscaler:
             cfg_scale=cfg_scale, 
             seed=seed,
             latent_noise_scale=latent_noise_scale,
-            cache_model=cache_model_dit
+            cache_model=dit_cache
         )
 
         # Phase 3: Decode all batches
@@ -420,7 +442,7 @@ class SeedVR2VideoUpscaler:
             preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback,
-            cache_model=cache_model_vae
+            cache_model=vae_cache
         )
 
         # Phase 4: Post-processing and final assembly
@@ -445,7 +467,7 @@ class SeedVR2VideoUpscaler:
 
         # Final cleanup
         debug.start_timer("final_cleanup")
-        self.cleanup(cache_model_dit=cache_model_dit, cache_model_vae=cache_model_vae, debug=debug)
+        self.cleanup(dit_cache=dit_cache, vae_cache=vae_cache, debug=debug)
         debug.end_timer("final_cleanup", "Final cleanup")
 
         # Log final memory state after ALL cleanup is done by the phases
@@ -536,31 +558,26 @@ class SeedVR2VideoUpscaler:
         progress_value = int(overall_progress * 100)
         self._pbar.update_absolute(progress_value, 100)
 
-    def cleanup(self, cache_model_dit: bool = False, cache_model_vae: bool = False, 
+    def cleanup(self, dit_cache: bool = False, vae_cache: bool = False, 
                debug: Optional[Debug] = None) -> None:
         """
-        Cleanup runner and free memory
+        Cleanup resources after upscaling.
         
         Args:
-            cache_model_dit: If True, keep DiT model in RAM for future runs
-            cache_model_vae: If True, keep VAE model in RAM for future runs
-            debug: Optional debug instance for logging cleanup operations
+            dit_cache: If True, keep DiT model in RAM for reuse
+            vae_cache: If True, keep VAE model in RAM for reuse
+            debug: Debug instance (uses self.debug if not provided)
         """
-        # Clear progress bar if it exists
-        if hasattr(self, '_pbar') and self._pbar is not None:
-            self._pbar.update_absolute(0, 100)
-            self._pbar = None
-            
-        # Get debug from runner if not provided
+        # Use existing debug from runner if not provided
         if debug is None and self.runner and hasattr(self.runner, 'debug'):
             debug = self.runner.debug
         
         # Use complete_cleanup for all cleanup operations
         if self.runner:
-            complete_cleanup(runner=self.runner, debug=debug, keep_dit_in_ram=cache_model_dit, keep_vae_in_ram=cache_model_vae)
+            complete_cleanup(runner=self.runner, debug=debug, keep_dit_in_ram=dit_cache, keep_vae_in_ram=vae_cache)
             
             # Delete runner only if neither model is cached
-            if not (cache_model_dit or cache_model_vae):
+            if not (dit_cache or vae_cache):
                 del self.runner
                 self.runner = None
                 self._dit_model_name = ""
@@ -579,7 +596,7 @@ class SeedVR2VideoUpscaler:
             
             # Full cleanup
             if hasattr(self, 'cleanup'):
-                self.cleanup(cache_model_dit=False, cache_model_vae=False, debug=debug)
+                self.cleanup(dit_cache=False, vae_cache=False, debug=debug)
             
             # Clear all remaining references
             for attr in ['runner', '_model_name', 'debug', 'ctx']:

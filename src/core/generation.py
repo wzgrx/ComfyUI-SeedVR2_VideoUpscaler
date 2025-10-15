@@ -25,44 +25,43 @@ Key Features:
 import os
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable, Union
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ..utils.debug import Debug
-    from .infer import VideoDiffusionInfer
 from torchvision.transforms import Compose, Lambda, Normalize
 
-from ..utils.constants import get_script_directory
+from .alpha_upscaling import process_alpha_for_batch
+from .infer import VideoDiffusionInfer
+from .model_manager import configure_runner, materialize_model, apply_model_specific_config
 from ..common.distributed import get_device
-from .model_manager import configure_runner, materialize_model
+from ..common.seed import set_seed
+from ..data.image.transforms.divisible_crop import DivisibleCrop
+from ..data.image.transforms.na_resize import NaResize
 from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
-    complete_cleanup,
     clear_memory,
-    manage_model_device
+    manage_model_device,
+    release_tensor_memory,
+    release_tensor_collection
 )
 from ..optimization.performance import (
     optimized_video_rearrange, 
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
-from ..optimization.blockswap import apply_block_swap_to_dit
-from ..common.seed import set_seed
-from ..data.image.transforms.divisible_crop import DivisibleCrop
-from ..data.image.transforms.na_resize import NaResize
 from ..utils.color_fix import wavelet_reconstruction, adaptive_instance_normalization
-from ..utils.vae_rgba_adapter import adapt_vae_for_rgba, restore_vae_rgb_only
+from ..utils.constants import get_script_directory
+from ..utils.debug import Debug
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
 
-def prepare_video_transforms(res_w: int) -> Compose:
+def prepare_video_transforms(res_w: int, debug: Optional[Debug] = None) -> Compose:
     """
     Prepare optimized video transformation pipeline
     
     Args:
         res_w (int): Target resolution width
+        debug (Debug, optional): Debug instance for logging
         
     Returns:
         Compose: Configured transformation pipeline
@@ -72,6 +71,9 @@ def prepare_video_transforms(res_w: int) -> Compose:
         - Proper normalization for model compatibility
         - Memory-efficient tensor operations
     """
+    if debug:
+        debug.log(f"Initializing video transformation pipeline for {res_w}px", category="setup")
+    
     return Compose([
         NaResize(
             resolution=(res_w),
@@ -84,6 +86,23 @@ def prepare_video_transforms(res_w: int) -> Compose:
         Normalize(0.5, 0.5),
         Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w (faster than Rearrange)
     ])
+
+
+def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Debug) -> None:
+    """
+    Setup video transformation pipeline in context with consistent timing and logging.
+    
+    Args:
+        ctx: Generation context dictionary
+        res_w: Target resolution width
+        debug: Debug instance
+    """
+    if ctx.get('video_transform') is None:
+        debug.start_timer("video_transform")
+        ctx['video_transform'] = prepare_video_transforms(res_w, debug)
+        debug.end_timer("video_transform", "Video transform pipeline initialization")
+    else:
+        debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
 
 
 def load_text_embeddings(script_directory: str, device: Union[str, torch.device], 
@@ -259,10 +278,26 @@ def prepare_generation_context(dit_device: str, vae_device: str, debug: Optional
     return ctx
 
 
-def _ensure_precision_initialized(ctx: Dict[str, Any], 
-                                runner: 'VideoDiffusionInfer', 
-                                debug: Optional['Debug'] = None) -> None:
-    """Lazily initialize precision settings if not already done"""
+def _ensure_precision_initialized(
+    ctx: Dict[str, Any],
+    runner: 'VideoDiffusionInfer',
+    debug: Optional['Debug']
+) -> None:
+    """
+    Ensure precision settings are initialized in context based on model dtypes.
+    
+    Lazily initializes compute_dtype and autocast_dtype by inspecting actual
+    model weights to determine optimal precision settings. This avoids assuming
+    precision before models are loaded.
+    
+    Args:
+        ctx: Generation context dictionary to update with precision settings
+        runner: VideoDiffusionInfer instance with loaded models
+        debug: Optional Debug instance for logging
+        
+    Raises:
+        ValueError: If runner has no models loaded (both DiT and VAE are None)
+    """
     if ctx.get('compute_dtype') is not None:
         return  # Already initialized
     
@@ -338,17 +373,28 @@ def setup_device_environment(dit_device: Optional[str] = None,
     return dit_device, vae_device
 
 
-def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram: bool, debug: 'Debug',
-                   cache_model_dit: bool = False, cache_model_vae: bool = False, block_swap_config: Optional[Dict[str, Any]] = None,
-                   encode_tiled: bool = False, encode_tile_size: Optional[Tuple[int, int]] = None,
-                   encode_tile_overlap: Optional[Tuple[int, int]] = None,
-                   decode_tiled: bool = False, decode_tile_size: Optional[Tuple[int, int]] = None,
-                   decode_tile_overlap: Optional[Tuple[int, int]] = None,
-                   torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-                   torch_compile_args_vae: Optional[Dict[str, Any]] = None,
-                   cached_runner: Optional['VideoDiffusionInfer'] = None) -> Tuple['VideoDiffusionInfer', bool]:
+def prepare_runner(
+    dit_model: str,
+    vae_model: str,
+    model_dir: str,
+    preserve_vram: bool,
+    debug: 'Debug',
+    dit_cache: bool = False,
+    vae_cache: bool = False,
+    dit_id: Optional[int] = None,
+    vae_id: Optional[int] = None,
+    block_swap_config: Optional[Dict[str, Any]] = None,
+    encode_tiled: bool = False,
+    encode_tile_size: Optional[Tuple[int, int]] = None,
+    encode_tile_overlap: Optional[Tuple[int, int]] = None,
+    decode_tiled: bool = False,
+    decode_tile_size: Optional[Tuple[int, int]] = None,
+    decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    torch_compile_args_dit: Optional[Dict[str, Any]] = None,
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+) -> Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]:
     """
-    Prepare runner with model state management.
+    Prepare runner with model state management and global cache integration.
     Handles model changes and caching logic with independent DiT/VAE caching support.
     
     Args:
@@ -357,8 +403,10 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
         model_dir: Base directory containing model files
         preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
         debug: Debug instance for logging
-        cache_model_dit: Whether to cache DiT model in RAM between runs
-        cache_model_vae: Whether to cache VAE model in RAM between runs
+        dit_cache: Whether to cache DiT model in RAM between runs
+        vae_cache: Whether to cache VAE model in RAM between runs
+        dit_id: Node instance ID for DiT model caching
+        vae_id: Node instance ID for VAE model caching
         block_swap_config: Optional BlockSwap configuration for DiT memory optimization
         encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
         encode_tile_size: Tile size for encoding (height, width)
@@ -368,10 +416,18 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
         decode_tile_overlap: Tile overlap for decoding (height, width)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
-        cached_runner: Optional cached runner to reuse (passed if either model is cached)
         
     Returns:
-        Tuple[VideoDiffusionInfer, bool]: (configured runner, whether models changed)
+        Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]: Tuple containing:
+            - VideoDiffusionInfer: Configured runner instance with models loaded and settings applied
+            - bool: model_changed flag - True if new models were created/loaded, False if reusing
+              cached models from previous run (determined by cache_context['reusing_runner'])
+            - Dict[str, Any]: Cache context dictionary containing cache state and metadata with keys:
+                - 'global_cache': GlobalModelCache instance
+                - 'dit_cache', 'vae_cache': Caching enabled flags
+                - 'dit_id', 'vae_id': Node IDs for cache lookup
+                - 'cached_dit', 'cached_vae': Cached model instances (if found)
+                - 'reusing_runner': Flag indicating if runner template was reused
         
     Features:
         - Independent DiT and VAE caching for flexible memory management
@@ -383,46 +439,18 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
     dit_changed = False
     vae_changed = False
     
-    # Check for model changes if we have a cached runner
-    if cached_runner is not None:
-        current_dit = getattr(cached_runner, '_dit_model_name', None)
-        current_vae = getattr(cached_runner, '_vae_model_name', None)
-        
-        # Check DiT model change
-        if current_dit != dit_model:
-            dit_changed = True
-            debug.log(f"DiT model changed from {current_dit} to {dit_model}, clearing DiT cache...", category="cache")
-            cleanup_dit(runner=cached_runner, debug=debug, keep_model_in_ram=False)
-        
-        # Check VAE model change
-        if current_vae != vae_model:
-            vae_changed = True
-            debug.log(f"VAE model changed from {current_vae} to {vae_model}, clearing VAE cache...", category="cache")
-            cleanup_vae(runner=cached_runner, debug=debug, keep_model_in_ram=False)
-        
-        # If either model changed, invalidate cached_runner for that model
-        # Keep runner alive only if at least one model is still valid and cached
-        if dit_changed and vae_changed:
-            # Both changed - full recreation needed
-            cached_runner = None
-        elif dit_changed and not cache_model_vae:
-            # DiT changed and VAE not cached - full recreation
-            cached_runner = None
-        elif vae_changed and not cache_model_dit:
-            # VAE changed and DiT not cached - full recreation
-            cached_runner = None
-        # Otherwise keep cached_runner for partial reuse
-    
     # Configure runner
     debug.log("Configuring inference runner...", category="runner")
-    runner = configure_runner(
+    runner, cache_context = configure_runner(
         dit_model=dit_model,
         vae_model=vae_model,
         base_cache_dir=model_dir,
         preserve_vram=preserve_vram,
         debug=debug,
-        cache_model_dit=cache_model_dit,
-        cache_model_vae=cache_model_vae,
+        dit_cache=dit_cache,
+        vae_cache=vae_cache,
+        dit_id=dit_id,
+        vae_id=vae_id,
         block_swap_config=block_swap_config,
         encode_tiled=encode_tiled,
         encode_tile_size=encode_tile_size,
@@ -431,25 +459,31 @@ def prepare_runner(dit_model: str, vae_model: str, model_dir: str, preserve_vram
         decode_tile_size=decode_tile_size,
         decode_tile_overlap=decode_tile_overlap,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae,
-        cached_runner=cached_runner if (cache_model_dit or cache_model_vae) else None
+        torch_compile_args_vae=torch_compile_args_vae
     )
     
     # Store both model names for future comparisons
     runner._dit_model_name = dit_model
     runner._vae_model_name = vae_model
     
-    model_changed = dit_changed or vae_changed
-    return runner, model_changed
+    # Model changed if we didn't reuse an existing runner
+    model_changed = not cache_context.get('reusing_runner', False)
+    return runner, model_changed, cache_context
 
 
-def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
-                       images: Optional[torch.Tensor] = None, batch_size: int = 1, 
-                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
-                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-                       temporal_overlap: int = 0, res_w: int = 1072, 
-                       input_noise_scale: float = 0.0,
-                       color_correction: str = "wavelet") -> Dict[str, Any]:
+def encode_all_batches(
+    runner: 'VideoDiffusionInfer',
+    ctx: Optional[Dict[str, Any]] = None,
+    images: Optional[torch.Tensor] = None,
+    batch_size: int = 5,
+    preserve_vram: bool = False,
+    debug: Optional['Debug'] = None,
+    progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+    temporal_overlap: int = 0,
+    res_w: int = 1072,
+    input_noise_scale: float = 0.0,
+    color_correction: str = "wavelet"
+) -> Dict[str, Any]:
     """
     Phase 1: VAE Encoding for all batches
     
@@ -510,19 +544,10 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         raise ValueError("No frames to process")
     
     # Setup video transformation pipeline if not already done
-    if ctx.get('video_transform') is None:
-        debug.start_timer("video_transform")
-        ctx['video_transform'] = prepare_video_transforms(res_w)
-        debug.log(f"Initialized video transformation pipeline for {res_w}px", category="setup")
-        debug.end_timer("video_transform", "Video transform pipeline initialization")
-    else:
-        debug.log(f"Reusing pre-initialized video transformation pipeline", category="setup")
+    setup_video_transform(ctx, res_w, debug)
     
-    # Detect if input is RGBA (4 channels) - we'll adapt AFTER loading weights
-    if images[0].shape[-1] == 4:  # RGBA detected
-        ctx['is_rgba'] = True
-    else:
-        ctx['is_rgba'] = False
+    # Detect if input is RGBA (4 channels)
+    ctx['is_rgba'] = images[0].shape[-1] == 4
     
     # Display batch optimization tips
     if total_frames > 0:
@@ -571,15 +596,25 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
             materialize_model(runner, "vae", str(ctx['vae_device']), runner.config, 
                             preserve_vram, debug)
+        else:
+            # Model already materialized (cached) - apply any pending configs if needed
+            if getattr(runner, '_vae_config_needs_application', False):
+                debug.log("Applying updated VAE configuration", category="vae", force=True)
+                apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
         
+        # Cache VAE now that it's fully configured and ready for inference
+        if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
+            runner.vae._model_name = ctx['cache_context']['vae_model']
+            ctx['cache_context']['global_cache'].set_vae(
+                {'node_id': ctx['cache_context']['vae_id'], 'cache_in_ram': True}, 
+                runner.vae, ctx['cache_context']['vae_model'], debug
+            )
+            ctx['cache_context']['vae_newly_cached'] = True
+
         # Move VAE to GPU for encoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
                           model_name="VAE", preserve_vram=False, debug=debug,
                           runner=runner)
-    
-        # Adapt VAE for RGBA after weights are loaded
-        if ctx.get('is_rgba', False):
-            runner.vae = adapt_vae_for_rgba(runner.vae, debug)
         
         debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
@@ -604,11 +639,34 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
             # Process current batch
             video = images[start_idx:end_idx]
             video = video.permute(0, 3, 1, 2).to(ctx['vae_device'], dtype=ctx['compute_dtype'])
-            
-            # Apply transformations
-            transformed_video = ctx['video_transform'](video)
 
-            del video
+            # Check temporal dimension and pad ONCE if needed (format: T, C, H, W)
+            t = video.size(0)
+            debug.log(f"  Sequence of {t} frames", category="video", force=True)
+
+            ori_length = t
+
+            if t % 4 != 1:
+                target = ((t-1)//4+1)*4+1
+                padding_frames = target - t
+                debug.log(f"  Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
+                
+                # Pad original video once (TCHW format, need to convert to CTHW)
+                video = optimized_single_video_rearrange(video)  # TCHW -> CTHW
+                video = cut_videos(video)
+                video = optimized_single_video_rearrange(video)  # CTHW -> TCHW
+
+            # Extract RGB for transforms (view, not copy)
+            if ctx.get('is_rgba', False):
+                rgb_for_transform = video[:, :3, :, :]
+                debug.log(f"  Extracted Alpha channel for edge-guided upscaling", category="alpha")
+            else:
+                rgb_for_transform = video
+
+            # Apply transformations (to RGB from already-padded video)
+            transformed_video = ctx['video_transform'](rgb_for_transform)
+
+            del rgb_for_transform
 
             # Apply input noise if requested (to reduce artifacts at high resolutions)
             if input_noise_scale > 0:
@@ -628,28 +686,34 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
                 
                 del noise
 
-            ori_length = transformed_video.size(1)
-            
-            # Log sequence info
-            t = transformed_video.size(1)
-            debug.log(f"  Sequence of {t} frames", category="video", force=True)
-
-            # Handle 4n+1 constraint
-            if t % 4 != 1:
-                target = ((t-1)//4+1)*4+1
-                padding_frames = target - t
-                debug.log(f"  Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
-                transformed_video = cut_videos(transformed_video)
-            
             # Store original length for proper trimming later
             ctx['all_ori_lengths'][encode_idx] = ori_length
-            
+
             # Store transformed video on CPU if needed for color correction
             if color_correction != "none":
                 # Move to CPU to free VRAM
                 transformed_video_cpu = transformed_video.to('cpu', non_blocking=False)
                 ctx['all_transformed_videos'][encode_idx] = transformed_video_cpu
-            
+
+            # Extract and store Alpha and RGB from padded original video
+            if ctx.get('is_rgba', False):
+                if 'all_alpha_channels' not in ctx:
+                    ctx['all_alpha_channels'] = [None] * num_encode_batches
+                if 'all_input_rgb' not in ctx:
+                    ctx['all_input_rgb'] = [None] * num_encode_batches
+                
+                # Extract from padded RGBA video (format: T, 4, H, W)
+                alpha_channel = video[:, 3:4, :, :]
+                rgb_video_original = video[:, :3, :, :]
+                
+                # Store on CPU to save VRAM
+                ctx['all_alpha_channels'][encode_idx] = alpha_channel.to('cpu', non_blocking=False)
+                ctx['all_input_rgb'][encode_idx] = rgb_video_original.to('cpu', non_blocking=False)
+                
+                del alpha_channel, rgb_video_original
+
+            del video
+
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
             
@@ -682,11 +746,17 @@ def encode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     return ctx
 
 
-def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
-                        preserve_vram: bool = False, debug: Optional['Debug'] = None, 
-                        progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
-                        cfg_scale: float = 1.0, seed: int = 100, 
-                        latent_noise_scale: float = 0.0, cache_model: bool = False) -> Dict[str, Any]:
+def upscale_all_batches(
+    runner: 'VideoDiffusionInfer',
+    ctx: Optional[Dict[str, Any]] = None,
+    preserve_vram: bool = False,
+    debug: Optional['Debug'] = None,
+    progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+    cfg_scale: float = 7.5,
+    seed: int = 100,
+    latent_noise_scale: float = 0.0,
+    cache_model: bool = False
+) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
     
@@ -766,12 +836,33 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", str(ctx['dit_device']), runner.config, 
                             preserve_vram, debug)
+        else:
+            # Model already materialized (cached) - apply any pending configs if needed
+            if getattr(runner, '_dit_config_needs_application', False):
+                debug.log("Applying updated DiT configuration", category="dit", force=True)
+                apply_model_specific_config(runner.dit, runner, runner.config, True, debug)
         
+       # Cache DiT now that it's fully configured and ready for inference
+        if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
+            runner.dit._model_name = ctx['cache_context']['dit_model']
+            ctx['cache_context']['global_cache'].set_dit(
+                {'node_id': ctx['cache_context']['dit_id'], 'cache_in_ram': True}, 
+                runner.dit, ctx['cache_context']['dit_model'], debug
+            )
+            ctx['cache_context']['dit_newly_cached'] = True
+            # If both models now cached, cache runner template
+            vae_is_cached = ctx['cache_context']['cached_vae'] or ctx['cache_context']['vae_newly_cached']
+            if vae_is_cached:
+                ctx['cache_context']['global_cache'].set_runner(
+                    ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
+                    runner, debug
+                )
+
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=str(ctx['dit_device']), 
                             model_name="DiT", preserve_vram=False, debug=debug,
                             runner=runner)
-        
+
         debug.log_memory_state("After DiT loading", detailed_tensors=False)
 
         for batch_idx, latent in enumerate(ctx['all_latents']):
@@ -832,7 +923,8 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
             # Store upscaled result on CPU to save VRAM
             ctx['all_upscaled_latents'][upscale_idx] = upscaled[0].to('cpu', non_blocking=False)
             
-            # Free original latent
+            # Free original latent - release tensor memory first
+            release_tensor_memory(ctx['all_latents'][batch_idx])
             ctx['all_latents'][batch_idx] = None
             
             del noises, aug_noises, latent, conditions, condition, base_noise, upscaled
@@ -897,10 +989,14 @@ def upscale_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, A
     return ctx
 
 
-def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, Any]] = None, 
-                       preserve_vram: bool = False, debug: Optional['Debug'] = None, 
-                       progress_callback: Optional[Callable[[int, int, int, str], None]] = None, 
-                       cache_model: bool = False) -> Dict[str, Any]:
+def decode_all_batches(
+    runner: 'VideoDiffusionInfer',
+    ctx: Optional[Dict[str, Any]] = None,
+    preserve_vram: bool = False,
+    debug: Optional['Debug'] = None,
+    progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+    cache_model: bool = False
+) -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding.
     
@@ -986,12 +1082,15 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
                 samples = [sample.to(torch.float16, non_blocking=False) for sample in samples]
             
             # Process samples
+            debug.start_timer("optimized_video_rearrange")
             samples = optimized_video_rearrange(samples)
+            debug.end_timer("optimized_video_rearrange", "Video rearrange")
             
             # Store decoded samples for post-processing
             ctx['batch_samples'][decode_idx] = samples
             
             # Free the upscaled latent
+            release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
             ctx['all_upscaled_latents'][batch_idx] = None
             del upscaled_latent, samples
             
@@ -1007,16 +1106,12 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
         debug.log(f"Error in Phase 3 (Decoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always restore VAE to RGB (3-channel) state before cleanup
-        if hasattr(runner, 'vae') and runner.vae is not None:
-            if hasattr(runner.vae, 'encoder') and runner.vae.encoder.conv_in.in_channels == 4:
-                runner.vae = restore_vae_rgb_only(runner.vae, debug)
-        
         # Cleanup VAE as it's no longer needed
         cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=cache_model)
         
         # Clean up upscaled latents storage
         if 'all_upscaled_latents' in ctx:
+            release_tensor_collection(ctx['all_upscaled_latents'])
             del ctx['all_upscaled_latents']
         
     debug.end_timer("phase3_decoding", "Phase 3: VAE decoding complete", show_breakdown=True)
@@ -1025,10 +1120,12 @@ def decode_all_batches(runner: 'VideoDiffusionInfer', ctx: Optional[Dict[str, An
     return ctx
 
 
-def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
-                         debug: Optional['Debug'] = None,
-                         progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-                         color_correction: str = "wavelet") -> Dict[str, Any]:
+def postprocess_all_batches(
+    ctx: Optional[Dict[str, Any]] = None,
+    debug: Optional['Debug'] = None,
+    progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
+    color_correction: str = "wavelet"
+) -> Dict[str, Any]:
     """
     Phase 4: Post-processing and Final Video Assembly.
     
@@ -1067,6 +1164,52 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
     num_valid_samples = len([s for s in ctx['batch_samples'] if s is not None])
     processed_samples = []
     
+    # Alpha processing - handle RGBA inputs with edge-guided upscaling
+    if ctx.get('is_rgba', False) and 'all_alpha_channels' in ctx and 'all_input_rgb' in ctx:
+        debug.log("Processing Alpha channel with edge-guided upscaling...", category="alpha")
+        
+        # Validate alpha channel data exists
+        if not isinstance(ctx.get('all_alpha_channels'), list) or not isinstance(ctx.get('all_input_rgb'), list):
+            debug.log("WARNING: Alpha channel data malformed, skipping alpha processing", 
+                     level="WARNING", category="alpha", force=True)
+        else:
+            for batch_idx in range(len(ctx['batch_samples'])):
+                if ctx['batch_samples'][batch_idx] is None:
+                    continue
+                
+                # Bounds checking for alpha channel lists
+                if batch_idx >= len(ctx['all_alpha_channels']) or ctx['all_alpha_channels'][batch_idx] is None:
+                    continue
+                    
+                # Validate alpha channel tensor integrity
+                if not isinstance(ctx['all_alpha_channels'][batch_idx], torch.Tensor):
+                    debug.log(f"WARNING: Alpha channel {batch_idx} is not a tensor, skipping", 
+                             level="WARNING", category="alpha", force=True)
+                    continue
+            
+            debug.log(f"Processing Alpha batch {batch_idx+1}/{num_valid_samples}", category="alpha", force=True)
+            debug.start_timer(f"alpha_batch_{batch_idx+1}")
+
+            # Process Alpha and merge with RGB
+            ctx['batch_samples'][batch_idx] = process_alpha_for_batch(
+                rgb_samples=ctx['batch_samples'][batch_idx],
+                alpha_original=ctx['all_alpha_channels'][batch_idx],
+                rgb_original=ctx['all_input_rgb'][batch_idx],
+                device=ctx['vae_device'],
+                debug=debug
+            )
+            
+            # Free memory immediately
+            release_tensor_memory(ctx['all_alpha_channels'][batch_idx])
+            ctx['all_alpha_channels'][batch_idx] = None
+
+            release_tensor_memory(ctx['all_input_rgb'][batch_idx])
+            ctx['all_input_rgb'][batch_idx] = None
+        
+            debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
+
+        debug.log("Alpha processing complete for all batches", category="alpha")
+    
     try:
         for batch_idx, samples in enumerate(ctx['batch_samples']):
             if samples is None:
@@ -1094,11 +1237,18 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                     alpha_channel = None
                     
                     if has_alpha:
-                        debug.log("  RGBA color correction: preserving Alpha channel", category="video")
-                        # Split in channels-first format: (T, 4, H, W) -> (T, 3, H, W) + (T, 1, H, W)
-                        rgb_sample = sample[:, :3, :, :]  # RGB channels
-                        alpha_channel = sample[:, 3:4, :, :]  # Alpha channel
-                        sample = rgb_sample
+                        # Check actual channel count before splitting
+                        actual_channels = sample.shape[1] if sample.ndim >= 2 else 1
+                        
+                        if actual_channels == 4:
+                            # Split in channels-first format: (T, 4, H, W) -> (T, 3, H, W) + (T, 1, H, W)
+                            rgb_sample = sample[:, :3, :, :]  # RGB channels
+                            alpha_channel = sample[:, 3:4, :, :]  # Alpha channel
+                            sample = rgb_sample
+                        else:
+                            debug.log(f"  WARNING: Expected 4 channels but got {actual_channels}, skipping Alpha split", 
+                                    level="WARNING", category="video", force=True)
+                            alpha_channel = None
                         
                     # Get transformed video from CPU
                     transformed_video = ctx['all_transformed_videos'][video_idx]
@@ -1150,9 +1300,23 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
                 
                 # Convert to final format
                 sample = optimized_sample_to_image_format(sample)
-                sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
+                
+                # Apply normalization only to RGB channels, preserve Alpha as-is
+                if ctx.get('is_rgba', False) and sample.shape[-1] == 4:
+                    # Split RGBA: sample is (T, H, W, C) format after optimized_sample_to_image_format
+                    rgb_channels = sample[..., :3]  # (T, H, W, 3)
+                    alpha_channel = sample[..., 3:4]  # (T, H, W, 1)
+                    
+                    # Normalize only RGB from [-1, 1] to [0, 1]
+                    rgb_channels = rgb_channels.clip(-1, 1).mul_(0.5).add_(0.5)
+                    
+                    # Merge back with unchanged Alpha
+                    sample = torch.cat([rgb_channels, alpha_channel], dim=-1)
+                else:
+                    # RGB only: apply normalization as usual
+                    sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
+                
                 sample_cpu = sample.to(torch.float16).to("cpu")
-                del sample
                 
                 # Store processed sample
                 processed_samples.append(sample_cpu)
@@ -1202,24 +1366,45 @@ def postprocess_all_batches(ctx: Optional[Dict[str, Any]] = None,
         debug.log(f"Error in Phase 4 (Post-processing): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Clean up post-processing intermediate storage
-        if 'batch_samples' in ctx:
+        # 1. Clean up local processed_samples
+        if 'processed_samples' in locals() and processed_samples:
+            release_tensor_collection(processed_samples)
+            processed_samples.clear()
+            del processed_samples
+        
+        # 2. Clean up batch_samples from context
+        if 'batch_samples' in ctx and ctx['batch_samples']:
+            release_tensor_collection(ctx['batch_samples'])
             ctx['batch_samples'].clear()
             del ctx['batch_samples']
         
-        # Clean up video transform
+        # 3. Clean up video transform caches
         if ctx.get('video_transform'):
-            for transform in ctx['video_transform'].transforms:
-                if hasattr(transform, '__dict__'):
-                    transform.__dict__.clear()
+            if hasattr(ctx['video_transform'], 'transforms'):
+                for transform in ctx['video_transform'].transforms:
+                    # Clear cache attributes
+                    for cache_attr in ['cache', '_cache']:
+                        if hasattr(transform, cache_attr):
+                            setattr(transform, cache_attr, None)
+                    # Clear remaining attributes
+                    if hasattr(transform, '__dict__'):
+                        transform.__dict__.clear()
+            del ctx['video_transform']
             ctx['video_transform'] = None
-            
-        # Clean up any remaining intermediate storage
-        for storage_key in ['all_latents', 'all_transformed_videos', 'all_ori_lengths']:
-            if storage_key in ctx:
-                del ctx[storage_key]
         
-        # Final deep memory clear to ensure everything is cleaned
+        # 4. Clean up storage lists (all_latents, all_alpha_channels, etc.)
+        tensor_storage_keys = ['all_latents', 'all_transformed_videos', 
+                            'all_alpha_channels', 'all_input_rgb']
+        for key in tensor_storage_keys:
+            if key in ctx and ctx[key]:
+                release_tensor_collection(ctx[key])
+                del ctx[key]
+        
+        # 5. Clean up non-tensor storage
+        if 'all_ori_lengths' in ctx:
+            del ctx['all_ori_lengths']
+        
+        # 6. Final deep memory clear
         clear_memory(debug=debug, deep=True, force=True, timer_name="final_memory_clear")
         
     debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
