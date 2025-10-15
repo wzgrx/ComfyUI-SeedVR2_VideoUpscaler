@@ -24,10 +24,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeedVR2TorchCompileSettings": "SeedVR2 Torch Compile Settings",
 }
 
-__version__ = "2.0.0"
-__author__ = "numz, adrientoupet"
-__description__ = "ComfyUI integration of ByteDance-Seed's SeedVR2: One-step diffusion-based video/image upscaling with memory-efficient inference"
-
 __all__ = [
     'SeedVR2VideoUpscaler',
     'SeedVR2LoadDiTModel',
