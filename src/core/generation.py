@@ -499,7 +499,7 @@ def encode_all_batches(
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
         ctx: Generation context from prepare_generation_context (required)
-        images: Input frames tensor [T, H, W, C] in float16, range [0,1]. 
+        images: Input frames tensor [T, H, W, C] range [0,1]. 
                 Required if ctx doesn't contain 'input_images'
         batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
         preserve_vram: If True, offload VAE between operations
@@ -1082,11 +1082,6 @@ def decode_all_batches(
             samples = runner.vae_decode([upscaled_latent], preserve_vram=preserve_vram)
             debug.end_timer("vae_decode", "VAE decode")
             
-            # Convert to Float16 for efficiency
-            if samples and len(samples) > 0 and samples[0].dtype != torch.float16:
-                debug.log(f"Converting from {samples[0].dtype} to Float16", category="precision")
-                samples = [sample.to(torch.float16, non_blocking=False) for sample in samples]
-            
             # Process samples
             debug.start_timer("optimized_video_rearrange")
             samples = optimized_video_rearrange(samples)
@@ -1146,7 +1141,7 @@ def postprocess_all_batches(
         
     Returns:
         dict: Updated context containing:
-            - final_video: Assembled video tensor [T, H, W, C] in float16, range [0,1]
+            - final_video: Assembled video tensor [T, H, W, C] range [0,1]
             - All intermediate storage cleared for memory efficiency
             
     Raises:
@@ -1331,7 +1326,8 @@ def postprocess_all_batches(
                     # RGB only: apply normalization as usual
                     sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
                 
-                sample_cpu = sample.to(torch.float16).to("cpu")
+                # Move to CPU
+                sample_cpu = sample.cpu()
                 
                 # Store processed sample
                 processed_samples.append(sample_cpu)
@@ -1355,7 +1351,7 @@ def postprocess_all_batches(
                 debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info")
                 
                 # Pre-allocate final tensor
-                ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=torch.float16)
+                ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'])
                 
                 # Copy batch results into final tensor
                 current_idx = 0
@@ -1371,10 +1367,10 @@ def postprocess_all_batches(
                 channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
                 debug.log(f"Final video assembled: Total frames: {total_frames}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", category="generation", force=True)
             else:
-                ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
+                ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
                 debug.log("No frame to assemble", level="WARNING", category="video", force=True)
         else:
-            ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=torch.float16)
+            ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
             debug.log("No samples to assemble", level="WARNING", category="video", force=True)
             
     except Exception as e:

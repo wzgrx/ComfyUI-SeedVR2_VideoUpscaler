@@ -456,6 +456,10 @@ class SeedVR2VideoUpscaler:
         # Get final result - preserve channel format from input
         sample = ctx['final_video']
         
+        # Convert to float32 for maximum ComfyUI compatibility
+        if torch.is_tensor(sample) and sample.dtype != torch.float32:
+            sample = sample.to(torch.float32)
+        
         # Ensure output is on CPU (ComfyUI expects CPU tensors)
         if torch.is_tensor(sample) and sample.is_cuda:
             sample = sample.cpu()

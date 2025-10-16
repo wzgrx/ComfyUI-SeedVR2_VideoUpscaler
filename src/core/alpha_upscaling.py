@@ -13,6 +13,31 @@ import numpy as np
 from typing import Optional, Any, List
 
 
+def _ensure_float32_precision(tensor: torch.Tensor, force_float32: bool = True) -> tuple[torch.Tensor, torch.dtype]:
+    """
+    Ensure tensor is in float32 for precision-sensitive operations.
+    
+    Args:
+        tensor: Input tensor
+        force_float32: If True, convert reduced precision dtypes to float32
+    
+    Returns:
+        (converted_tensor, original_dtype) tuple for restoration
+    """
+    original_dtype = tensor.dtype
+    
+    # Skip if conversion disabled
+    if not force_float32:
+        return tensor, original_dtype
+    
+    # Convert anything that's NOT already full precision
+    if original_dtype not in (torch.float32, torch.float64):
+        return tensor.float(), original_dtype
+    
+    # Already full precision (float32 or float64)
+    return tensor, original_dtype
+
+
 def process_alpha_for_batch(
     rgb_samples: List[torch.Tensor],
     alpha_original: torch.Tensor,
@@ -93,10 +118,9 @@ def detect_edges_batch(images: torch.Tensor, method: str = 'sobel') -> torch.Ten
         
     Returns:
         Edge map tensor of shape (T, 1, H, W) in range [0, 1]
-    """
-    original_dtype = images.dtype
-    if images.dtype == torch.bfloat16:
-        images = images.float()
+    """    
+    # Convert to float32 for OpenCV processing (will be converted to numpy anyway)
+    images, images_dtype = _ensure_float32_precision(images, force_float32=True)
     
     images_np = images.cpu().numpy()
     T, C, H, W = images_np.shape
@@ -129,11 +153,10 @@ def detect_edges_batch(images: torch.Tensor, method: str = 'sobel') -> torch.Ten
     
     edges = np.stack(edges)
     edges = torch.from_numpy(edges).float() / 255.0
-    edges = edges.unsqueeze(1)
-    edges = edges.to(images.device)
+    edges = edges.unsqueeze(1).to(images.device)
     
-    if original_dtype == torch.bfloat16:
-        edges = edges.to(torch.bfloat16)
+    # Restore original dtype
+    edges = edges.to(images_dtype)
     
     return edges
 
@@ -154,11 +177,9 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
     Returns:
         Filtered output (T, 1, H, W)
     """
-    original_dtype = guide.dtype
-    
-    if guide.dtype == torch.bfloat16:
-        guide = guide.float()
-        src = src.float()
+    # Convert to float32 for numerical stability in statistical operations
+    guide, guide_dtype = _ensure_float32_precision(guide, force_float32=True)
+    src, _ = _ensure_float32_precision(src, force_float32=True)
     
     T, C, H, W = guide.shape
     
@@ -172,8 +193,7 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
     output = _apply_guided_filter(guide_gray, src, radius, eps)
     
     # Restore original dtype
-    if original_dtype == torch.bfloat16:
-        output = output.to(torch.bfloat16)
+    output = output.to(guide_dtype)
     
     return output
 
@@ -258,11 +278,10 @@ def edge_guided_alpha_upscale(
     device = input_alpha.device
     dtype = input_alpha.dtype
     
-    # Convert bfloat16 to float32 for numerical stability during processing
-    if dtype == torch.bfloat16:
-        input_alpha = input_alpha.float()
-        upscaled_rgb = upscaled_rgb.float()
-        input_rgb = input_rgb.float()
+    # Convert to float32 for numerical stability in edge detection and filtering
+    input_alpha, alpha_dtype = _ensure_float32_precision(input_alpha, force_float32=True)
+    upscaled_rgb, _ = _ensure_float32_precision(upscaled_rgb, force_float32=True)
+    input_rgb, _ = _ensure_float32_precision(input_rgb, force_float32=True)
     
     # Analyze alpha distribution to detect binary masks vs gradient alphas
     alpha_flat = input_alpha.flatten()
@@ -364,10 +383,9 @@ def edge_guided_alpha_upscale(
     
     # Clamp output to valid alpha range [0, 1]
     alpha_final = alpha_final.clamp(0, 1)
-    
-    # Restore original dtype (bfloat16) if necessary
-    if dtype == torch.bfloat16:
-        alpha_final = alpha_final.to(torch.bfloat16)
+
+    # Restore original dtype
+    alpha_final = alpha_final.to(alpha_dtype)
     
     if debug:
         final_values = alpha_final.flatten()
