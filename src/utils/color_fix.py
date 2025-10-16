@@ -19,7 +19,7 @@ from torch import Tensor
 from torch.nn import functional as F
 from typing import Optional
 from torchvision.transforms import ToTensor, ToPILImage
-from ..common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation
+from ..common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation, ensure_float32_precision
 
 
 def adain_color_fix(target: Image.Image, source: Image.Image) -> Image.Image:
@@ -288,13 +288,12 @@ def lab_color_transfer(
             align_corners=False
         )
     
-    # Store original dtype and device
-    original_dtype = content_feat.dtype
+    # Store device
     device = content_feat.device
     
     # Convert to float32 for accurate color space conversion
-    content_feat = content_feat.to(torch.float32)
-    style_feat = style_feat.to(torch.float32)
+    content_feat, original_dtype = ensure_float32_precision(content_feat)
+    style_feat, _ = ensure_float32_precision(style_feat)
     
     # Convert from [-1, 1] to [0, 1] range
     content_rgb = torch.clamp((content_feat + 1.0) * 0.5, 0.0, 1.0)
@@ -514,12 +513,9 @@ def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, deb
             align_corners=False
         )
     
-    # Store original dtype
-    original_dtype = content_feat.dtype
-    
     # Convert to float32 for processing
-    content_feat = content_feat.to(torch.float32)
-    style_feat = style_feat.to(torch.float32)
+    content_feat, original_dtype = ensure_float32_precision(content_feat)
+    style_feat, _ = ensure_float32_precision(style_feat)
     
     # Convert from [-1, 1] to [0, 1] range
     content_rgb = torch.clamp((content_feat + 1.0) * 0.5, 0.0, 1.0)
@@ -734,11 +730,9 @@ def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, 
             align_corners=False
         )
     
-    original_dtype = content_feat.dtype
-    
     # Convert to float32 for processing
-    content_feat = content_feat.to(torch.float32)
-    style_feat = style_feat.to(torch.float32)
+    content_feat, original_dtype = ensure_float32_precision(content_feat)
+    style_feat, _ = ensure_float32_precision(style_feat)
     
     # Step 1: Apply wavelet (base correction)
     wavelet_result = wavelet_reconstruction(content_feat, style_feat, debug)

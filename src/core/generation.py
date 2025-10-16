@@ -567,8 +567,9 @@ def encode_all_batches(
         
         if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
             debug.log("", category="none", force=True)
-            debug.log(f"For {total_frames} frames, use batch_size={batch_params['best_batch']} for better efficiency", category="tip", force=True)
-            debug.log(f"  Consider larger batches: better temporal coherence BUT uses more memory", category="tip", force=True)
+            debug.log(f"For {total_frames} frames, batch_size={batch_params['best_batch']} avoids padding waste", category="tip", force=True)
+            debug.log(f"  Match batch_size to shot lengths for better temporal coherence", category="tip", force=True)
+
         
         if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
             debug.log("", category="none", force=True)
@@ -759,7 +760,7 @@ def upscale_all_batches(
     debug: Optional['Debug'] = None,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cfg_scale: float = 7.5,
-    seed: int = 100,
+    seed: int = 42,
     latent_noise_scale: float = 0.0,
     cache_model: bool = False
 ) -> Dict[str, Any]:

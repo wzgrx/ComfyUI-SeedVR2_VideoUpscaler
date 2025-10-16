@@ -11,31 +11,7 @@ import torch.nn.functional as F
 import cv2
 import numpy as np
 from typing import Optional, Any, List
-
-
-def _ensure_float32_precision(tensor: torch.Tensor, force_float32: bool = True) -> tuple[torch.Tensor, torch.dtype]:
-    """
-    Ensure tensor is in float32 for precision-sensitive operations.
-    
-    Args:
-        tensor: Input tensor
-        force_float32: If True, convert reduced precision dtypes to float32
-    
-    Returns:
-        (converted_tensor, original_dtype) tuple for restoration
-    """
-    original_dtype = tensor.dtype
-    
-    # Skip if conversion disabled
-    if not force_float32:
-        return tensor, original_dtype
-    
-    # Convert anything that's NOT already full precision
-    if original_dtype not in (torch.float32, torch.float64):
-        return tensor.float(), original_dtype
-    
-    # Already full precision (float32 or float64)
-    return tensor, original_dtype
+from ..common.half_precision_fixes import ensure_float32_precision
 
 
 def process_alpha_for_batch(
@@ -120,7 +96,7 @@ def detect_edges_batch(images: torch.Tensor, method: str = 'sobel') -> torch.Ten
         Edge map tensor of shape (T, 1, H, W) in range [0, 1]
     """    
     # Convert to float32 for OpenCV processing (will be converted to numpy anyway)
-    images, images_dtype = _ensure_float32_precision(images, force_float32=True)
+    images, images_dtype = ensure_float32_precision(images, force_float32=True)
     
     images_np = images.cpu().numpy()
     T, C, H, W = images_np.shape
@@ -178,8 +154,8 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
         Filtered output (T, 1, H, W)
     """
     # Convert to float32 for numerical stability in statistical operations
-    guide, guide_dtype = _ensure_float32_precision(guide, force_float32=True)
-    src, _ = _ensure_float32_precision(src, force_float32=True)
+    guide, guide_dtype = ensure_float32_precision(guide, force_float32=True)
+    src, _ = ensure_float32_precision(src, force_float32=True)
     
     T, C, H, W = guide.shape
     
@@ -279,9 +255,9 @@ def edge_guided_alpha_upscale(
     dtype = input_alpha.dtype
     
     # Convert to float32 for numerical stability in edge detection and filtering
-    input_alpha, alpha_dtype = _ensure_float32_precision(input_alpha, force_float32=True)
-    upscaled_rgb, _ = _ensure_float32_precision(upscaled_rgb, force_float32=True)
-    input_rgb, _ = _ensure_float32_precision(input_rgb, force_float32=True)
+    input_alpha, alpha_dtype = ensure_float32_precision(input_alpha, force_float32=True)
+    upscaled_rgb, _ = ensure_float32_precision(upscaled_rgb, force_float32=True)
+    input_rgb, _ = ensure_float32_precision(input_rgb, force_float32=True)
     
     # Analyze alpha distribution to detect binary masks vs gradient alphas
     alpha_flat = input_alpha.flatten()

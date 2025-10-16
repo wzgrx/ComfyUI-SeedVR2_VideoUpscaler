@@ -72,7 +72,7 @@ class SeedVR2VideoUpscaler:
                     "tooltip": "VAE model configuration from SeedVR2 Load VAE Model node"
                 }),
                 "seed": ("INT", {
-                    "default": 100,
+                    "default": 42,
                     "min": 0,
                     "max": 2**32 - 1, 
                     "step": 1,
