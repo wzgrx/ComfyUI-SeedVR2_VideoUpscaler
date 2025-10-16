@@ -395,6 +395,9 @@ class SeedVR2VideoUpscaler:
         input_h, input_w = pixels.shape[1], pixels.shape[2]
         channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
         
+        # Store in context for reuse across all phases
+        ctx['total_frames'] = total_frames
+        
         # Create transform pipeline early and apply to first frame to get exact output dimensions
         setup_video_transform(ctx, new_resolution, debug)
 

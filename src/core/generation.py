@@ -17,6 +17,7 @@ Key Features:
 - Temporal overlap support for smooth transitions between batches
 - Adaptive dtype detection and optimal autocast configuration
 - Memory-efficient pre-allocated batch processing
+- Stream-based assembly eliminates memory spikes for long videos
 - Advanced video format handling (4n+1 constraint)
 - Clean separation of concerns with phase-specific resource management
 - Each phase handles its own cleanup in finally blocks
@@ -545,7 +546,13 @@ def encode_all_batches(
     else:
         images = ctx['input_images']
     
-    total_frames = len(images)
+    # Get total frame count from context (set in video_upscaler before encoding)
+    total_frames = ctx.get('total_frames', len(images))
+    
+    # Set it if not already set (for standalone/CLI usage)
+    if 'total_frames' not in ctx:
+        ctx['total_frames'] = total_frames
+    
     if total_frames == 0:
         raise ValueError("No frames to process")
     
@@ -1083,15 +1090,18 @@ def decode_all_batches(
             samples = runner.vae_decode([upscaled_latent], preserve_vram=preserve_vram)
             debug.end_timer("vae_decode", "VAE decode")
             
-            # Process samples
+           # Process samples
             debug.start_timer("optimized_video_rearrange")
             samples = optimized_video_rearrange(samples)
             debug.end_timer("optimized_video_rearrange", "Video rearrange")
             
-            # Store decoded samples for post-processing
-            ctx['batch_samples'][decode_idx] = samples
+            # Move samples to CPU to avoid VRAM accumulation across batches
+            samples_cpu = [sample.cpu() if (sample.is_cuda or sample.is_mps) else sample for sample in samples]
             
-            # Free the upscaled latent
+            # Store decoded samples on CPU for post-processing
+            ctx['batch_samples'][decode_idx] = samples_cpu
+            
+            # Free the upscaled latent and GPU samples
             release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
             ctx['all_upscaled_latents'][batch_idx] = None
             del upscaled_latent, samples
@@ -1132,7 +1142,9 @@ def postprocess_all_batches(
     Phase 4: Post-processing and Final Video Assembly.
     
     Applies color correction and assembles the final video from decoded batches.
-    Requires context from decode_all_batches with decoded samples.
+    Uses stream-based direct writing to minimize memory usage - processes each
+    batch and writes directly to pre-allocated output tensor without accumulating
+    intermediate results.
     
     Args:
         ctx: Context from decode_all_batches containing batch_samples (required)
@@ -1162,9 +1174,21 @@ def postprocess_all_batches(
     debug.log("━━━━━━━━ Phase 4: Post-processing ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase4_postprocess")
     
-    # Count valid samples
+    # Total_frames represents the original input frame count (set in Phase 1)
+    total_frames = ctx.get('total_frames', 0)
+    
+    # Early exit if no frames to process
+    if total_frames == 0:
+        ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
+        debug.log("No frames to process", level="WARNING", category="generation", force=True)
+        return ctx
+    
+    # Count valid samples for progress reporting
     num_valid_samples = len([s for s in ctx['batch_samples'] if s is not None])
-    processed_samples = []
+    
+    # Pre-allocation will happen after processing first sample to get exact dimensions
+    ctx['final_video'] = None
+    current_frame_idx = 0
     
     # Alpha processing - handle RGBA inputs with edge-guided upscaling
     if ctx.get('is_rgba', False) and 'all_alpha_channels' in ctx and 'all_input_rgb' in ctx:
@@ -1213,6 +1237,7 @@ def postprocess_all_batches(
         debug.log("Alpha processing complete for all batches", category="alpha")
     
     try:
+        # Stream-based processing: write directly to final_video without accumulation
         for batch_idx, samples in enumerate(ctx['batch_samples']):
             if samples is None:
                 continue
@@ -1224,6 +1249,9 @@ def postprocess_all_batches(
             
             # Post-process each sample in the batch
             for i, sample in enumerate(samples):
+                # Move sample to device for processing (consistent with other phases)
+                sample = sample.to(ctx['vae_device'], dtype=ctx['compute_dtype'], non_blocking=False)
+                
                 # Get original length for trimming (always available)
                 video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
                 ori_length = ctx['all_ori_lengths'][video_idx] if 'all_ori_lengths' in ctx else sample.shape[0]
@@ -1239,68 +1267,54 @@ def postprocess_all_batches(
                     alpha_channel = None
                     
                     if has_alpha:
-                        # Check actual channel count before splitting
-                        actual_channels = sample.shape[1] if sample.ndim >= 2 else 1
+                        # Check actual channel count
+                        if sample.shape[1] == 4:
+                            # Extract and temporarily store alpha for reattachment after color correction
+                            alpha_channel = sample[:, 3:4, :, :]  # (T, 1, H, W)
+                            sample = sample[:, :3, :, :]  # Keep only RGB (T, 3, H, W)
+                    
+                    # Bounds checking for transformed videos
+                    if video_idx < len(ctx['all_transformed_videos']) and ctx['all_transformed_videos'][video_idx] is not None:
+                        transformed_video = ctx['all_transformed_videos'][video_idx]
                         
-                        if actual_channels == 4:
-                            # Split in channels-first format: (T, 4, H, W) -> (T, 3, H, W) + (T, 1, H, W)
-                            rgb_sample = sample[:, :3, :, :]  # RGB channels
-                            alpha_channel = sample[:, 3:4, :, :]  # Alpha channel
-                            sample = rgb_sample
+                        # Convert transformed video from C T H W to T C H W format for color correction
+                        input_video = optimized_single_video_rearrange(transformed_video)
+                        
+                        # Ensure both tensors are on same device (GPU) for color correction
+                        if input_video.device != sample.device:
+                            input_video = input_video.to(sample.device, non_blocking=False)
+                        
+                        # Apply selected color correction method
+                        debug.start_timer(f"color_correction_{color_correction}")
+                        
+                        if color_correction == "lab":
+                            debug.log("  Applying LAB perceptual color transfer", category="video", force=True)
+                            sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
+                        elif color_correction == "wavelet_adaptive":
+                            debug.log("  Applying wavelet with adaptive saturation correction", category="video", force=True)
+                            sample = wavelet_adaptive_color_correction(sample, input_video, debug)
+                        elif color_correction == "wavelet":
+                            debug.log("  Applying wavelet color reconstruction", category="video", force=True)
+                            sample = wavelet_reconstruction(sample, input_video, debug)
+                        elif color_correction == "hsv":
+                            debug.log("  Applying HSV hue-conditional saturation matching", category="video", force=True)
+                            sample = hsv_saturation_histogram_match(sample, input_video, debug)
+                        elif color_correction == "adain":
+                            debug.log("  Applying AdaIN color correction", category="video", force=True)
+                            sample = adaptive_instance_normalization(sample, input_video)
                         else:
-                            debug.log(f"  WARNING: Expected 4 channels but got {actual_channels}, skipping Alpha split", 
-                                    level="WARNING", category="video", force=True)
-                            alpha_channel = None
+                            debug.log(f"  Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
                         
-                    # Get transformed video from CPU
-                    transformed_video = ctx['all_transformed_videos'][video_idx]
-                    
-                    # Move to GPU for color correction
-                    transformed_video = transformed_video.to(ctx['vae_device'], non_blocking=False)
-                    
-                    # Adjust transformed video to handle cases when padding was applied during encoding
-                    if transformed_video.shape[1] != sample.shape[0]:
-                        debug.log(f"  Trimming reference from {transformed_video.shape[1]} to {sample.shape[0]} frames", 
-                                category="video")
-                        transformed_video = transformed_video[:, :sample.shape[0]]
-                    
-                    # Split reference video to RGB if it's RGBA (for color correction)
-                    if has_alpha and transformed_video.shape[0] == 4:  # Check channel dimension (C, T, H, W)
-                        transformed_video = transformed_video[:3, ...]  # Keep only RGB channels
-                    
-                    input_video = [optimized_single_video_rearrange(transformed_video)]
-                    
-                    # Apply selected color correction method
-                    debug.start_timer(f"color_correction_{color_correction}")
-                    
-                    if color_correction == "lab":
-                        debug.log("  Applying LAB perceptual color transfer", category="video", force=True)
-                        sample = lab_color_transfer(sample, input_video[0], debug, luminance_weight=0.8)
-                    elif color_correction == "wavelet_adaptive":
-                        debug.log("  Applying wavelet with adaptive saturation correction", category="video", force=True)
-                        sample = wavelet_adaptive_color_correction(sample, input_video[0], debug)
-                    elif color_correction == "wavelet":
-                        debug.log("  Applying wavelet color reconstruction", category="video", force=True)
-                        sample = wavelet_reconstruction(sample, input_video[0], debug)
-                    elif color_correction == "hsv":
-                        debug.log("  Applying HSV hue-conditional saturation matching", category="video", force=True)
-                        sample = hsv_saturation_histogram_match(sample, input_video[0], debug)
-                    elif color_correction == "adain":
-                        debug.log("  Applying AdaIN color correction", category="video", force=True)
-                        sample = adaptive_instance_normalization(sample, input_video[0])
-                    else:
-                        debug.log(f"  Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
-                    
-                    debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
-                    
-                    # Free the transformed video
-                    ctx['all_transformed_videos'][video_idx] = None
-                    del input_video, transformed_video
+                        debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
+                        
+                        # Free the transformed video
+                        ctx['all_transformed_videos'][video_idx] = None
+                        del input_video, transformed_video
 
-                    # Recombine with Alpha if it was present in input
-                    if has_alpha and alpha_channel is not None:
-                        # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
-                        sample = torch.cat([sample, alpha_channel], dim=1)
+                        # Recombine with Alpha if it was present in input
+                        if has_alpha and alpha_channel is not None:
+                            # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
+                            sample = torch.cat([sample, alpha_channel], dim=1)
                 
                 else:
                     debug.log("  Color correction disabled (set to none)", category="video")
@@ -1309,7 +1323,7 @@ def postprocess_all_batches(
                 if 'all_ori_lengths' in ctx and video_idx < len(ctx['all_ori_lengths']):
                     ctx['all_ori_lengths'][video_idx] = None
                 
-                # Convert to final format
+                # Convert to final format (still on GPU at this point)
                 sample = optimized_sample_to_image_format(sample)
                 
                 # Apply normalization only to RGB channels, preserve Alpha as-is
@@ -1327,11 +1341,33 @@ def postprocess_all_batches(
                     # RGB only: apply normalization as usual
                     sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
                 
-                # Move to CPU
-                sample_cpu = sample.cpu()
+                # Move to CPU after all GPU processing is complete
+                if sample.is_cuda or sample.is_mps:
+                    sample = sample.cpu()
                 
-                # Store processed sample
-                processed_samples.append(sample_cpu)
+                # Get batch dimensions
+                batch_frames = sample.shape[0]
+                
+                # Pre-allocate output tensor on first write (now we know exact output dimensions)
+                if ctx['final_video'] is None:
+                    H, W, C = sample.shape[1], sample.shape[2], sample.shape[3]
+                    channels_str = "RGBA" if C == 4 else "RGB" if C == 3 else f"{C}-channel"
+                    
+                    debug.log(f"Pre-allocating output tensor: {total_frames} frames, {W}x{H}px, {channels_str}", category="setup")
+                    
+                    # Allocate once with correct dimensions on CPU
+                    ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'], device='cpu')
+                
+                # Direct write to output tensor
+                ctx['final_video'][current_frame_idx:current_frame_idx + batch_frames] = sample
+                current_frame_idx += batch_frames
+                
+                # Immediately release sample memory
+                del sample
+                
+            # Clear batch samples as we go to free memory progressively
+            release_tensor_memory(ctx['batch_samples'][batch_idx])
+            ctx['batch_samples'][batch_idx] = None
             
             debug.end_timer(f"postprocess_batch_{batch_idx+1}", f"Post-processed batch {batch_idx+1}")
             
@@ -1339,58 +1375,33 @@ def postprocess_all_batches(
                 progress_callback(batch_idx+1, num_valid_samples,
                                 1, "Phase 4: Post-processing")
 
-        debug.log("Assembling final video from processed batches...", category="video")
-
-        # Merge all processed samples into final video
-        if processed_samples:
-            total_frames = sum(batch.shape[0] for batch in processed_samples)
+        # Verify final assembly
+        if ctx['final_video'] is not None:
+            final_shape = ctx['final_video'].shape
+            Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
+            channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
             
-            if total_frames > 0:
-                sample_shape = processed_samples[0].shape
-                H, W, C = sample_shape[1], sample_shape[2], sample_shape[3]
-                
-                debug.log(f"Total frames: {total_frames}, shape per frame: {H}x{W}x{C}", category="info")
-                
-                # Pre-allocate final tensor
-                ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'])
-                
-                # Copy batch results into final tensor
-                current_idx = 0
-                for batch in processed_samples:
-                    batch_frames = batch.shape[0]
-                    ctx['final_video'][current_idx:current_idx + batch_frames] = batch
-                    current_idx += batch_frames
-                
-                final_shape = ctx['final_video'].shape
-                Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
-
-                # Format channel info for readability
-                channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
-                debug.log(f"Final video assembled: Total frames: {total_frames}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", category="generation", force=True)
-            else:
-                ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
-                debug.log("No frame to assemble", level="WARNING", category="video", force=True)
+            debug.log(f"Final video assembled: {current_frame_idx} frames written, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", 
+                     category="generation", force=True)
+            
+            if current_frame_idx != total_frames:
+                debug.log(f"WARNING: Frame count mismatch - expected {total_frames}, wrote {current_frame_idx}", 
+                         level="WARNING", category="generation", force=True)
         else:
             ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
-            debug.log("No samples to assemble", level="WARNING", category="video", force=True)
+            debug.log("No frames were processed", level="WARNING", category="generation", force=True)
             
     except Exception as e:
-        debug.log(f"Error in Phase 4 (Post-processing): {e}", level="ERROR", category="error", force=True)
+        debug.log(f"Error in Phase 4 (Post-processing): {e}", level="ERROR", category="generation", force=True)
         raise
     finally:
-        # 1. Clean up local processed_samples
-        if 'processed_samples' in locals() and processed_samples:
-            release_tensor_collection(processed_samples)
-            processed_samples.clear()
-            del processed_samples
-        
-        # 2. Clean up batch_samples from context
+        # 1. Clean up batch_samples from context (already mostly freed during processing)
         if 'batch_samples' in ctx and ctx['batch_samples']:
             release_tensor_collection(ctx['batch_samples'])
             ctx['batch_samples'].clear()
             del ctx['batch_samples']
         
-        # 3. Clean up video transform caches
+        # 2. Clean up video transform caches
         if ctx.get('video_transform'):
             if hasattr(ctx['video_transform'], 'transforms'):
                 for transform in ctx['video_transform'].transforms:
@@ -1404,7 +1415,7 @@ def postprocess_all_batches(
             del ctx['video_transform']
             ctx['video_transform'] = None
         
-        # 4. Clean up storage lists (all_latents, all_alpha_channels, etc.)
+        # 3. Clean up storage lists (all_latents, all_alpha_channels, etc.)
         tensor_storage_keys = ['all_latents', 'all_transformed_videos', 
                             'all_alpha_channels', 'all_input_rgb']
         for key in tensor_storage_keys:
@@ -1412,11 +1423,11 @@ def postprocess_all_batches(
                 release_tensor_collection(ctx[key])
                 del ctx[key]
         
-        # 5. Clean up non-tensor storage
+        # 4. Clean up non-tensor storage
         if 'all_ori_lengths' in ctx:
             del ctx['all_ori_lengths']
         
-        # 6. Final deep memory clear
+        # 5. Final deep memory clear
         clear_memory(debug=debug, deep=True, force=True, timer_name="final_memory_clear")
         
     debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
