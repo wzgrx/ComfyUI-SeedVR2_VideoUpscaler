@@ -86,7 +86,6 @@ class InflatedCausalConv3d(Conv3d):
         split_dim=3,
         padding=(0, 0, 0, 0, 0, 0),
         prev_cache=None,
-        preserve_vram = False,
     ):
         # Compatible with no limit.
         if math.isinf(self.memory_limit):
@@ -163,8 +162,7 @@ class InflatedCausalConv3d(Conv3d):
                 x[idx],
                 split_dim=split_dim + 1,
                 padding=padding,
-                prev_cache=cache,
-                preserve_vram=preserve_vram
+                prev_cache=cache
             )
 
             # Update cache.
@@ -182,8 +180,7 @@ class InflatedCausalConv3d(Conv3d):
     def forward(
         self,
         input: Union[Tensor, List[Tensor]],
-        memory_state: MemoryState = MemoryState.UNSET,
-        preserve_vram: bool = False,
+        memory_state: MemoryState = MemoryState.UNSET
     ) -> Tensor:
         assert memory_state != MemoryState.UNSET
         if memory_state != MemoryState.ACTIVE:
@@ -194,7 +191,7 @@ class InflatedCausalConv3d(Conv3d):
             and get_sequence_parallel_group() is None
         ):
             return self.basic_forward(input, memory_state)
-        return self.slicing_forward(input, memory_state, preserve_vram)
+        return self.slicing_forward(input, memory_state)
 
     def basic_forward(self, input: Tensor, memory_state: MemoryState = MemoryState.UNSET):
         mem_size = self.stride[0] - self.kernel_size[0]
@@ -221,7 +218,6 @@ class InflatedCausalConv3d(Conv3d):
         self,
         input: Union[Tensor, List[Tensor]],
         memory_state: MemoryState = MemoryState.UNSET,
-        preserve_vram: bool = False,
     ) -> Tensor:
         squeeze_out = False
         if torch.is_tensor(input):
@@ -267,8 +263,7 @@ class InflatedCausalConv3d(Conv3d):
             input[i] = self.memory_limit_conv(
                 input[i],
                 padding=padding,
-                prev_cache=cache,
-                preserve_vram=preserve_vram
+                prev_cache=cache
             )
 
             # Update cache.
@@ -323,7 +318,7 @@ def init_causal_conv3d(
     return InflatedCausalConv3d(*args, inflation_mode=inflation_mode, **kwargs)
 
 
-def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor, preserve_vram: bool = False) -> torch.Tensor:
+def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     input_dtype = x.dtype
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:

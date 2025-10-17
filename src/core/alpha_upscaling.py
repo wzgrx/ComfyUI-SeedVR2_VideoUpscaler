@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from typing import Optional, Any, List
 from ..common.half_precision_fixes import ensure_float32_precision
+from ..optimization.memory_manager import manage_tensor_device
 
 
 def process_alpha_for_batch(
@@ -27,8 +28,8 @@ def process_alpha_for_batch(
     
     Args:
         rgb_samples: List of decoded RGB samples
-        alpha_original: Original Alpha channel (C, T, H, W) on CPU
-        rgb_original: Original RGB for guidance (C, T, H, W) on CPU
+        alpha_original: Original Alpha channel (C, T, H, W)
+        rgb_original: Original RGB for guidance (C, T, H, W)
         device: Target device for processing
         debug: Debug instance
         
@@ -36,13 +37,33 @@ def process_alpha_for_batch(
         List of RGBA samples with Alpha merged
     """
     # Move alpha and RGB guidance tensors to processing device (GPU)
-    alpha_original = alpha_original.to(device, non_blocking=False)
-    rgb_original = rgb_original.to(device, non_blocking=False)
+    alpha_original = manage_tensor_device(
+        tensor=alpha_original,
+        target_device=device,
+        tensor_name="alpha_original",
+        debug=debug,
+        reason="Alpha processing"
+    )
+    rgb_original = manage_tensor_device(
+        tensor=rgb_original,
+        target_device=device,
+        tensor_name="rgb_original",
+        debug=debug,
+        reason="Alpha processing"
+    )
     
     # Process each RGB sample individually to handle variable frame counts
     processed_samples = []
     
     for rgb_sample in rgb_samples:
+        # Move RGB sample to processing device before use
+        rgb_sample = manage_tensor_device(
+            tensor=rgb_sample,
+            target_device=device,
+            tensor_name="rgb_sample",
+            debug=debug,
+            reason="Alpha processing"
+        )
         # Handle dimension variations between single frames and video sequences
         if rgb_sample.ndim == 3:
             # Single frame: (C, H, W) -> need to add T dimension
@@ -84,17 +105,22 @@ def process_alpha_for_batch(
     return processed_samples
 
 
-def detect_edges_batch(images: torch.Tensor, method: str = 'sobel') -> torch.Tensor:
+def detect_edges_batch(
+    images: torch.Tensor,
+    method: str = 'sobel',
+    debug: Optional[Any] = None
+    ) -> torch.Tensor:
     """
     Detect edges in a batch of images using Sobel or Canny.
     
     Args:
         images: Tensor of shape (T, C, H, W) in range [-1, 1] or [0, 1]
         method: 'sobel' or 'canny'
+        debug: Optional debug instance for logging
         
     Returns:
         Edge map tensor of shape (T, 1, H, W) in range [0, 1]
-    """    
+    """
     # Convert to float32 for OpenCV processing (will be converted to numpy anyway)
     images, images_dtype = ensure_float32_precision(images, force_float32=True)
     
@@ -129,10 +155,17 @@ def detect_edges_batch(images: torch.Tensor, method: str = 'sobel') -> torch.Ten
     
     edges = np.stack(edges)
     edges = torch.from_numpy(edges).float() / 255.0
-    edges = edges.unsqueeze(1).to(images.device)
+    edges = edges.unsqueeze(1)
     
-    # Restore original dtype
-    edges = edges.to(images_dtype)
+    # Move back to images device after CPU numpy processing
+    edges = manage_tensor_device(
+        tensor=edges,
+        target_device=images.device,
+        tensor_name="edge_map",
+        dtype=images_dtype,
+        debug=debug,
+        reason="edge detection result"
+    )
     
     return edges
 
@@ -168,8 +201,16 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
     # Apply guided filter
     output = _apply_guided_filter(guide_gray, src, radius, eps)
     
-    # Restore original dtype
-    output = output.to(guide_dtype)
+    # Restore original dtype after float32 processing
+    if output.dtype != guide_dtype:
+        output = manage_tensor_device(
+            tensor=output,
+            target_device=output.device,
+            tensor_name="filtered_output",
+            dtype=guide_dtype,
+            debug=debug,
+            reason="dtype restoration"
+        )
     
     return output
 
@@ -267,9 +308,9 @@ def edge_guided_alpha_upscale(
     is_binary_mask = binary_ratio > 0.95
     
     if debug:
-        debug.log(f"    Alpha type: {'binary mask' if is_binary_mask else 'gradient alpha'}", category="alpha")
-        debug.log(f"    Binary ratio: {binary_ratio:.2%}", category="alpha")
-        debug.log("    Creating tight edge-aligned transitions", category="alpha")
+        debug.log(f"  Alpha type: {'binary mask' if is_binary_mask else 'gradient alpha'}", category="alpha")
+        debug.log(f"  Binary ratio: {binary_ratio:.2%}", category="alpha")
+        debug.log("  Creating tight edge-aligned transitions", category="alpha")
     
     # Normalize RGB from [-1, 1] to [0, 1] for edge detection
     rgb_normalized = upscaled_rgb.clone()
@@ -277,7 +318,7 @@ def edge_guided_alpha_upscale(
         rgb_normalized = (rgb_normalized + 1) / 2
     
     # Detect edges in upscaled RGB
-    rgb_edges = detect_edges_batch(rgb_normalized, method='sobel')
+    rgb_edges = detect_edges_batch(images=rgb_normalized, method='sobel', debug=debug)
     
     # Step 1: Initial bicubic upscale provides smooth base before edge refinement
     alpha_upscaled = F.interpolate(
@@ -290,7 +331,7 @@ def edge_guided_alpha_upscale(
     
     if is_binary_mask:
         if debug:
-            debug.log("    Applying tight edge-aware refinement", category="alpha")
+            debug.log("  Applying tight edge-aware refinement", category="alpha")
         
         # Step 2: Single-pass guided filter with small radius for tight edges
         alpha_refined = guided_filter_pytorch(
@@ -344,7 +385,7 @@ def edge_guided_alpha_upscale(
     else:
         # For gradient alphas: single guided filter pass preserves smooth transitions
         if debug:
-            debug.log("    Applying guided filter for gradient alpha", category="alpha")
+            debug.log("  Applying guided filter for gradient alpha", category="alpha")
         
         alpha_final = alpha_upscaled.clone()
         
@@ -357,11 +398,19 @@ def edge_guided_alpha_upscale(
             debug=None
         )
     
-    # Clamp output to valid alpha range [0, 1]
+   # Clamp output to valid alpha range [0, 1]
     alpha_final = alpha_final.clamp(0, 1)
 
-    # Restore original dtype
-    alpha_final = alpha_final.to(alpha_dtype)
+    # Restore original dtype after float32 processing
+    if alpha_final.dtype != alpha_dtype:
+        alpha_final = manage_tensor_device(
+            tensor=alpha_final,
+            target_device=alpha_final.device,
+            tensor_name="alpha_final",
+            dtype=alpha_dtype,
+            debug=debug,
+            reason="dtype restoration"
+        )
     
     if debug:
         final_values = alpha_final.flatten()
@@ -371,6 +420,6 @@ def edge_guided_alpha_upscale(
         mid_grays = ((final_values >= 0.35) & (final_values <= 0.65)).sum().item()
         total = final_values.numel()
         
-        debug.log(f"    Pure 0s: {exact_zeros/total*100:.1f}% | Pure 1s: {exact_ones/total*100:.1f}% | Smooth edges: {smooth_edges/total*100:.1f}% | Mid-grays: {mid_grays/total*100:.1f}%", category="alpha")
+        debug.log(f"  Pure 0s: {exact_zeros/total*100:.1f}% | Pure 1s: {exact_ones/total*100:.1f}% | Smooth edges: {smooth_edges/total*100:.1f}% | Mid-grays: {mid_grays/total*100:.1f}%", category="alpha")
     
     return alpha_final

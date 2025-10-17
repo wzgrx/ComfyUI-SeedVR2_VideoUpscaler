@@ -46,7 +46,6 @@ except ImportError:
 from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
 from ..common.config import load_config, create_object
-from ..common.distributed import get_device
 from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
 from ..optimization.compatibility import FP8CompatibleDiT
 from ..optimization.blockswap import is_blockswap_enabled, apply_block_swap_to_dit, cleanup_blockswap
@@ -464,7 +463,6 @@ def configure_runner(
     dit_model: str,
     vae_model: str,
     base_cache_dir: str,
-    preserve_vram: bool = False,
     debug: Optional[Debug] = None,
     dit_cache: bool = False,
     vae_cache: bool = False,
@@ -489,10 +487,9 @@ def configure_runner(
         dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         base_cache_dir: Base directory containing model files
-        preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
         debug: Debug instance for logging (required)
-        dit_cache: Whether to cache DiT model in RAM between runs
-        vae_cache: Whether to cache VAE model in RAM between runs
+        dit_cache: Whether to cache DiT model between runs
+        vae_cache: Whether to cache VAE model between runs
         dit_id: Node instance ID for DiT model caching (required if dit_cache=True)
         vae_id: Node instance ID for VAE model caching (required if vae_cache=True)
         block_swap_config: Optional BlockSwap configuration for DiT memory optimization
@@ -615,7 +612,7 @@ def _initialize_cache_context(
     # Check for cached DiT model with model name validation
     # Model name validation prevents stale cache when user switches models in UI
     if dit_cache and dit_model and dit_id is not None:
-        cached_model = global_cache.get_dit({'node_id': dit_id, 'cache_in_ram': True}, debug)
+        cached_model = global_cache.get_dit({'node_id': dit_id, 'cache_model': True}, debug)
         if cached_model:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
@@ -635,7 +632,7 @@ def _initialize_cache_context(
 
     # Check for cached VAE model with model name validation
     if vae_cache and vae_model and vae_id is not None:
-        cached_model = global_cache.get_vae({'node_id': vae_id, 'cache_in_ram': True}, debug)
+        cached_model = global_cache.get_vae({'node_id': vae_id, 'cache_model': True}, debug)
         if cached_model:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
@@ -923,7 +920,7 @@ def _setup_dit_model(
         if hasattr(runner, 'dit') and runner.dit is not None:
             debug.log(f"DiT model changed ({current_dit_name} → {dit_model}), cleaning old model", 
                      category="cache", force=True)
-            cleanup_dit(runner=runner, debug=debug, keep_model_in_ram=False)
+            cleanup_dit(runner=runner, debug=debug, cache_model=False)
     
     if cache_context['cached_dit'] is not None:
         # Reuse cached DiT model
@@ -989,7 +986,7 @@ def _setup_vae_model(
         if hasattr(runner, 'vae') and runner.vae is not None:
             debug.log(f"VAE model changed ({current_vae_name} → {vae_model}), cleaning old model", 
                      category="cache", force=True)
-            cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=False)
+            cleanup_vae(runner=runner, debug=debug, cache_model=False)
     
     if cache_context['cached_vae'] is not None:
         # Reuse cached VAE model
@@ -1043,13 +1040,17 @@ def _setup_vae_model(
         return False
 
 
-def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: Optional[Debug] = None) -> Dict[str, torch.Tensor]:
+def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
+                              debug: Optional[Debug] = None) -> Dict[str, torch.Tensor]:
     """
-    Load model state dictionary with optimal memory management
+    Load model state dict from checkpoint with support for multiple formats.
+    
+    Handles .safetensors, .gguf, and .pth files. GGUF models support quantization
+    for memory-efficient loading. Validates required libraries are installed.
     
     Args:
-        checkpoint_path (str): Path to checkpoint file (.safetensors or .pth)
-        device (str/torch.device): Target device for tensor placement
+        checkpoint_path: Path to checkpoint file
+        device: Target device for tensor placement (torch.device object, defaults to CPU)
         debug: Optional Debug instance for logging
         
     Returns:
@@ -1059,6 +1060,8 @@ def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: 
         - SafeTensors files use optimized loading with direct device placement
         - PyTorch files use memory-mapped loading to reduce RAM usage
     """
+    device_str = str(device)
+    
     if checkpoint_path.endswith('.safetensors'):
         if not SAFETENSORS_AVAILABLE:
             error_msg = (
@@ -1071,7 +1074,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: 
                 debug.log("This is a one-time installation that will enable loading of .safetensors files", 
                          level="INFO", category="info", force=True)
             raise ImportError(error_msg)
-        state = load_safetensors_file(checkpoint_path, device=device)
+        state = load_safetensors_file(checkpoint_path, device=device_str)
     elif checkpoint_path.endswith('.gguf'):
         if not GGUF_AVAILABLE:
             error_msg = (
@@ -1091,17 +1094,26 @@ def load_quantized_state_dict(checkpoint_path: str, device: str = "cpu", debug: 
                     handle_prefix="model.diffusion_model."
                 )
     elif checkpoint_path.endswith('.pth'):
-        state = torch.load(checkpoint_path, map_location=device, mmap=True)
+        state = torch.load(checkpoint_path, map_location=device_str, mmap=True)
     else:
         raise ValueError(f"Unsupported checkpoint format. Expected .safetensors or .pth, got: {checkpoint_path}")
     
     return state
 
 
-def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
+def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional[Debug],
                     handle_prefix: str = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
     """
     Load GGUF state dict
+    
+    Args:
+        checkpoint_path: Path to GGUF file
+        device: Target device (torch.device object)
+        debug: Debug instance
+        handle_prefix: Prefix to strip from tensor names
+        
+    Returns:
+        State dictionary with loaded tensors
     """
     reader = gguf.GGUFReader(checkpoint_path)
 
@@ -1124,7 +1136,8 @@ def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
     state_dict = {}
     total_tensors = len(reader.tensors)
     
-    debug.log(f"Loading {total_tensors} tensors to {device}...", category="dit")
+    device_str = str(device)
+    debug.log(f"Loading {total_tensors} tensors to {str(device_str)}...", category="dit")
     
     # Suppress expected warnings: GGUF tensors are read-only numpy arrays that trigger warnings when converted
     suppress_tensor_warnings()
@@ -1155,7 +1168,7 @@ def _load_gguf_state(checkpoint_path: str, device: str, debug: Optional[Debug],
         if (i + 1) % 100 == 0:
             debug.log(f"  Loaded {i+1}/{total_tensors} tensors...", category="dit")
 
-    debug.log(f"Successfully loaded {len(state_dict)} tensors to {device}", category="success")
+    debug.log(f"Successfully loaded {len(state_dict)} tensors to {device_str}", category="success")
 
     return state_dict
 
@@ -1384,9 +1397,8 @@ def prepare_model_structure(runner: VideoDiffusionInfer, model_type: str,
     return runner
 
 
-def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str, 
-                     config: OmegaConf, preserve_vram: bool = False,
-                     debug: Optional[Debug] = None) -> None:
+def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torch.device, 
+                     config: OmegaConf, debug: Optional[Debug] = None) -> None:
     """
     Materialize model weights from checkpoint to memory.
     Call this right before the model is needed.
@@ -1394,9 +1406,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
     Args:
         runner: Runner with model structure on meta device
         model_type: "dit" or "vae"
-        device: Target device for inference
+        device: Target device for inference (torch.device object)
         config: Full configuration
-        preserve_vram: Whether to keep on CPU
         debug: Debug instance
     """
     if debug is None:
@@ -1426,28 +1437,31 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
         debug.log(f"{model_type_upper} already materialized on {model.device}", category=model_type)
         return
     
-    # Determine target device
-    # For DiT, check if BlockSwap is active; for VAE, blockswap is never active
-    blockswap_active = is_dit and hasattr(runner, '_blockswap_active') and runner._blockswap_active
-    use_cpu = preserve_vram or blockswap_active
-    target_device = "cpu" if use_cpu else device
-    
-    # Build reason string for logging
-    cpu_reason = ""
-    if target_device == "cpu":
-        reasons = []
+    # Determine target device for materialization
+    # For DiT with BlockSwap, materialize to offload device (blocks distributed later)
+    # For VAE or DiT without BlockSwap, materialize to inference device
+    offload_reason = ""
+    if is_dit:
+        blockswap_active = hasattr(runner, '_blockswap_active') and runner._blockswap_active
         if blockswap_active:
-            reasons.append("BlockSwap")
-        if preserve_vram:
-            reasons.append("preserve_vram")
-        cpu_reason = f" ({', '.join(reasons)})" if reasons else ""
+            # BlockSwap: materialize to offload device, blocks will be distributed
+            target_device = runner._block_swap_config.get("offload_device")
+            if target_device is None:
+                target_device = torch.device("cpu")
+            offload_reason = f" (BlockSwap offload device)"
+        else:
+            # No BlockSwap: materialize directly to inference device
+            target_device = device
+    else:
+        # VAE: always materialize to inference device
+        target_device = device
     
     # Start materialization
     debug.start_timer(f"{model_type}_materialize")
     
     # Load weights (this materializes from meta to target device)
     model = _load_model_weights(model, checkpoint_path, target_device, True,
-                               model_type_upper, cpu_reason, debug, override_dtype) 
+                               model_type_upper, offload_reason, debug, override_dtype) 
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
@@ -1464,7 +1478,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: str,
         runner._vae_dtype_override = None
 
 
-def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: str, 
+def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: torch.device, 
                         used_meta: bool, model_type: str, cpu_reason: str, 
                         debug: Debug, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """
@@ -1476,7 +1490,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     Args:
         model: Model instance (may be on meta device)
         checkpoint_path: Path to checkpoint file
-        target_device: Target device for weights
+        target_device: Target device for weights (torch.device object)
         used_meta: Whether model was created on meta device
         model_type: Model type string for logging
         cpu_reason: Reason string if using CPU
@@ -1490,7 +1504,8 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     
     # Log loading action
     action = "Materializing" if used_meta else "Loading"
-    debug.log(f"{action} {model_type} weights to {target_device.upper()}{cpu_reason}: {checkpoint_path}", 
+    target_device_str = str(target_device).upper()
+    debug.log(f"{action} {model_type} weights to {target_device_str}{cpu_reason}: {checkpoint_path}", 
              category=model_type_lower, force=True)
     
     # Load state dict from file
@@ -1834,7 +1849,7 @@ def _report_parameter_mismatches(state: Dict[str, torch.Tensor],
         debug.log(f"  First few missing: {missing[:5]}", level="WARNING", category="dit", force=True)
 
 
-def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: str, debug: Debug) -> None:
+def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: torch.device, debug: Debug) -> None:
     """Initialize meta buffers with timing."""
     debug.start_timer("buffer_init")
     initialized = _initialize_meta_buffers(model, target_device, debug)
@@ -1843,7 +1858,7 @@ def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: str,
     debug.end_timer("buffer_init", "Buffer initialization")
 
 
-def _initialize_meta_buffers(model: torch.nn.Module, target_device: str, debug: Optional[Debug]) -> int:
+def _initialize_meta_buffers(model: torch.nn.Module, target_device: torch.device, debug: Optional[Debug]) -> int:
     """
     Initialize any buffers still on meta device after materialization.
     
@@ -1852,7 +1867,7 @@ def _initialize_meta_buffers(model: torch.nn.Module, target_device: str, debug: 
     
     Args:
         model: Model potentially containing meta device buffers
-        target_device: Target device for initialization
+        target_device: Target device for initialization (torch.device object)
         debug: Debug instance for logging
         
     Returns:

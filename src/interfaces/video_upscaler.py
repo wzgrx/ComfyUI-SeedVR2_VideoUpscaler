@@ -10,9 +10,8 @@ from ..utils.constants import get_base_cache_dir
 from ..utils.downloads import download_weight
 from ..utils.debug import Debug
 from ..core.generation import (
-    setup_device_environment,
     setup_video_transform,
-    prepare_generation_context, 
+    setup_generation_context, 
     prepare_runner,
     encode_all_batches, 
     upscale_all_batches, 
@@ -22,7 +21,8 @@ from ..core.generation import (
 )
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
-    complete_cleanup
+    complete_cleanup,
+    get_device_list
 )
 
 # Import ComfyUI progress reporting
@@ -78,8 +78,6 @@ class SeedVR2VideoUpscaler:
                     "step": 1,
                     "tooltip": "Random seed for generation. Same seed = same output."
                 }),
-            },
-            "optional": {
                 "new_resolution": ("INT", {
                     "default": 1072, 
                     "min": 16, 
@@ -94,6 +92,8 @@ class SeedVR2VideoUpscaler:
                     "step": 4,
                     "tooltip": "Frames processed per batch. At least 5 for temporal consistency. Higher = better quality but more VRAM."
                 }),
+            },
+            "optional": {
                 "color_correction": (["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], {
                     "default": "lab",
                     "tooltip": "Color correction method:\n• lab - Full perceptual color matching with detail preservation (recommended)\n• wavelet - Frequency-based transfer preserving high-frequency details\n• wavelet_adaptive - Wavelet base + targeted saturation correction for oversaturated regions\n• hsv - Hue-conditional saturation histogram matching\n• adain - Statistical style transfer (mean/std matching)\n• none - No color correction applied"
@@ -112,9 +112,9 @@ class SeedVR2VideoUpscaler:
                     "step": 0.001,
                     "tooltip": "Add noise during diffusion for detail softening (use sparingly)"
                 }),
-                "preserve_vram": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Offload models between pipeline steps (slower but saves VRAM)"
+                "offload_device": (get_device_list(include_none=True, include_cpu=True), {
+                    "default": "cpu",
+                    "tooltip": "Device to offload intermediate tensors between pipeline phases. 'cpu' prevents VRAM accumulation for long videos. 'none' keeps all tensors on inference device (faster but increases VRAM usage)."
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
@@ -130,7 +130,7 @@ class SeedVR2VideoUpscaler:
     def execute(self, pixels: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
-                latent_noise_scale: float = 0.0, preserve_vram: bool = False,
+                latent_noise_scale: float = 0.0, offload_device: str = "none", 
                 enable_debug: bool = False) -> Tuple[torch.Tensor]:
         """
         Execute SeedVR2 video upscaling with progress reporting
@@ -146,10 +146,10 @@ class SeedVR2VideoUpscaler:
             seed: Random seed for reproducible generation
             new_resolution: Target resolution for shortest edge (maintains aspect ratio)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
-            color_correction: Color correction method ("wavelet", "adain", or "none")
+            color_correction: Color correction method ("lab", "wavelet", "wavelet_adaptive", "hsv", "adain", or "none")
             input_noise_scale: Input noise injection scale [0.0-1.0]
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
-            preserve_vram: Offload models between pipeline phases to save VRAM
+            offload_device: Device to offload intermediate tensors
             enable_debug: Enable detailed logging and memory tracking
             
         Returns:
@@ -166,15 +166,20 @@ class SeedVR2VideoUpscaler:
         # Extract configuration from dict inputs
         dit_model = dit["model"]
         vae_model = vae["model"]
-        dit_device = dit["device"]
-        vae_device = vae["device"]
-        dit_cache = dit["cache_in_ram"]
-        vae_cache = vae["cache_in_ram"]
+        dit_device = torch.device(dit["device"])
+        vae_device = torch.device(vae["device"])
+        dit_cache = dit["cache_model"]
+        vae_cache = vae["cache_model"]
         dit_id = dit.get("node_id")
         vae_id = vae.get("node_id")
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
+        # Normalize offload devices: "none" -> None, convert strings to torch.device
+        dit_offload_device = None if dit.get("offload_device", "none") == "none" else torch.device(dit.get("offload_device"))
+        vae_offload_device = None if vae.get("offload_device", "none") == "none" else torch.device(vae.get("offload_device"))
+        tensor_offload_device = None if offload_device == "none" else torch.device(offload_device)
+ 
         # Extract VAE tiling configuration
         encode_tiled = vae["encode_tiled"]
         encode_tile_size = vae["encode_tile_size"]
@@ -189,6 +194,7 @@ class SeedVR2VideoUpscaler:
             block_swap_config = {
                 "blocks_to_swap": dit["blocks_to_swap"],
                 "swap_io_components": dit["swap_io_components"],
+                "offload_device": dit_offload_device
             }
         
         # Fixed parameters
@@ -241,7 +247,6 @@ class SeedVR2VideoUpscaler:
                 decode_tiled=decode_tiled,
                 decode_tile_size=decode_tile_size,
                 decode_tile_overlap=decode_tile_overlap,
-                preserve_vram=preserve_vram,
                 temporal_overlap=temporal_overlap,
                 dit_cache=dit_cache,
                 vae_cache=vae_cache,
@@ -249,6 +254,9 @@ class SeedVR2VideoUpscaler:
                 vae_id=vae_id,
                 dit_device=dit_device,
                 vae_device=vae_device,
+                dit_offload_device=dit_offload_device,
+                vae_offload_device=vae_offload_device,
+                tensor_offload_device=tensor_offload_device,
                 dit_torch_compile_args=dit_torch_compile_args,
                 vae_torch_compile_args=vae_torch_compile_args,
                 block_swap_config=block_swap_config
@@ -275,14 +283,16 @@ class SeedVR2VideoUpscaler:
         decode_tiled: bool, 
         decode_tile_size: int, 
         decode_tile_overlap: int, 
-        preserve_vram: bool, 
         temporal_overlap: int, 
         dit_cache: bool, 
         vae_cache: bool, 
         dit_id: int,
         vae_id: int,
-        dit_device: str, 
-        vae_device: str,
+        dit_device: torch.device, 
+        vae_device: torch.device,
+        dit_offload_device: Optional[torch.device],
+        vae_offload_device: Optional[torch.device],
+        tensor_offload_device: Optional[torch.device],
         dit_torch_compile_args: Optional[Dict[str, Any]], 
         vae_torch_compile_args: Optional[Dict[str, Any]], 
         block_swap_config: Optional[Dict[str, Any]]
@@ -313,14 +323,16 @@ class SeedVR2VideoUpscaler:
             decode_tiled: Enable VAE tiled decoding
             decode_tile_size: VAE decoding tile size in pixels
             decode_tile_overlap: VAE decoding tile overlap in pixels
-            preserve_vram: Offload models between phases
             temporal_overlap: Overlap frames between batches (fixed at 0)
-            dit_cache: Keep DiT model in RAM after use
-            vae_cache: Keep VAE model in RAM after use
+            dit_cache: Keep DiT model on dit_offload_device after use
+            vae_cache: Keep VAE model on vae_offload_device after use
             dit_id: Node instance ID for DiT model caching
             vae_id: Node instance ID for VAE model caching
-            dit_device: Device string for DiT model
-            vae_device: Device string for VAE model
+            dit_device: Target device for DiT model inference (torch.device object)
+            vae_device: Target device for VAE model inference (torch.device object)
+            dit_offload_device: Device to offload DiT when not in use (torch.device object or None)
+            vae_offload_device: Device to offload VAE when not in use (torch.device object or None)
+            tensor_offload_device: Device to offload intermediate tensors (torch.device object or None)
             dit_torch_compile_args: Optional torch.compile settings for DiT
             vae_torch_compile_args: Optional torch.compile settings for VAE
             block_swap_config: Optional BlockSwap configuration for DiT
@@ -349,20 +361,25 @@ class SeedVR2VideoUpscaler:
         else:
             self._pbar = None
 
-        # Setup device environment
-        dit_device, vae_device = setup_device_environment(dit_device, vae_device, debug)
-
-        # Create generation context with the configured device
-        ctx = prepare_generation_context(dit_device=dit_device, vae_device=vae_device, debug=debug)
+        # Setup generation context with device configuration
+        ctx = setup_generation_context(
+            dit_device=dit_device,
+            vae_device=vae_device,
+            dit_offload_device=dit_offload_device,
+            vae_offload_device=vae_offload_device,
+            tensor_offload_device=tensor_offload_device,
+            debug=debug
+        )
         self.ctx = ctx
 
         # Prepare runner with model state management and global cache
+        # Device configuration is automatically stored on runner
         self.runner, model_changed, cache_context = prepare_runner(
             dit_model=dit_model, 
             vae_model=vae_model, 
             model_dir=get_base_cache_dir(),
-            preserve_vram=preserve_vram,
             debug=debug,
+            ctx=ctx,
             dit_cache=dit_cache,
             vae_cache=vae_cache,
             dit_id=dit_id,
@@ -416,7 +433,6 @@ class SeedVR2VideoUpscaler:
             ctx=ctx, 
             images=pixels, 
             batch_size=batch_size, 
-            preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback, 
             temporal_overlap=temporal_overlap, 
@@ -429,7 +445,6 @@ class SeedVR2VideoUpscaler:
         ctx = upscale_all_batches(
             self.runner, 
             ctx=ctx, 
-            preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback, 
             cfg_scale=cfg_scale, 
@@ -442,7 +457,6 @@ class SeedVR2VideoUpscaler:
         ctx = decode_all_batches(
             self.runner, 
             ctx=ctx, 
-            preserve_vram=preserve_vram,
             debug=debug, 
             progress_callback=self._progress_callback,
             cache_model=vae_cache
@@ -459,13 +473,14 @@ class SeedVR2VideoUpscaler:
         # Get final result - preserve channel format from input
         sample = ctx['final_video']
         
-        # Convert to float32 for maximum ComfyUI compatibility
-        if torch.is_tensor(sample) and sample.dtype != torch.float32:
-            sample = sample.to(torch.float32)
-        
-        # Ensure output is on CPU (ComfyUI expects CPU tensors)
-        if torch.is_tensor(sample) and sample.is_cuda:
-            sample = sample.cpu()
+        # Convert to float32 for maximum ComfyUI compatibility and move to CPU
+        if torch.is_tensor(sample):
+            # Move to CPU if not already there (ComfyUI expects CPU tensors)
+            if sample.is_cuda or sample.is_mps:
+                sample = sample.cpu()
+            # Convert dtype if needed
+            if sample.dtype != torch.float32:
+                sample = sample.to(torch.float32)
 
         debug.log("", category="none", force=True)
         debug.log("Video upscaling completed successfully!", category="success", force=True)
@@ -571,8 +586,8 @@ class SeedVR2VideoUpscaler:
         Cleanup resources after upscaling.
         
         Args:
-            dit_cache: If True, keep DiT model in RAM for reuse
-            vae_cache: If True, keep VAE model in RAM for reuse
+            dit_cache: If True, keep DiT model cached for reuse
+            vae_cache: If True, keep VAE model cached for reuse
             debug: Debug instance (uses self.debug if not provided)
         """
         # Use existing debug from runner if not provided
@@ -581,7 +596,7 @@ class SeedVR2VideoUpscaler:
         
         # Use complete_cleanup for all cleanup operations
         if self.runner:
-            complete_cleanup(runner=self.runner, debug=debug, keep_dit_in_ram=dit_cache, keep_vae_in_ram=vae_cache)
+            complete_cleanup(runner=self.runner, debug=debug, cache_dit=dit_cache, cache_vae=vae_cache)
             
             # Delete runner only if neither model is cached
             if not (dit_cache or vae_cache):

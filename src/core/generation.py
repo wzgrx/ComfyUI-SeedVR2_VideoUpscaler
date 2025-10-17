@@ -31,7 +31,6 @@ from torchvision.transforms import Compose, Lambda, Normalize
 from .alpha_upscaling import process_alpha_for_batch
 from .infer import VideoDiffusionInfer
 from .model_manager import configure_runner, materialize_model, apply_model_specific_config
-from ..common.distributed import get_device
 from ..common.seed import set_seed
 from ..data.image.transforms.divisible_crop import DivisibleCrop
 from ..data.image.transforms.na_resize import NaResize
@@ -40,6 +39,7 @@ from ..optimization.memory_manager import (
     cleanup_vae,
     cleanup_text_embeddings,
     clear_memory,
+    manage_tensor_device,
     manage_model_device,
     release_tensor_memory,
     release_tensor_collection
@@ -112,15 +112,16 @@ def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Debug) -> None
         debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
 
 
-def load_text_embeddings(script_directory: str, device: Union[str, torch.device], 
-                        dtype: torch.dtype) -> Dict[str, List[torch.Tensor]]:
+def load_text_embeddings(script_directory: str, device: torch.device, 
+                        dtype: torch.dtype, debug: Optional[Debug] = None) -> Dict[str, List[torch.Tensor]]:
     """
     Load and prepare text embeddings for generation
     
     Args:
         script_directory (str): Script directory path
-        device (str): Target device
+        device (torch.device): Target device
         dtype (torch.dtype): Target dtype
+        debug: Optional debug instance for logging
         
     Returns:
         dict: Text embeddings dictionary
@@ -129,9 +130,27 @@ def load_text_embeddings(script_directory: str, device: Union[str, torch.device]
         - Adaptive dtype handling
         - Device-optimized loading
         - Memory-efficient embedding preparation
+        - Consistent movement logging
     """
-    text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt')).to(device, dtype=dtype)
-    text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt')).to(device, dtype=dtype)
+    text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt'))
+    text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt'))
+    
+    text_pos_embeds = manage_tensor_device(
+        tensor=text_pos_embeds,
+        target_device=device,
+        tensor_name="text_pos_embeds",
+        dtype=dtype,
+        debug=debug,
+        reason="DiT inference"
+    )
+    text_neg_embeds = manage_tensor_device(
+        tensor=text_neg_embeds,
+        target_device=device,
+        tensor_name="text_neg_embeds",
+        dtype=dtype,
+        debug=debug,
+        reason="DiT inference"
+    )
     
     return {"texts_pos": [text_pos_embeds], "texts_neg": [text_neg_embeds]}
 
@@ -231,30 +250,121 @@ def check_interrupt(ctx: Dict[str, Any]) -> None:
         ctx['interrupt_fn']()
 
 
-def prepare_generation_context(dit_device: str, vae_device: str, debug: Optional['Debug'] = None) -> Dict[str, Any]:
+def _ensure_precision_initialized(
+    ctx: Dict[str, Any],
+    runner: 'VideoDiffusionInfer',
+    debug: Optional['Debug'] = None
+) -> None:
     """
-    Initialize generation context for the upscaling pipeline.
+    Initialize compute_dtype and autocast_dtype based on actual model dtypes.
     
-    Creates a context dictionary that holds all state and configuration needed
-    throughout the generation process.
-    Supports independent device placement for DiT and VAE models.
+    Lazily initializes compute_dtype and autocast_dtype by inspecting actual
+    model weights to determine optimal precision settings. Only checks models
+    that are materialized (not on meta device). Safe to call multiple times.
     
     Args:
-        dit_device: Device for DiT model (required, e.g., "cuda:0", "cuda:1", "cpu")
-        vae_device: Device for VAE model (required, e.g., "cuda:0", "cuda:1", "cpu")
+        ctx: Generation context dictionary to update with precision settings
+        runner: VideoDiffusionInfer instance with loaded models
+        debug: Optional Debug instance for logging
+    """
+    try:
+        # Check which models are materialized (not on meta device)
+        dit_dtype = None
+        vae_dtype = None
+        
+        if runner.dit is not None:
+            try:
+                param_device = next(runner.dit.parameters()).device
+                if param_device.type != 'meta':
+                    dit_dtype = next(runner.dit.parameters()).dtype
+            except StopIteration:
+                pass
+        
+        if runner.vae is not None:
+            try:
+                param_device = next(runner.vae.parameters()).device
+                if param_device.type != 'meta':
+                    vae_dtype = next(runner.vae.parameters()).dtype
+            except StopIteration:
+                pass
+        
+        # Need at least one materialized model
+        if dit_dtype is None and vae_dtype is None:
+            return
+        
+        # Initialize compute dtype once
+        if ctx.get('compute_dtype') is None:
+            ctx['compute_dtype'] = torch.bfloat16
+            ctx['autocast_dtype'] = torch.bfloat16
+        
+        # Always log current state (what's materialized)
+        if debug:
+            parts = []
+            if dit_dtype is not None:
+                parts.append(f"DiT={dit_dtype}")
+            if vae_dtype is not None:
+                parts.append(f"VAE={vae_dtype}")
+            parts.append(f"compute={ctx['compute_dtype']}")
+            parts.append(f"autocast={ctx['autocast_dtype']}")
+            
+            debug.log(f"Initialized precision: {', '.join(parts)}", category="precision")
+            
+    except Exception as e:
+        # Fallback to safe defaults
+        ctx['compute_dtype'] = torch.bfloat16
+        ctx['autocast_dtype'] = torch.bfloat16
+        
+        if debug:
+            debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
+
+
+def setup_generation_context(
+    dit_device: Optional[torch.device] = None,
+    vae_device: Optional[torch.device] = None,
+    dit_offload_device: Optional[torch.device] = None,
+    vae_offload_device: Optional[torch.device] = None,
+    tensor_offload_device: Optional[torch.device] = None,
+    debug: Optional['Debug'] = None
+) -> Dict[str, Any]:
+    """
+    Initialize generation context with device configuration.
+    
+    Processes device objects, configures environment variables, and creates the
+    generation context dictionary with all necessary state.
+    
+    Args:
+        dit_device: Device for DiT model (torch.device object, defaults to cpu)
+        vae_device: Device for VAE model (torch.device object, defaults to cpu)
+        dit_offload_device: Device to offload DiT to when not in use (optional torch.device)
+        vae_offload_device: Device to offload VAE to when not in use (optional torch.device)
+        tensor_offload_device: Device to offload intermediate tensors to (optional torch.device)
         debug: Debug instance for logging
         
-    Raises:
-        ValueError: If dit_device or vae_device is None
-        
+    Returns:
+        Dict[str, Any]: Generation context dictionary containing:
+            - dit_device: torch.device for DiT inference
+            - vae_device: torch.device for VAE inference
+            - offload device configurations
+            - state containers (latents, samples, etc.)
+            - ComfyUI integration hooks
+            
     Note:
         Precision settings (compute_dtype, autocast_dtype) are lazily initialized
         when first needed via _ensure_precision_initialized() to detect actual
         model dtypes and configure optimal computation settings.
     """
-    if dit_device is None or vae_device is None:
-        raise ValueError("Device must be provided to prepare_generation_context")
+    # Apply default devices if not specified
+    default_device = "cpu"
+    if dit_device is None:
+        dit_device = default_device
+    if vae_device is None:
+        vae_device = default_device
     
+    # Set LOCAL_RANK to 0 for single-GPU inference mode
+    # CLI multi-GPU uses CUDA_VISIBLE_DEVICES to restrict visibility per worker
+    os.environ.setdefault("LOCAL_RANK", "0")
+    
+    # Detect ComfyUI integration for interrupt support
     try:
         import comfy.model_management
         interrupt_fn = comfy.model_management.throw_exception_if_processing_interrupted
@@ -263,9 +373,13 @@ def prepare_generation_context(dit_device: str, vae_device: str, debug: Optional
         interrupt_fn = None
         comfyui_available = False
     
+    # Create generation context
     ctx = {
         'dit_device': dit_device,
         'vae_device': vae_device,
+        'dit_offload_device': dit_offload_device,
+        'vae_offload_device': vae_offload_device,
+        'tensor_offload_device': tensor_offload_device,
         'compute_dtype': None,
         'autocast_dtype': None,
         'video_transform': None,
@@ -276,116 +390,38 @@ def prepare_generation_context(dit_device: str, vae_device: str, debug: Optional
         'batch_samples': [],
         'final_video': None,
         'comfyui_available': comfyui_available,
-        'interrupt_fn': interrupt_fn,  # Store the function reference
+        'interrupt_fn': interrupt_fn,
     }
     
     if debug:
-        debug.log("Initialized generation context", category="setup")
+        # Build device configuration summary
+        offload_info = []
+        if dit_offload_device:
+            offload_info.append(f"DiT offload={str(dit_offload_device)}")
+        if vae_offload_device:
+            offload_info.append(f"VAE offload={str(vae_offload_device)}")
+        if tensor_offload_device:
+            offload_info.append(f"Tensor offload={str(tensor_offload_device)}")
+        
+        offload_str = ", ".join(offload_info) if offload_info else "none"
+        
+        debug.log(
+            f"Generation context initialized: "
+            f"DiT={str(dit_device)}, VAE={str(vae_device)}, "
+            f"Offload=[{offload_str}], "
+            f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
+            category="setup"
+        )
     
     return ctx
-
-
-def _ensure_precision_initialized(
-    ctx: Dict[str, Any],
-    runner: 'VideoDiffusionInfer',
-    debug: Optional['Debug']
-) -> None:
-    """
-    Ensure precision settings are initialized in context based on model dtypes.
-    
-    Lazily initializes compute_dtype and autocast_dtype by inspecting actual
-    model weights to determine optimal precision settings. This avoids assuming
-    precision before models are loaded.
-    
-    Args:
-        ctx: Generation context dictionary to update with precision settings
-        runner: VideoDiffusionInfer instance with loaded models
-        debug: Optional Debug instance for logging
-        
-    Raises:
-        ValueError: If runner has no models loaded (both DiT and VAE are None)
-    """
-    if ctx.get('compute_dtype') is not None:
-        return  # Already initialized
-    
-    try:
-        # Get real dtype of loaded models
-        dit_dtype = next(runner.dit.parameters()).dtype
-        vae_dtype = next(runner.vae.parameters()).dtype
-
-        # Use BFloat16 for all models
-        # - FP8 models: BFloat16 required for arithmetic operations
-        # - FP16 models: BFloat16 provides better numerical stability and prevents black frames
-        # - BFloat16 models: Already optimal
-        if dit_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            ctx['compute_dtype'] = torch.bfloat16
-            ctx['autocast_dtype'] = torch.bfloat16
-        elif dit_dtype == torch.float16:
-            ctx['compute_dtype'] = torch.bfloat16
-            ctx['autocast_dtype'] = torch.bfloat16
-        else:
-            ctx['compute_dtype'] = torch.bfloat16
-            ctx['autocast_dtype'] = torch.bfloat16
-        
-        if debug:
-            debug.log(f"Initialized precision: DiT={dit_dtype}, VAE={vae_dtype}, compute={ctx['compute_dtype']}, autocast={ctx['autocast_dtype']}", category="precision")
-    except Exception as e:
-        # Fallback to safe defaults
-        ctx['compute_dtype'] = torch.bfloat16
-        ctx['autocast_dtype'] = torch.bfloat16
-        
-        if debug:
-            debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
-
-
-def setup_device_environment(dit_device: Optional[str] = None, 
-                            vae_device: Optional[str] = None,
-                            debug: Optional['Debug'] = None) -> Tuple[str, str]:
-    """
-    Setup device environment variables before model loading.
-    This must be called before configure_runner.
-    
-    Handles independent device configuration for DiT and VAE models,
-    allowing them to run on different GPUs for load balancing.
-    
-    Args:
-        dit_device: Device string for DiT model (e.g., "cuda:0", "none")
-        vae_device: Device string for VAE model (e.g., "cuda:1", "none")
-        debug: Debug instance for logging
-        
-    Returns:
-        Tuple[str, str]: (processed_dit_device, processed_vae_device)
-    """
-    # Get default device if not specified
-    default_device = "cpu"
-    if torch.cuda.is_available() or torch.mps.is_available():
-        default_device = str(get_device())
-    
-    # Apply defaults
-    if dit_device is None:
-        dit_device = default_device
-    if vae_device is None:
-        vae_device = default_device
-    
-    # Set LOCAL_RANK based on primary device (DiT device)
-    # This is for distributed compatibility with the main model
-    if dit_device != "none" and ":" in dit_device:
-        os.environ["LOCAL_RANK"] = dit_device.split(":")[1]
-    else:
-        os.environ["LOCAL_RANK"] = "0"
-    
-    if debug:
-        debug.log(f"Device environment configured: DiT={dit_device}, VAE={vae_device}, LOCAL_RANK={os.environ['LOCAL_RANK']}", category="setup")
-    
-    return dit_device, vae_device
 
 
 def prepare_runner(
     dit_model: str,
     vae_model: str,
     model_dir: str,
-    preserve_vram: bool,
     debug: 'Debug',
+    ctx: Dict[str, Any],
     dit_cache: bool = False,
     vae_cache: bool = False,
     dit_id: Optional[int] = None,
@@ -408,10 +444,10 @@ def prepare_runner(
         dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         model_dir: Base directory containing model files
-        preserve_vram: Whether to preserve VRAM by offloading models between pipeline steps
         debug: Debug instance for logging
-        dit_cache: Whether to cache DiT model in RAM between runs
-        vae_cache: Whether to cache VAE model in RAM between runs
+        ctx: Generation context from setup_generation_context
+        dit_cache: Whether to cache DiT model between runs
+        vae_cache: Whether to cache VAE model between runs
         dit_id: Node instance ID for DiT model caching
         vae_id: Node instance ID for VAE model caching
         block_swap_config: Optional BlockSwap configuration for DiT memory optimization
@@ -452,7 +488,6 @@ def prepare_runner(
         dit_model=dit_model,
         vae_model=vae_model,
         base_cache_dir=model_dir,
-        preserve_vram=preserve_vram,
         debug=debug,
         dit_cache=dit_cache,
         vae_cache=vae_cache,
@@ -472,9 +507,15 @@ def prepare_runner(
     # Store both model names for future comparisons
     runner._dit_model_name = dit_model
     runner._vae_model_name = vae_model
+    # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
+    runner._dit_device = ctx['dit_device']
+    runner._vae_device = ctx['vae_device']
+    runner._dit_offload_device = ctx['dit_offload_device']
+    runner._vae_offload_device = ctx['vae_offload_device']
     
     # Model changed if we didn't reuse an existing runner
     model_changed = not cache_context.get('reusing_runner', False)
+
     return runner, model_changed, cache_context
 
 
@@ -483,7 +524,6 @@ def encode_all_batches(
     ctx: Optional[Dict[str, Any]] = None,
     images: Optional[torch.Tensor] = None,
     batch_size: int = 5,
-    preserve_vram: bool = False,
     debug: Optional['Debug'] = None,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     temporal_overlap: int = 0,
@@ -499,11 +539,10 @@ def encode_all_batches(
     
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
-        ctx: Generation context from prepare_generation_context (required)
+        ctx: Generation context from setup_generation_context (required)
         images: Input frames tensor [T, H, W, C] range [0,1]. 
                 Required if ctx doesn't contain 'input_images'
         batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
-        preserve_vram: If True, offload VAE between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         temporal_overlap: Overlapping frames between batches for continuity
@@ -533,9 +572,6 @@ def encode_all_batches(
     # Context must be provided
     if ctx is None:
         raise ValueError("Generation context must be provided to encode_all_batches")
-    
-    # Ensure precision is initialized
-    _ensure_precision_initialized(ctx, runner, debug)
     
     # Validate and store inputs
     if images is None and 'input_images' not in ctx:
@@ -575,7 +611,7 @@ def encode_all_batches(
         if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
             debug.log("", category="none", force=True)
             debug.log(f"For {total_frames} frames, batch_size={batch_params['best_batch']} avoids padding waste", category="tip", force=True)
-            debug.log(f"  Match batch_size to shot lengths for better temporal coherence", category="tip", force=True)
+            debug.log(f"  Match batch_size to shot length for better temporal coherence", category="tip", force=True)
 
         
         if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
@@ -608,27 +644,28 @@ def encode_all_batches(
     try:
         # Materialize VAE if still on meta device
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
-            materialize_model(runner, "vae", str(ctx['vae_device']), runner.config, 
-                            preserve_vram, debug)
+            materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
         else:
             # Model already materialized (cached) - apply any pending configs if needed
             if getattr(runner, '_vae_config_needs_application', False):
                 debug.log("Applying updated VAE configuration", category="vae", force=True)
                 apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
         
+        # Initialize precision after VAE is materialized with actual weights
+        _ensure_precision_initialized(ctx, runner, debug)
+
         # Cache VAE now that it's fully configured and ready for inference
         if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
             runner.vae._model_name = ctx['cache_context']['vae_model']
             ctx['cache_context']['global_cache'].set_vae(
-                {'node_id': ctx['cache_context']['vae_id'], 'cache_in_ram': True}, 
+                {'node_id': ctx['cache_context']['vae_id'], 'cache_model': True}, 
                 runner.vae, ctx['cache_context']['vae_model'], debug
             )
             ctx['cache_context']['vae_newly_cached'] = True
-
+        
         # Move VAE to GPU for encoding (no-op if already there)
-        manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
-                          model_name="VAE", preserve_vram=False, debug=debug,
-                          runner=runner)
+        manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
+                          model_name="VAE", debug=debug, runner=runner)
         
         debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
@@ -652,7 +689,15 @@ def encode_all_batches(
             
             # Process current batch
             video = images[start_idx:end_idx]
-            video = video.permute(0, 3, 1, 2).to(ctx['vae_device'], dtype=ctx['compute_dtype'])
+            video = video.permute(0, 3, 1, 2)
+            video = manage_tensor_device(
+                tensor=video,
+                target_device=ctx['vae_device'],
+                tensor_name=f"video_batch_{encode_idx+1}",
+                dtype=ctx['compute_dtype'],
+                debug=debug,
+                reason="VAE encoding"
+            )
 
             # Check temporal dimension and pad ONCE if needed (format: T, C, H, W)
             t = video.size(0)
@@ -703,11 +748,18 @@ def encode_all_batches(
             # Store original length for proper trimming later
             ctx['all_ori_lengths'][encode_idx] = ori_length
 
-            # Store transformed video on CPU if needed for color correction
+            # Store transformed video on offload device if needed for color correction
             if color_correction != "none":
-                # Move to CPU to free VRAM
-                transformed_video_cpu = transformed_video.to('cpu', non_blocking=False)
-                ctx['all_transformed_videos'][encode_idx] = transformed_video_cpu
+                if ctx['tensor_offload_device'] is not None and (transformed_video.is_cuda or transformed_video.is_mps):
+                    ctx['all_transformed_videos'][encode_idx] = manage_tensor_device(
+                        tensor=transformed_video,
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"transformed_video_{encode_idx+1}",
+                        debug=debug,
+                        reason="storing input reference for color correction"
+                    )
+                else:
+                    ctx['all_transformed_videos'][encode_idx] = transformed_video
 
             # Extract and store Alpha and RGB from padded original video
             if ctx.get('is_rgba', False):
@@ -720,19 +772,53 @@ def encode_all_batches(
                 alpha_channel = video[:, 3:4, :, :]
                 rgb_video_original = video[:, :3, :, :]
                 
-                # Store on CPU to save VRAM
-                ctx['all_alpha_channels'][encode_idx] = alpha_channel.to('cpu', non_blocking=False)
-                ctx['all_input_rgb'][encode_idx] = rgb_video_original.to('cpu', non_blocking=False)
+                # Store on tensor_offload_device to save VRAM (or keep on device if none)
+                if ctx['tensor_offload_device'] is not None:
+                    ctx['all_alpha_channels'][encode_idx] = manage_tensor_device(
+                        tensor=alpha_channel,
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"alpha_channel_{encode_idx+1}",
+                        debug=debug,
+                        reason="storing Alpha channel for upscaling"
+                    )
+                    ctx['all_input_rgb'][encode_idx] = manage_tensor_device(
+                        tensor=rgb_video_original,
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"rgb_original_{encode_idx+1}",
+                        debug=debug,
+                        reason="storing RGB edge guidance for Alpha upscaling"
+                    )
+                else:
+                    ctx['all_alpha_channels'][encode_idx] = alpha_channel
+                    ctx['all_input_rgb'][encode_idx] = rgb_video_original
                 
                 del alpha_channel, rgb_video_original
 
             del video
 
+            # Move to VAE device with correct dtype for encoding (no-op if already there)
+            transformed_video = manage_tensor_device(
+                tensor=transformed_video,
+                target_device=ctx['vae_device'],
+                tensor_name=f"transformed_video_{encode_idx+1}",
+                dtype=ctx['compute_dtype'],
+                debug=debug,
+                reason="VAE encoding"
+            )
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
             
-            # Offload latents to CPU to save VRAM between phases
-            ctx['all_latents'][encode_idx] = cond_latents[0].to('cpu', non_blocking=False)
+            # Offload latents to avoid VRAM accumulation
+            if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps):
+                ctx['all_latents'][encode_idx] = manage_tensor_device(
+                    tensor=cond_latents[0],
+                    target_device=ctx['tensor_offload_device'],
+                    tensor_name=f"latent_{encode_idx+1}",
+                    debug=debug,
+                    reason="storing encoded latents for upscaling"
+                )
+            else:
+                ctx['all_latents'][encode_idx] = cond_latents[0]
             
             del cond_latents, transformed_video
             
@@ -748,11 +834,10 @@ def encode_all_batches(
         debug.log(f"Error in Phase 1 (Encoding): {e}", level="ERROR", category="error", force=True)
         raise
     finally:
-        # Always offload VAE if needed
-        if preserve_vram:
-            manage_model_device(model=runner.vae, target_device='cpu', 
-                              model_name="VAE", preserve_vram=preserve_vram, debug=debug,
-                              runner=runner)
+        # Offload VAE to configured offload device if specified
+        if ctx['vae_offload_device'] is not None:
+            manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'], 
+                                model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
     
     debug.end_timer("phase1_encoding", "Phase 1: VAE encoding complete", show_breakdown=True)
     debug.log_memory_state("After phase 1 (VAE encoding)", show_tensors=False)
@@ -763,7 +848,6 @@ def encode_all_batches(
 def upscale_all_batches(
     runner: 'VideoDiffusionInfer',
     ctx: Optional[Dict[str, Any]] = None,
-    preserve_vram: bool = False,
     debug: Optional['Debug'] = None,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cfg_scale: float = 7.5,
@@ -780,7 +864,6 @@ def upscale_all_batches(
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
         ctx: Context from encode_all_batches containing latents (required)
-        preserve_vram: If True, offload DiT between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         cfg_scale: Classifier-free guidance scale (default: 1.0)
@@ -789,7 +872,7 @@ def upscale_all_batches(
                            Adds noise during diffusion conditioning. Can soften details
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
-        cache_model: If True, keep DiT model in RAM for reuse instead of deleting it
+        cache_model: If True, keep DiT model for reuse instead of deleting it
         
     Returns:
         dict: Updated context containing:
@@ -805,10 +888,7 @@ def upscale_all_batches(
     
     if ctx is None:
         raise ValueError("Context is required for upscale_all_batches. Run encode_all_batches first.")
-    
-    # Ensure precision is initialized
-    _ensure_precision_initialized(ctx, runner, debug)
-    
+        
     # Validate we have encoded latents
     if 'all_latents' not in ctx or not ctx['all_latents']:
         raise ValueError("No encoded latents found. Run encode_all_batches first.")
@@ -819,14 +899,14 @@ def upscale_all_batches(
     
     # Load text embeddings if not already loaded
     if ctx.get('text_embeds') is None:
-        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'])
+        ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
         debug.log("Loaded text embeddings for DiT", category="dit")
     
     # Configure diffusion parameters
     runner.config.diffusion.cfg.scale = cfg_scale
     runner.config.diffusion.cfg.rescale = 0.0
     runner.config.diffusion.timesteps.sampling.steps = 1
-    runner.configure_diffusion(dtype=ctx['compute_dtype'])
+    runner.configure_diffusion(device=ctx['dit_device'], dtype=ctx['compute_dtype'])
     
     # Set seed for generation
     set_seed(seed)
@@ -848,19 +928,21 @@ def upscale_all_batches(
     try:
         # Materialize DiT if still on meta device
         if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
-            materialize_model(runner, "dit", str(ctx['dit_device']), runner.config, 
-                            preserve_vram, debug)
+            materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)
         else:
             # Model already materialized (cached) - apply any pending configs if needed
             if getattr(runner, '_dit_config_needs_application', False):
                 debug.log("Applying updated DiT configuration", category="dit", force=True)
                 apply_model_specific_config(runner.dit, runner, runner.config, True, debug)
-        
-       # Cache DiT now that it's fully configured and ready for inference
+    
+        # Initialize precision after DiT is materialized with actual weights
+        _ensure_precision_initialized(ctx, runner, debug)
+
+        # Cache DiT now that it's fully configured and ready for inference
         if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
             runner.dit._model_name = ctx['cache_context']['dit_model']
             ctx['cache_context']['global_cache'].set_dit(
-                {'node_id': ctx['cache_context']['dit_id'], 'cache_in_ram': True}, 
+                {'node_id': ctx['cache_context']['dit_id'], 'cache_model': True}, 
                 runner.dit, ctx['cache_context']['dit_model'], debug
             )
             ctx['cache_context']['dit_newly_cached'] = True
@@ -873,9 +955,8 @@ def upscale_all_batches(
                 )
 
         # Move DiT to GPU for upscaling (no-op if already there)
-        manage_model_device(model=runner.dit, target_device=str(ctx['dit_device']), 
-                            model_name="DiT", preserve_vram=False, debug=debug,
-                            runner=runner)
+        manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
+                            model_name="DiT", debug=debug, runner=runner)
 
         debug.log_memory_state("After DiT loading", detailed_tensors=False)
 
@@ -888,15 +969,18 @@ def upscale_all_batches(
             debug.log(f"Upscaling batch {upscale_idx+1}/{num_valid_latents}", category="generation", force=True)
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
             
-            # Move latent from CPU to device with correct dtype
-            latent = latent.to(ctx['dit_device'], dtype=ctx['compute_dtype'], non_blocking=False)
-            
-            # Generate noise
-            if torch.mps.is_available():
-                base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
-            else:
-                with torch.cuda.device(ctx['dit_device']):
-                    base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
+            # Move to DiT device with correct dtype for upscaling (no-op if already there)
+            latent = manage_tensor_device(
+                tensor=latent,
+                target_device=ctx['dit_device'],
+                tensor_name=f"latent_{upscale_idx+1}",
+                dtype=ctx['compute_dtype'],
+                debug=debug,
+                reason="DiT upscaling"
+            )
+
+            # Generate noise (randn_like automatically uses latent's device)
+            base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
             
             noises = [base_noise]
             aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
@@ -927,24 +1011,30 @@ def upscale_all_batches(
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
                 with torch.autocast(str(ctx['dit_device']), ctx['autocast_dtype'], enabled=True):
-                    upscaled = runner.inference(
+                    upscaled_latents = runner.inference(
                         noises=noises,
                         conditions=conditions,
                         **ctx['text_embeds'],
                     )
             debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
             
-            # Store upscaled result on CPU to save VRAM
-            ctx['all_upscaled_latents'][upscale_idx] = upscaled[0].to('cpu', non_blocking=False)
+            # Offload upscaled latents to avoid VRAM accumulation
+            if ctx['tensor_offload_device'] is not None and (upscaled_latents[0].is_cuda or upscaled_latents[0].is_mps):
+                ctx['all_upscaled_latents'][upscale_idx] = manage_tensor_device(
+                    tensor=upscaled_latents[0],
+                    target_device=ctx['tensor_offload_device'],
+                    tensor_name=f"upscaled_latent_{upscale_idx+1}",
+                    debug=debug,
+                    reason="storing upscaled latents for decoding"
+                )
+            else:
+                ctx['all_upscaled_latents'][upscale_idx] = upscaled_latents[0]
             
             # Free original latent - release tensor memory first
             release_tensor_memory(ctx['all_latents'][batch_idx])
             ctx['all_latents'][batch_idx] = None
             
-            del noises, aug_noises, latent, conditions, condition, base_noise, upscaled
-            
-            if preserve_vram and ctx['all_upscaled_latents'][upscale_idx].shape[0] > 1:
-                clear_memory(debug=debug, deep=True, force=True, timer_name=f"upscale_all_batches - batch {upscale_idx+1} - deep")
+            del noises, aug_noises, latent, conditions, condition, base_noise, upscaled_latents
             
             debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
             
@@ -990,7 +1080,7 @@ def upscale_all_batches(
                             category="blockswap")
 
         # Cleanup DiT as it's no longer needed after upscaling
-        cleanup_dit(runner=runner, debug=debug, keep_model_in_ram=cache_model)
+        cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
@@ -1006,7 +1096,6 @@ def upscale_all_batches(
 def decode_all_batches(
     runner: 'VideoDiffusionInfer',
     ctx: Optional[Dict[str, Any]] = None,
-    preserve_vram: bool = False,
     debug: Optional['Debug'] = None,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cache_model: bool = False
@@ -1020,10 +1109,9 @@ def decode_all_batches(
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
         ctx: Context from upscale_all_batches containing upscaled latents (required)
-        preserve_vram: If True, offload VAE between operations
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
-        cache_model: If True, keep VAE model in RAM for reuse instead of deleting it
+        cache_model: If True, keep VAE model for reuse instead of deleting it
         
     Returns:
         dict: Updated context containing:
@@ -1039,9 +1127,6 @@ def decode_all_batches(
     
     if ctx is None:
         raise ValueError("Context is required for decode_all_batches. Run upscale_all_batches first.")
-    
-    # Ensure precision is initialized
-    _ensure_precision_initialized(ctx, runner, debug)
     
     # Validate we have upscaled latents
     if 'all_upscaled_latents' not in ctx or not ctx['all_upscaled_latents']:
@@ -1063,13 +1148,14 @@ def decode_all_batches(
     try:
         # VAE should already be materialized from encoding phase
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
-            materialize_model(runner, "vae", str(ctx['vae_device']), runner.config, 
-                            preserve_vram, debug)
-        
-        # Move VAE to GPU for decoding
-        manage_model_device(model=runner.vae, target_device=str(ctx['vae_device']), 
-                          model_name="VAE", preserve_vram=False, debug=debug,
-                          runner=runner)
+            materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
+
+        # Precision should already be initialized from encoding phase
+        _ensure_precision_initialized(ctx, runner, debug)
+
+        # Move VAE to GPU for decoding (no-op if already there)
+        manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
+                          model_name="VAE", debug=debug, runner=runner)
         
         debug.log_memory_state("After VAE loading", detailed_tensors=False)
         
@@ -1082,12 +1168,19 @@ def decode_all_batches(
             debug.log(f"Decoding batch {decode_idx+1}/{num_valid_latents}", category="vae", force=True)
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
-            # Move latent to device with correct dtype for decoding
-            upscaled_latent = upscaled_latent.to(ctx['vae_device'], dtype=ctx['compute_dtype'], non_blocking=False)
+            # Move to VAE device with correct dtype for decoding (no-op if already there)
+            upscaled_latent = manage_tensor_device(
+                tensor=upscaled_latent,
+                target_device=ctx['vae_device'],
+                tensor_name=f"upscaled_latent_{decode_idx+1}",
+                dtype=ctx['compute_dtype'],
+                debug=debug,
+                reason="VAE decoding"
+            )
             
             # Decode latent
             debug.start_timer("vae_decode")
-            samples = runner.vae_decode([upscaled_latent], preserve_vram=preserve_vram)
+            samples = runner.vae_decode([upscaled_latent])
             debug.end_timer("vae_decode", "VAE decode")
             
            # Process samples
@@ -1095,11 +1188,18 @@ def decode_all_batches(
             samples = optimized_video_rearrange(samples)
             debug.end_timer("optimized_video_rearrange", "Video rearrange")
             
-            # Move samples to CPU to avoid VRAM accumulation across batches
-            samples_cpu = [sample.cpu() if (sample.is_cuda or sample.is_mps) else sample for sample in samples]
-            
-            # Store decoded samples on CPU for post-processing
-            ctx['batch_samples'][decode_idx] = samples_cpu
+            # Offload decoded samples to avoid VRAM accumulation
+            if ctx['tensor_offload_device'] is not None:
+                # samples is always a single-element list from vae_decode([upscaled_latent])]
+                if samples[0].is_cuda or samples[0].is_mps:
+                    samples[0] = manage_tensor_device(
+                        tensor=samples[0],
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"sample_{decode_idx+1}",
+                        debug=debug,
+                        reason="storing decoded latents for post-processing"
+                    )
+            ctx['batch_samples'][decode_idx] = samples
             
             # Free the upscaled latent and GPU samples
             release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
@@ -1119,7 +1219,7 @@ def decode_all_batches(
         raise
     finally:
         # Cleanup VAE as it's no longer needed
-        cleanup_vae(runner=runner, debug=debug, keep_model_in_ram=cache_model)
+        cleanup_vae(runner=runner, debug=debug, cache_model=cache_model)
         
         # Clean up upscaled latents storage
         if 'all_upscaled_latents' in ctx:
@@ -1212,27 +1312,27 @@ def postprocess_all_batches(
                     debug.log(f"WARNING: Alpha channel {batch_idx} is not a tensor, skipping", 
                              level="WARNING", category="alpha", force=True)
                     continue
-            
-            debug.log(f"Processing Alpha batch {batch_idx+1}/{num_valid_samples}", category="alpha", force=True)
-            debug.start_timer(f"alpha_batch_{batch_idx+1}")
+                
+                debug.log(f"Processing Alpha batch {batch_idx+1}/{num_valid_samples}", category="alpha", force=True)
+                debug.start_timer(f"alpha_batch_{batch_idx+1}")
 
-            # Process Alpha and merge with RGB
-            ctx['batch_samples'][batch_idx] = process_alpha_for_batch(
-                rgb_samples=ctx['batch_samples'][batch_idx],
-                alpha_original=ctx['all_alpha_channels'][batch_idx],
-                rgb_original=ctx['all_input_rgb'][batch_idx],
-                device=ctx['vae_device'],
-                debug=debug
-            )
-            
-            # Free memory immediately
-            release_tensor_memory(ctx['all_alpha_channels'][batch_idx])
-            ctx['all_alpha_channels'][batch_idx] = None
+                # Process Alpha and merge with RGB
+                ctx['batch_samples'][batch_idx] = process_alpha_for_batch(
+                    rgb_samples=ctx['batch_samples'][batch_idx],
+                    alpha_original=ctx['all_alpha_channels'][batch_idx],
+                    rgb_original=ctx['all_input_rgb'][batch_idx],
+                    device=ctx['vae_device'],
+                    debug=debug
+                )
+                
+                # Free memory immediately
+                release_tensor_memory(ctx['all_alpha_channels'][batch_idx])
+                ctx['all_alpha_channels'][batch_idx] = None
 
-            release_tensor_memory(ctx['all_input_rgb'][batch_idx])
-            ctx['all_input_rgb'][batch_idx] = None
-        
-            debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
+                release_tensor_memory(ctx['all_input_rgb'][batch_idx])
+                ctx['all_input_rgb'][batch_idx] = None
+            
+                debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
 
         debug.log("Alpha processing complete for all batches", category="alpha")
     
@@ -1249,8 +1349,15 @@ def postprocess_all_batches(
             
             # Post-process each sample in the batch
             for i, sample in enumerate(samples):
-                # Move sample to device for processing (consistent with other phases)
-                sample = sample.to(ctx['vae_device'], dtype=ctx['compute_dtype'], non_blocking=False)
+                # Move to VAE device with correct dtype for processing (no-op if already there)
+                sample = manage_tensor_device(
+                    tensor=sample,
+                    target_device=ctx['vae_device'],
+                    tensor_name=f"sample_{batch_idx+1}_{i}",
+                    dtype=ctx['compute_dtype'],
+                    debug=debug,
+                    reason="post-processing"
+                )
                 
                 # Get original length for trimming (always available)
                 video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
@@ -1282,7 +1389,13 @@ def postprocess_all_batches(
                         
                         # Ensure both tensors are on same device (GPU) for color correction
                         if input_video.device != sample.device:
-                            input_video = input_video.to(sample.device, non_blocking=False)
+                            input_video = manage_tensor_device(
+                                tensor=input_video,
+                                target_device=sample.device,
+                                tensor_name=f"input_video_{batch_idx+1}",
+                                debug=debug,
+                                reason="color correction"
+                            )
                         
                         # Apply selected color correction method
                         debug.start_timer(f"color_correction_{color_correction}")
@@ -1341,24 +1454,34 @@ def postprocess_all_batches(
                     # RGB only: apply normalization as usual
                     sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
                 
-                # Move to CPU after all GPU processing is complete
-                if sample.is_cuda or sample.is_mps:
-                    sample = sample.cpu()
+                # Move to tensor_offload_device if specified
+                if ctx['tensor_offload_device'] is not None:
+                    if sample.is_cuda or sample.is_mps:
+                        sample = manage_tensor_device(
+                            tensor=sample,
+                            target_device=ctx['tensor_offload_device'],
+                            tensor_name=f"final_sample_{batch_idx+1}",
+                            debug=debug,
+                            reason="storing final assembly"
+                        )
+                # If no tensor_offload_device, sample stays on VAE device (no movement needed)
                 
                 # Get batch dimensions
                 batch_frames = sample.shape[0]
                 
-                # Pre-allocate output tensor on first write (now we know exact output dimensions)
+                # Pre-allocate output tensor on first write
                 if ctx['final_video'] is None:
-                    H, W, C = sample.shape[1], sample.shape[2], sample.shape[3]
-                    channels_str = "RGBA" if C == 4 else "RGB" if C == 3 else f"{C}-channel"
+                    H, W = sample.shape[1], sample.shape[2]
+                    # Use input format, not first sample's shape, for consistent allocation
+                    C = 4 if ctx.get('is_rgba', False) else 3
+                    channels_str = "RGBA" if C == 4 else "RGB"
                     
                     debug.log(f"Pre-allocating output tensor: {total_frames} frames, {W}x{H}px, {channels_str}", category="setup")
                     
-                    # Allocate once with correct dimensions on CPU
-                    ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'], device='cpu')
-                
-                # Direct write to output tensor
+                    target_device = ctx['tensor_offload_device'] if ctx['tensor_offload_device'] is not None else ctx['vae_device']
+                    ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'], device=target_device)
+
+                # Direct write - if dimensions don't match, let it fail with clear error
                 ctx['final_video'][current_frame_idx:current_frame_idx + batch_frames] = sample
                 current_frame_idx += batch_frames
                 

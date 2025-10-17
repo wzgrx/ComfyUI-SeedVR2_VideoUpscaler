@@ -35,7 +35,7 @@ class SeedVR2LoadVAEModel:
                 }),
                 "device": (devices, {
                     "default": devices[0],
-                    "tooltip": "Device to use for VAE processing"
+                    "tooltip": "Device for VAE inference (encoding/decoding)"
                 }),
             },
             "optional": {
@@ -71,9 +71,13 @@ class SeedVR2LoadVAEModel:
                     "step": 32,
                     "tooltip": "Pixel overlap between decoding tiles to reduce visible seams. Higher = better blending but slower processing."
                 }),
-                "cache_in_ram": ("BOOLEAN", {
+                "offload_device": (get_device_list(include_none=True, include_cpu=True), {
+                    "default": "none",
+                    "tooltip": "Device to offload VAE model to when not in use. Select 'none' to keep on inference device, or 'cpu' for CPU offload (slower but reduces VRAM usage). Required for BlockSwap."
+                }),
+                "cache_model": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Keep model in RAM between runs for faster reuse. Useful for batch processing."
+                    "tooltip": "Keep VAE model loaded on offload_device between workflow runs. Useful for batch processing."
                 }),
                 "torch_compile_args": ("TORCH_COMPILE_ARGS", {
                     "tooltip": "Optional torch.compile settings from SeedVR2 Torch Compile Settings node for speedup"
@@ -92,41 +96,55 @@ class SeedVR2LoadVAEModel:
         "model caching, and torch.compile optimization. Connect output to SeedVR2 Video Upscaler."
     )
     
-    def create_config(self, model: str, device: str, encode_tiled: bool = False, 
+    def create_config(self, model: str, device: str, offload_device: str = "none",
+                     cache_model: bool = False, encode_tiled: bool = False,
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
-                     decode_tile_overlap: int = 64, cache_in_ram: bool = False,
-                     torch_compile_args: Dict[str, Any] = None, unique_id: int = 0
-                     ) -> Tuple[Dict[str, Any]]:
+                     decode_tile_overlap: int = 64, torch_compile_args: Dict[str, Any] = None,
+                     unique_id: int = 0) -> Tuple[Dict[str, Any]]:
         """
         Create VAE model configuration for SeedVR2 main node
         
         Args:
             model: Model filename to load
             device: Target device for model execution
+            offload_device: Device to offload model to when not in use
+            cache_model: Whether to keep model loaded between runs
             encode_tiled: Enable tiled encoding
             encode_tile_size: Tile size for encoding
             encode_tile_overlap: Tile overlap for encoding
             decode_tiled: Enable tiled decoding
             decode_tile_size: Tile size for decoding
             decode_tile_overlap: Tile overlap for decoding
-            cache_in_ram: Whether to keep model in RAM between runs
             torch_compile_args: Optional torch.compile configuration from settings node
             unique_id: Node instance ID for caching
             
         Returns:
             Tuple containing configuration dictionary for SeedVR2 main node
+            
+        Raises:
+            ValueError: If cache_model is enabled but offload_device is invalid
         """
+        # Validate cache_model configuration
+        if cache_model and offload_device == "none":
+            raise ValueError(
+                "Model caching (cache_model=True) requires offload_device to be set. "
+                f"Current: offload_device='{offload_device}'. "
+                "Please set offload_device to specify where the cached VAE model should be stored "
+                "(e.g., 'cpu' or another device). Set cache_model=False if you don't want to cache the model."
+            )
+        
         config = {
             "model": model,
             "device": device,
+            "offload_device": offload_device,
+            "cache_model": cache_model,
             "encode_tiled": encode_tiled,
             "encode_tile_size": encode_tile_size,
             "encode_tile_overlap": encode_tile_overlap,
             "decode_tiled": decode_tiled,
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
-            "cache_in_ram": cache_in_ram,
             "torch_compile_args": torch_compile_args,
             "node_id": unique_id,
         }

@@ -27,13 +27,13 @@ class GlobalModelCache:
         Get cached DiT model if available.
         
         Args:
-            dit_config: Configuration dictionary with 'cache_in_ram' and 'node_id' keys
+            dit_config: Configuration dictionary with 'cache_model' and 'node_id' keys
             debug: Optional debug instance for logging
             
         Returns:
             Cached DiT model instance if found, None otherwise
         """
-        if not dit_config.get('cache_in_ram', False):
+        if not dit_config.get('cache_model', False):
             return None
             
         node_id = dit_config.get('node_id')
@@ -47,13 +47,13 @@ class GlobalModelCache:
         Get cached VAE model if available.
         
         Args:
-            vae_config: Configuration dictionary with 'cache_in_ram' and 'node_id' keys
+            vae_config: Configuration dictionary with 'cache_model' and 'node_id' keys
             debug: Optional debug instance for logging
             
         Returns:
             Cached VAE model instance if found, None otherwise
         """
-        if not vae_config.get('cache_in_ram', False):
+        if not vae_config.get('cache_model', False):
             return None
             
         node_id = vae_config.get('node_id')
@@ -88,7 +88,7 @@ class GlobalModelCache:
         Store DiT model in cache.
         
         Args:
-            dit_config: Configuration dictionary with 'cache_in_ram' and 'node_id' keys
+            dit_config: Configuration dictionary with 'cache_model' and 'node_id' keys
             model: DiT model instance to cache
             model_name: Name identifier for the model
             debug: Optional debug instance for logging
@@ -96,7 +96,7 @@ class GlobalModelCache:
         Returns:
             Node ID string if cached successfully, None if caching disabled
         """
-        if not dit_config.get('cache_in_ram', False):
+        if not dit_config.get('cache_model', False):
             return None
             
         node_id = dit_config.get('node_id')
@@ -113,7 +113,7 @@ class GlobalModelCache:
         Store VAE model in cache.
         
         Args:
-            vae_config: Configuration dictionary with 'cache_in_ram' and 'node_id' keys
+            vae_config: Configuration dictionary with 'cache_model' and 'node_id' keys
             model: VAE model instance to cache
             model_name: Name identifier for the model
             debug: Optional debug instance for logging
@@ -121,7 +121,7 @@ class GlobalModelCache:
         Returns:
             Node ID string if cached successfully, None if caching disabled
         """
-        if not vae_config.get('cache_in_ram', False):
+        if not vae_config.get('cache_model', False):
            return None
             
         node_id = vae_config.get('node_id')

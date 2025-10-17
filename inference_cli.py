@@ -289,22 +289,27 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
 
     import torch  # local import inside subprocess
     from src.core.generation import (
-        setup_device_environment, prepare_generation_context, prepare_runner,
+        setup_generation_context, prepare_runner,
         encode_all_batches, upscale_all_batches, decode_all_batches
     )
     
     # Create debug instance for this worker process
     worker_debug = Debug(enabled=shared_args["debug"])
     
-    # Setup device environment
-    dit_device, vae_device = setup_device_environment(
-        dit_device=f"cuda:{device_id}", 
-        vae_device=f"cuda:{device_id}", 
+    # Prepare offload device arguments
+    # DiT offload is disabled in CLI (no caching, single-run workflow)
+    vae_offload = None if shared_args["vae_offload_device"] == "none" else shared_args["vae_offload_device"]
+    tensor_offload = None if shared_args["tensor_offload_device"] == "none" else shared_args["tensor_offload_device"]
+    
+    # Setup generation context with device configuration
+    ctx = setup_generation_context(
+        dit_device=f"cuda:{device_id}",
+        vae_device=f"cuda:{device_id}",
+        dit_offload_device=None,
+        vae_offload_device=vae_offload,
+        tensor_offload_device=tensor_offload,
         debug=worker_debug
     )
-
-    # Create generation context with the configured devices
-    ctx = prepare_generation_context(dit_device=dit_device, vae_device=vae_device, debug=worker_debug)
 
     # Reconstruct frames tensor
     frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
@@ -341,8 +346,8 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         dit_model=model_name,
         vae_model=DEFAULT_VAE,
         model_dir=model_dir,
-        preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug,
+        ctx=ctx,
         dit_cache=False, # No caching in CLI
         vae_cache=False, # No caching in CLI
         dit_id=None,  # No caching in CLI
@@ -364,7 +369,6 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         ctx=ctx,
         images=frames_tensor,
         batch_size=shared_args["batch_size"],
-        preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug,
         progress_callback=None,
         temporal_overlap=shared_args["temporal_overlap"],
@@ -377,7 +381,6 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     ctx = upscale_all_batches(
         runner,
         ctx=ctx,
-        preserve_vram=shared_args["preserve_vram"],
         debug=worker_debug,
         progress_callback=None,
         cfg_scale=shared_args["cfg_scale"],
@@ -389,8 +392,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     # Phase 3: Decode all batches
     ctx = decode_all_batches(
         runner, 
-        ctx=ctx, 
-        preserve_vram=shared_args["preserve_vram"],
+        ctx=ctx,
         debug=worker_debug, 
         progress_callback=None,
         cache_model=False # No caching in CLI
@@ -407,8 +409,12 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     # Get final result
     result_tensor = ctx['final_video']
 
+    # Ensure result is on CPU before converting to numpy
+    if result_tensor.is_cuda or result_tensor.is_mps:
+        result_tensor = result_tensor.cpu()
+    
     # Send back result as numpy array to avoid CUDA transfers
-    return_queue.put((proc_idx, result_tensor.cpu().numpy()))
+    return_queue.put((proc_idx, result_tensor.numpy()))
 
 
 def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str], 
@@ -443,7 +449,6 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
     shared_args = {
         "model": args.model,
         "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
-        "preserve_vram": args.preserve_vram,
         "color_correction": args.color_correction,
         "input_noise_scale": args.input_noise_scale,
         "latent_noise_scale": args.latent_noise_scale,
@@ -463,6 +468,8 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "vae_decode_tiling_enabled": args.vae_decode_tiling_enabled,
         "vae_decode_tile_size": args.vae_decode_tile_size,
         "vae_decode_tile_overlap": args.vae_decode_tile_overlap,
+        "vae_offload_device": args.vae_offload_device,
+        "tensor_offload_device": args.tensor_offload_device,
         "compile_dit": args.compile_dit,
         "compile_vae": args.compile_vae,
         "compile_backend": args.compile_backend,
@@ -579,8 +586,6 @@ def parse_arguments() -> argparse.Namespace:
                         help="Input noise scale (0.0-1.0) to reduce artifacts at high resolutions. (default: 0.0)")
     parser.add_argument("--latent_noise_scale", type=float, default=0.0,
                         help="Latent space noise scale (0.0-1.0). Adds noise during diffusion, can soften details. Use if input_noise doesn't help (default: 0.0)")
-    parser.add_argument("--preserve_vram", action="store_true",
-                        help="Enable VRAM preservation mode")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     if platform.system() != "Darwin":
@@ -596,6 +601,14 @@ def parse_arguments() -> argparse.Namespace:
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
     parser.add_argument("--swap_io_components", action="store_true",
                         help="Swap IO components to CPU for VRAM optimization")
+    parser.add_argument("--vae_offload_device", type=str, default="none",
+                        help="Device to offload VAE when not in use (default: none). "
+                             "Options: 'cpu', 'none'. Use 'cpu' to free VRAM between encode/decode phases (slower but saves VRAM), "
+                             "'none' to keep VAE on GPU throughout (faster but uses more VRAM)")
+    parser.add_argument("--tensor_offload_device", type=str, default="cpu",
+                        help="Device to offload intermediate tensors between phases (default: cpu). "
+                             "Options: 'cpu', 'none'. Use 'cpu' to prevent VRAM accumulation for long videos (recommended), "
+                             "'none' to keep all tensors on GPU (faster but uses more VRAM)")
     parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
                         help="Enable VAE encode tiling for improved VRAM usage")
     parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
