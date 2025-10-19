@@ -425,7 +425,7 @@ class SeedVR2VideoUpscaler:
         # Transform outputs CTHW format, get dimensions from last two axes
         output_h, output_w = transformed_sample.shape[-2:]  # Get actual output size
         
-        debug.log(f"  Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True)
+        debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True, indent_level=1)
 
         # Phase 1: Encode all batches
         ctx = encode_all_batches(

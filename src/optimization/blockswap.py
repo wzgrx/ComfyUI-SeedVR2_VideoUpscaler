@@ -222,12 +222,12 @@ def _configure_io_components(model, device: torch.device, offload_device: torch.
                 _wrap_io_forward(module, name, model, debug)
                 io_components_offloaded.append(name)
                 io_memory_mb += module_memory
-                debug.log(f"  {name} → {str(offload_device).upper()} ({module_memory:.2f}MB, dynamic swapping)", category="blockswap")
+                debug.log(f"{name} → {str(offload_device).upper()} ({module_memory:.2f}MB, dynamic swapping)", category="blockswap", indent_level=1)
             else:
                 module.to(device)
                 io_components_on_gpu.append(name)
                 io_gpu_memory_mb += module_memory
-                debug.log(f"  {name} → {str(device).upper()} ({module_memory:.2f}MB)", category="blockswap")
+                debug.log(f"{name} → {str(device).upper()} ({module_memory:.2f}MB)", category="blockswap", indent_level=1)
 
     return {
         'components': io_components_offloaded,
@@ -282,9 +282,9 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: torch.de
     device_str = str(device)
     
     if blocks_on_gpu == 0:
-        debug.log(f"  Transformer blocks: {blocks_offloaded:.2f}MB on {offload_str} (dynamic swapping)", category="blockswap")
+        debug.log(f"Transformer blocks: {blocks_offloaded:.2f}MB on {offload_str} (dynamic swapping)", category="blockswap", indent_level=1)
     else:
-        debug.log(f"  Transformer blocks: {blocks_on_gpu:.2f}MB on {device_str}, {blocks_offloaded:.2f}MB on {offload_str}", category="blockswap")
+        debug.log(f"Transformer blocks: {blocks_on_gpu:.2f}MB on {device_str}, {blocks_offloaded:.2f}MB on {offload_str}", category="blockswap", indent_level=1)
     
     # Always log I/O components (whether swapping or not)
     io_memory = memory_stats.get('io_memory_mb', 0.0)
@@ -292,17 +292,17 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: torch.de
     
     if swap_io_components and io_memory > 0:
         io_components = memory_stats.get('io_components', [])
-        debug.log(f"  I/O components: {io_memory:.2f}MB on {offload_str} (dynamic swapping)", category="blockswap")
-        debug.log(f"    {', '.join(io_components)}", category="blockswap")
+        debug.log(f"I/O components: {io_memory:.2f}MB on {offload_str} (dynamic swapping)", category="blockswap", indent_level=1)
+        debug.log(f"{', '.join(io_components)}", category="blockswap", indent_level=2)
     elif io_gpu_memory > 0:
         io_gpu_components = memory_stats.get('gpu_components', [])
-        debug.log(f"  I/O components: {io_gpu_memory:.2f}MB on {device_str}", category="blockswap")
-        debug.log(f"    {', '.join(io_gpu_components)}", category="blockswap")
+        debug.log(f"I/O components: {io_gpu_memory:.2f}MB on {device_str}", category="blockswap", indent_level=1)
+        debug.log(f"{', '.join(io_gpu_components)}", category="blockswap", indent_level=2)
     
     # Log total VRAM savings
     total_offloaded = blocks_offloaded + (io_memory if swap_io_components else 0)
     if total_offloaded > 0:
-        debug.log(f"  Total VRAM saved: {total_offloaded:.2f}MB (~{total_offloaded/1024:.2f}GB)", category="blockswap")
+        debug.log(f"Total VRAM saved: {total_offloaded:.2f}MB (~{total_offloaded/1024:.2f}GB)", category="blockswap", indent_level=1)
 
 
 def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.Module, debug) -> None:
@@ -546,7 +546,7 @@ def _protect_model_from_move(model, runner, debug) -> None:
             
             # Check blockswap status using weak reference
             # Get configured offload device from runner
-            blockswap_offload_device = "cpu"  # default
+            blockswap_offload_device = "cpu" # default
             if runner_ref:
                 runner_obj = runner_ref()
                 if runner_obj and hasattr(runner_obj, "_block_swap_config"):

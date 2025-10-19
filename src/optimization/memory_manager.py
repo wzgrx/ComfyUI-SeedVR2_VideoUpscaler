@@ -556,12 +556,13 @@ def manage_tensor(
     dtype: Optional[torch.dtype] = None,
     non_blocking: bool = False,
     debug: Optional[Any] = None,
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
+    indent_level: int = 0
 ) -> torch.Tensor:
     """
     Unified tensor management for device movement and dtype conversion.
     
-    Handles both device transfers (CPU ↔ GPU) and dtype conversions (e.g., float16 ↔ bfloat16)
+    Handles both device transfers (CPU ↔ GPU) and dtype conversions (e.g., float16 → bfloat16)
     with intelligent early-exit optimization and comprehensive logging.
     
     Args:
@@ -572,6 +573,7 @@ def manage_tensor(
         non_blocking: Whether to use non-blocking transfer
         debug: Debug instance for logging
         reason: Optional reason for the operation (e.g., "inference", "offload", "dtype alignment")
+        indent_level: Indentation level for debug logging (0=no indent, 1=2 spaces, etc.)
         
     Returns:
         Tensor on target device with optional dtype conversion
@@ -617,7 +619,8 @@ def manage_tensor(
         
         debug.log(
             f"Moving {tensor_name} from {current_device_str} to {target_device_str}{dtype_info} ({reason})",
-            category="general"
+            category="general",
+            indent_level=indent_level
         )
     
     # Perform the operation based on what needs to change

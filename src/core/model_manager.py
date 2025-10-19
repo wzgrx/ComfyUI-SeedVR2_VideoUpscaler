@@ -281,7 +281,7 @@ def _update_model_config(
     # Log configuration changes
     debug.log(f"{model_type} configuration changed:", category=model_type.lower(), force=True)
     for change in config_changes:
-        debug.log(f"  {change}", category=model_type.lower(), force=True)
+        debug.log(f"{change}", category=model_type.lower(), force=True, indent_level=1)
     
     # Handle torch.compile unwrapping if needed
     if changes_detected.get('torch_compile', False):
@@ -1166,7 +1166,7 @@ def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional
         
         # Progress reporting
         if (i + 1) % 100 == 0:
-            debug.log(f"  Loaded {i+1}/{total_tensors} tensors...", category="dit")
+            debug.log(f"Loaded {i+1}/{total_tensors} tensors...", category="dit", indent_level=1)
 
     debug.log(f"Successfully loaded {len(state_dict)} tensors to {device_str}", category="success")
 
@@ -1273,9 +1273,9 @@ class GGUFTensor(torch.Tensor):
             return final_result
         except Exception as e:
             self.debug.log(f"Numpy fallback also failed: {e}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"  Tensor type: {self.tensor_type}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"  Shape: {self.shape}", level="WARNING", category="dit", force=True)
-            self.debug.log(f"  Target shape: {self.tensor_shape}", level="WARNING", category="dit", force=True)
+            self.debug.log(f"Tensor type: {self.tensor_type}", level="WARNING", category="dit", force=True, indent_level=1)
+            self.debug.log(f"Shape: {self.shape}", level="WARNING", category="dit", force=True, indent_level=1)
+            self.debug.log(f"Target shape: {self.tensor_shape}", level="WARNING", category="dit", force=True, indent_level=1)
             traceback.print_exc()
             
             # Return regular tensor as last resort
@@ -1322,8 +1322,8 @@ class GGUFTensor(torch.Tensor):
                 except Exception as e:
                     if debug:
                         debug.log(f"Error in linear dequantization: {e}", level="WARNING", category="dit", force=True)
-                        debug.log(f"  Function: {func}", level="WARNING", category="dit", force=True)
-                        debug.log(f"  Args: {[arg.shape if hasattr(arg, 'shape') else type(arg) for arg in args]}", level="WARNING", category="dit", force=True)
+                        debug.log(f"Function: {func}", level="WARNING", category="dit", force=True, indent_level=1)
+                        debug.log(f"Args: {[arg.shape if hasattr(arg, 'shape') else type(arg) for arg in args]}", level="WARNING", category="dit", force=True, indent_level=1)
                     raise
         
         # Handle matrix multiplication operations that need dequantization
@@ -1839,14 +1839,14 @@ def _report_parameter_mismatches(state: Dict[str, torch.Tensor],
     if unmatched:
         debug.log(f"Warning: {len(unmatched)} parameters from GGUF not found in model", 
                  level="WARNING", category="dit", force=True)
-        debug.log(f"  First few unmatched: {unmatched[:5]}", level="WARNING", category="dit", force=True)
+        debug.log(f"First few unmatched: {unmatched[:5]}", level="WARNING", category="dit", force=True, indent_level=1)
     
     # Check for missing model parameters  
     missing = [name for name in model_state if name not in loaded_names]
     if missing:
         debug.log(f"Warning: {len(missing)} model parameters not loaded from GGUF", 
                  level="WARNING", category="dit", force=True)
-        debug.log(f"  First few missing: {missing[:5]}", level="WARNING", category="dit", force=True)
+        debug.log(f"First few missing: {missing[:5]}", level="WARNING", category="dit", force=True, indent_level=1)
 
 
 def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: torch.device, debug: Debug) -> None:
@@ -2032,22 +2032,22 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
     
     # Log compilation configuration
     debug.log(f"Configuring torch.compile for {model_type}...", category="setup", force=True)
-    debug.log(f"  Backend: {settings['backend']} | Mode: {settings['mode']} | "
+    debug.log(f"Backend: {settings['backend']} | Mode: {settings['mode']} | "
              f"Fullgraph: {settings['fullgraph']} | Dynamic: {settings['dynamic']}", 
-             category="setup")
-    debug.log(f"  Dynamo cache_size_limit: {dynamo_cache_size_limit} | "
-             f"recompile_limit: {dynamo_recompile_limit}", category="setup")
+             category="setup", indent_level=1)
+    debug.log(f"Dynamo cache_size_limit: {dynamo_cache_size_limit} | "
+             f"recompile_limit: {dynamo_recompile_limit}", category="setup", indent_level=1)
     
     # Configure torch._dynamo settings
     try:
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit
         torch._dynamo.config.recompile_limit = dynamo_recompile_limit
-        debug.log(f"  torch._dynamo configured successfully", category="success")
+        debug.log(f"torch._dynamo configured successfully", category="success", indent_level=1)
         return settings, True
     except Exception as e:
-        debug.log(f"  Could not configure torch._dynamo settings: {e}", 
-                 level="WARNING", category="setup", force=True)
+        debug.log(f"Could not configure torch._dynamo settings: {e}", 
+                 level="WARNING", category="setup", force=True, indent_level=1)
         return settings, False
 
 
@@ -2074,15 +2074,15 @@ def _apply_torch_compile(model: torch.nn.Module, compile_args: Dict[str, Any],
         compiled_model = torch.compile(model, **settings)
         debug.end_timer(f"{model_type.lower()}_compile", 
                        f"{model_type} model wrapped for compilation", force=True)
-        debug.log(f"  Actual compilation will happen on first batch (expect initial delay, then speedup)", category="info")
+        debug.log(f"Actual compilation will happen on first batch (expect initial delay, then speedup)", category="info", indent_level=1)
         
         return compiled_model
         
     except Exception as e:
         debug.log(f"torch.compile failed for {model_type}: {e}", 
                  level="WARNING", category="setup", force=True)
-        debug.log(f"  Falling back to uncompiled model", 
-                 level="WARNING", category="setup", force=True)
+        debug.log(f"Falling back to uncompiled model", 
+                 level="WARNING", category="setup", force=True, indent_level=1)
         return model
 
 
@@ -2132,26 +2132,26 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
             _disable_compile_for_dynamic_modules(model.encoder)
             model.encoder = torch.compile(model.encoder, **settings)
             compiled_modules.append('encoder')
-            debug.log(f"  VAE encoder found and added to compilation queue", category="success")
+            debug.log(f"VAE encoder found and added to compilation queue", category="success", indent_level=1)
 
         if hasattr(model, 'decoder') and model.decoder is not None:
             # Disable compilation for InflatedCausalConv3d modules due to dynamic shapes  
             _disable_compile_for_dynamic_modules(model.decoder)
             model.decoder = torch.compile(model.decoder, **settings)
             compiled_modules.append('decoder')
-            debug.log(f"  VAE decoder found and added to compilation queue", category="success")
+            debug.log(f"VAE decoder found and added to compilation queue", category="success", indent_level=1)
         
         debug.end_timer("vae_submodule_compile", 
                        f"VAE submodules compiled: {', '.join(compiled_modules)}", force=True)
-        debug.log(f"  Actual compilation will happen on first batch (expect initial delay, then speedup)", category="info")
+        debug.log(f"Actual compilation will happen on first batch (expect initial delay, then speedup)", category="info", indent_level=1)
         
         return model
         
     except Exception as e:
         debug.log(f"torch.compile failed for VAE submodules: {e}", 
                  level="WARNING", category="setup", force=True)
-        debug.log(f"  Falling back to uncompiled VAE", 
-                 level="WARNING", category="setup", force=True)
+        debug.log(f"Falling back to uncompiled VAE", 
+                 level="WARNING", category="setup", force=True, indent_level=1)
         return model
 
 

@@ -173,7 +173,7 @@ class VideoDiffusionInfer():
 
             use_encode_tiling = self.encode_tiled
             if use_encode_tiling:
-                self.debug.log(f"  Using VAE tiled encoding (Tile: {self.encode_tile_size}, Overlap: {self.encode_tile_overlap})", category="vae", force=True)
+                self.debug.log(f"Using VAE tiled encoding (Tile: {self.encode_tile_size}, Overlap: {self.encode_tile_overlap})", category="vae", force=True, indent_level=1)
 
             # VAE process by each group.
             for sample in batches:
@@ -201,7 +201,7 @@ class VideoDiffusionInfer():
             else:
                 latents = [latent.squeeze(0) for latent in latents]
             
-            self.debug.log(f"  Latents shape: {latents[0].shape}", category="info")
+            self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
         return latents
     
@@ -236,9 +236,9 @@ class VideoDiffusionInfer():
 
             use_decode_tiling = self.decode_tiled
             if use_decode_tiling:
-                self.debug.log(f"  Using VAE tiled decoding (Tile: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap})", category="vae", force=True)
+                self.debug.log(f"Using VAE tiled decoding (Tile: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap})", category="vae", force=True, indent_level=1)
 
-            self.debug.log(f"  Latents shape: {latents[0].shape}", category="info")
+            self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
             for i, latent in enumerate(latents):
                 latent = latent.to(device, dtype, non_blocking=False)

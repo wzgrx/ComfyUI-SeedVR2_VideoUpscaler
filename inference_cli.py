@@ -650,7 +650,7 @@ def main() -> None:
     
     debug.log("Arguments:", category="setup")
     for key, value in vars(args).items():
-        debug.log(f"  {key}: {value}", category="none")
+        debug.log(f"{key}: {value}", category="none", indent_level=1)
 
     if args.vae_encode_tiling_enabled and (args.vae_encode_tile_overlap[0] >= args.vae_encode_tile_size[0] or args.vae_encode_tile_overlap[1] >= args.vae_encode_tile_size[1]):
         debug.log(f"VAE encode tile overlap {args.vae_encode_tile_overlap} must be smaller than tile size {args.vae_encode_tile_size}", level="ERROR", category="vae", force=True)

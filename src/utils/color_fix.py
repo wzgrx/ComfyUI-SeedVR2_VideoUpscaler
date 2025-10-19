@@ -470,7 +470,7 @@ def lab_color_transfer(
     # Restore original dtype
     result = result.to(original_dtype)
     
-    debug.log(f"  LAB color transfer completed (luminance_weight={luminance_weight})", category="video")
+    debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
     
     return result
 
@@ -690,7 +690,7 @@ def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, deb
     # Restore original dtype
     result = result.to(original_dtype)
     
-    debug.log("  HSV hue-conditional saturation matching completed", category="video")
+    debug.log("HSV hue-conditional saturation matching completed", category="video", indent_level=1)
     
     return result
 
@@ -782,6 +782,6 @@ def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, 
     
     # Log statistics
     correction_pct = (blend_weight > 0.01).float().mean().item() * 100
-    debug.log(f"  Wavelet Adaptive: {correction_pct:.1f}% pixels use HSV correction", category="video")
+    debug.log(f"Wavelet Adaptive: {correction_pct:.1f}% pixels use HSV correction", category="video", indent_level=1)
     
     return result

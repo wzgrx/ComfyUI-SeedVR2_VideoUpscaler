@@ -44,14 +44,16 @@ def process_alpha_for_batch(
         target_device=device,
         tensor_name="alpha_original",
         debug=debug,
-        reason="Alpha processing"
+        reason="Alpha processing",
+        indent_level=1
     )
     rgb_original = manage_tensor(
         tensor=rgb_original,
         target_device=device,
         tensor_name="rgb_original",
         debug=debug,
-        reason="Alpha processing"
+        reason="Alpha processing",
+        indent_level=1
     )
     
     # Process each RGB sample individually to handle variable frame counts
@@ -64,7 +66,8 @@ def process_alpha_for_batch(
             target_device=device,
             tensor_name="rgb_sample",
             debug=debug,
-            reason="Alpha processing"
+            reason="Alpha processing",
+            indent_level=1
         )
         # Handle dimension variations between single frames and video sequences
         if rgb_sample.ndim == 3:
@@ -97,7 +100,8 @@ def process_alpha_for_batch(
                 tensor_name="alpha_upscaled",
                 dtype=compute_dtype,
                 debug=debug,
-                reason="dtype alignment for RGBA concatenation"
+                reason="dtype alignment for RGBA concatenation",
+                indent_level=1
             )
         
         # Concatenate RGB and upscaled alpha to create RGBA output (T, 4, H, W)
@@ -177,7 +181,8 @@ def detect_edges_batch(
         tensor_name="edge_map",
         dtype=images_dtype,
         debug=debug,
-        reason="edge detection result"
+        reason="edge detection result",
+        indent_level=1
     )
     
     return edges
@@ -303,7 +308,7 @@ def edge_guided_alpha_upscale(
         
     Returns:
         Upscaled Alpha (T, 1, H_out, W_out) in [0, 1]
-    """    
+    """
     T, _, H_out, W_out = upscaled_rgb.shape
     device = input_alpha.device
     dtype = input_alpha.dtype
@@ -321,9 +326,9 @@ def edge_guided_alpha_upscale(
     is_binary_mask = binary_ratio > 0.95
     
     if debug:
-        debug.log(f"  Alpha type: {'binary mask' if is_binary_mask else 'gradient alpha'}", category="alpha")
-        debug.log(f"  Binary ratio: {binary_ratio:.2%}", category="alpha")
-        debug.log("  Creating tight edge-aligned transitions", category="alpha")
+        debug.log(f"Alpha type: {'binary mask' if is_binary_mask else 'gradient alpha'}", category="alpha", indent_level=1)
+        debug.log(f"Binary ratio: {binary_ratio:.2%}", category="alpha", indent_level=1)
+        debug.log("Creating tight edge-aligned transitions", category="alpha", indent_level=1)
     
     # Normalize RGB from [-1, 1] to [0, 1] for edge detection
     rgb_normalized = upscaled_rgb.clone()
@@ -344,7 +349,7 @@ def edge_guided_alpha_upscale(
     
     if is_binary_mask:
         if debug:
-            debug.log("  Applying tight edge-aware refinement", category="alpha")
+            debug.log("Applying tight edge-aware refinement", category="alpha", indent_level=1)
         
         # Step 2: Single-pass guided filter with small radius for tight edges
         alpha_refined = guided_filter_pytorch(
@@ -398,7 +403,7 @@ def edge_guided_alpha_upscale(
     else:
         # For gradient alphas: single guided filter pass preserves smooth transitions
         if debug:
-            debug.log("  Applying guided filter for gradient alpha", category="alpha")
+            debug.log("Applying guided filter for gradient alpha", category="alpha", indent_level=1)
         
         alpha_final = alpha_upscaled.clone()
         
@@ -422,6 +427,6 @@ def edge_guided_alpha_upscale(
         mid_grays = ((final_values >= 0.35) & (final_values <= 0.65)).sum().item()
         total = final_values.numel()
         
-        debug.log(f"  Pure 0s: {exact_zeros/total*100:.1f}% | Pure 1s: {exact_ones/total*100:.1f}% | Smooth edges: {smooth_edges/total*100:.1f}% | Mid-grays: {mid_grays/total*100:.1f}%", category="alpha")
+        debug.log(f"Pure 0s: {exact_zeros/total*100:.1f}% | Pure 1s: {exact_ones/total*100:.1f}% | Smooth edges: {smooth_edges/total*100:.1f}% | Mid-grays: {mid_grays/total*100:.1f}%", category="alpha", indent_level=1)
     
     return alpha_final

@@ -605,14 +605,14 @@ def encode_all_batches(
         if batch_params['padding_waste'] > 0:
             debug.log("", category="none", force=True)
             debug.log(f"Padding waste: {batch_params['padding_waste']}", category="info", force=True)
-            debug.log(f"  Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True)
-            debug.log(f"  Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True)
-            debug.log(f"  This increases memory usage and processing time unnecessarily", category="info", force=True)
+            debug.log(f"Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True, indent_level=1)
+            debug.log(f"Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True, indent_level=1)
+            debug.log(f"This increases memory usage and processing time unnecessarily", category="info", force=True, indent_level=1)
         
         if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
             debug.log("", category="none", force=True)
             debug.log(f"For {total_frames} frames, batch_size={batch_params['best_batch']} avoids padding waste", category="tip", force=True)
-            debug.log(f"  Match batch_size to shot length for better temporal coherence", category="tip", force=True)
+            debug.log(f"Match batch_size to shot length for better temporal coherence", category="tip", force=True, indent_level=1)
 
         
         if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
@@ -697,19 +697,20 @@ def encode_all_batches(
                 tensor_name=f"video_batch_{encode_idx+1}",
                 dtype=ctx['compute_dtype'],
                 debug=debug,
-                reason="VAE encoding"
+                reason="VAE encoding",
+                indent_level=1
             )
 
             # Check temporal dimension and pad ONCE if needed (format: T, C, H, W)
             t = video.size(0)
-            debug.log(f"  Sequence of {t} frames", category="video", force=True)
+            debug.log(f"Sequence of {t} frames", category="video", force=True, indent_level=1)
 
             ori_length = t
 
             if t % 4 != 1:
                 target = ((t-1)//4+1)*4+1
                 padding_frames = target - t
-                debug.log(f"  Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True)
+                debug.log(f"Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True, indent_level=1)
                 
                 # Pad original video once (TCHW format, need to convert to CTHW)
                 video = optimized_single_video_rearrange(video)  # TCHW -> CTHW
@@ -719,7 +720,7 @@ def encode_all_batches(
             # Extract RGB for transforms (view, not copy)
             if ctx.get('is_rgba', False):
                 rgb_for_transform = video[:, :3, :, :]
-                debug.log(f"  Extracted Alpha channel for edge-guided upscaling", category="alpha")
+                debug.log(f"Extracted Alpha channel for edge-guided upscaling", category="alpha", indent_level=1)
             else:
                 rgb_for_transform = video
 
@@ -730,7 +731,7 @@ def encode_all_batches(
 
             # Apply input noise if requested (to reduce artifacts at high resolutions)
             if input_noise_scale > 0:
-                debug.log(f"  Applying input noise (scale: {input_noise_scale:.2f})", category="video")
+                debug.log(f"Applying input noise (scale: {input_noise_scale:.2f})", category="video", indent_level=1)
                 
                 # Generate noise matching the video shape
                 noise = torch.randn_like(transformed_video)
@@ -749,20 +750,7 @@ def encode_all_batches(
             # Store original length for proper trimming later
             ctx['all_ori_lengths'][encode_idx] = ori_length
 
-            # Store transformed video on offload device if needed for color correction
-            if color_correction != "none":
-                if ctx['tensor_offload_device'] is not None and (transformed_video.is_cuda or transformed_video.is_mps):
-                    ctx['all_transformed_videos'][encode_idx] = manage_tensor(
-                        tensor=transformed_video,
-                        target_device=ctx['tensor_offload_device'],
-                        tensor_name=f"transformed_video_{encode_idx+1}",
-                        debug=debug,
-                        reason="storing input reference for color correction"
-                    )
-                else:
-                    ctx['all_transformed_videos'][encode_idx] = transformed_video
-
-            # Extract and store Alpha and RGB from padded original video
+            # Extract and store Alpha and RGB from padded original video (before encoding)
             if ctx.get('is_rgba', False):
                 if 'all_alpha_channels' not in ctx:
                     ctx['all_alpha_channels'] = [None] * num_encode_batches
@@ -780,14 +768,16 @@ def encode_all_batches(
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"alpha_channel_{encode_idx+1}",
                         debug=debug,
-                        reason="storing Alpha channel for upscaling"
+                        reason="storing Alpha channel for upscaling",
+                        indent_level=1
                     )
                     ctx['all_input_rgb'][encode_idx] = manage_tensor(
                         tensor=rgb_video_original,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"rgb_original_{encode_idx+1}",
                         debug=debug,
-                        reason="storing RGB edge guidance for Alpha upscaling"
+                        reason="storing RGB edge guidance for Alpha upscaling",
+                        indent_level=1
                     )
                 else:
                     ctx['all_alpha_channels'][encode_idx] = alpha_channel
@@ -797,17 +787,39 @@ def encode_all_batches(
 
             del video
 
-            # Move to VAE device with correct dtype for encoding (no-op if already there)
+            # Move to VAE device with correct dtype for encoding
             transformed_video = manage_tensor(
                 tensor=transformed_video,
                 target_device=ctx['vae_device'],
                 tensor_name=f"transformed_video_{encode_idx+1}",
                 dtype=ctx['compute_dtype'],
                 debug=debug,
-                reason="VAE encoding"
+                reason="VAE encoding",
+                indent_level=1
             )
+            
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
+            
+            # Store transformed video for color correction after encoding
+            if color_correction != "none":
+                if ctx['tensor_offload_device'] is not None:
+                    # Move to offload device to free VRAM
+                    ctx['all_transformed_videos'][encode_idx] = manage_tensor(
+                        tensor=transformed_video,
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"transformed_video_{encode_idx+1}",
+                        debug=debug,
+                        reason="storing input reference for color correction",
+                        indent_level=1
+                    )
+                else:
+                    # No offload device - keep reference on VAE device
+                    ctx['all_transformed_videos'][encode_idx] = transformed_video
+            
+            # Clean up transformed_video reference if not needed or already offloaded
+            if color_correction == "none" or ctx['tensor_offload_device'] is not None:
+                del transformed_video
             
             # Convert from VAE dtype to compute dtype and offload to avoid VRAM accumulation
             if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps):
@@ -817,7 +829,8 @@ def encode_all_batches(
                     tensor_name=f"latent_{encode_idx+1}",
                     dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="storing encoded latents for upscaling (VAE dtype → compute dtype)"
+                    reason="storing encoded latents for upscaling (VAE dtype → compute dtype)",
+                    indent_level=1
                 )
             else:
                 # Stay on current device but convert to compute dtype
@@ -827,10 +840,11 @@ def encode_all_batches(
                     tensor_name=f"latent_{encode_idx+1}",
                     dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="VAE dtype → compute dtype"
+                    reason="VAE dtype → compute dtype",
+                    indent_level=1
                 )
             
-            del cond_latents, transformed_video
+            del cond_latents
             
             debug.end_timer(f"encode_batch_{encode_idx+1}", f"Encoded batch {encode_idx+1}")
             
@@ -986,7 +1000,8 @@ def upscale_all_batches(
                 tensor_name=f"latent_{upscale_idx+1}",
                 dtype=ctx['compute_dtype'],
                 debug=debug,
-                reason="DiT upscaling"
+                reason="DiT upscaling",
+                indent_level=1
             )
 
             # Generate noise (randn_like automatically uses latent's device)
@@ -1035,7 +1050,8 @@ def upscale_all_batches(
                     target_device=ctx['tensor_offload_device'],
                     tensor_name=f"upscaled_latent_{upscale_idx+1}",
                     debug=debug,
-                    reason="storing upscaled latents for decoding"
+                    reason="storing upscaled latents for decoding",
+                    indent_level=1
                 )
             else:
                 ctx['all_upscaled_latents'][upscale_idx] = upscaled_latents[0]
@@ -1064,8 +1080,8 @@ def upscale_all_batches(
             if swap_summary and swap_summary.get('total_swaps', 0) > 0:
                 total_time = swap_summary.get('block_total_ms', 0) + swap_summary.get('io_total_ms', 0)
                 debug.log("BlockSwap Summary", category="blockswap")
-                debug.log(f"  BlockSwap overhead: {total_time:.2f}ms", category="blockswap")
-                debug.log(f"  Total swaps: {swap_summary['total_swaps']}", category="blockswap")
+                debug.log(f"BlockSwap overhead: {total_time:.2f}ms", category="blockswap", indent_level=1)
+                debug.log(f"Total swaps: {swap_summary['total_swaps']}", category="blockswap", indent_level=1)
                 
                 # Show block swap details
                 if 'block_swaps' in swap_summary and swap_summary['block_swaps'] > 0:
@@ -1074,20 +1090,20 @@ def upscale_all_batches(
                     min_ms = swap_summary.get('block_min_ms', 0)
                     max_ms = swap_summary.get('block_max_ms', 0)
                     
-                    debug.log(f"  Block swaps: {swap_summary['block_swaps']} "
+                    debug.log(f"Block swaps: {swap_summary['block_swaps']} "
                             f"(avg: {avg_ms:.2f}ms, min: {min_ms:.2f}ms, max: {max_ms:.2f}ms, total: {total_ms:.2f}ms)", 
-                            category="blockswap")
+                            category="blockswap", indent_level=1)
                     
                     # Show most frequently swapped block
                     if 'most_swapped_block' in swap_summary:
-                        debug.log(f"  Most swapped: Block {swap_summary['most_swapped_block']} "
-                                f"({swap_summary['most_swapped_count']} times)", category="blockswap")
+                        debug.log(f"Most swapped: Block {swap_summary['most_swapped_block']} "
+                                f"({swap_summary['most_swapped_count']} times)", category="blockswap", indent_level=1)
                 
                 # Show I/O swap details if present
                 if 'io_swaps' in swap_summary and swap_summary['io_swaps'] > 0:
-                    debug.log(f"  I/O swaps: {swap_summary['io_swaps']} "
+                    debug.log(f"I/O swaps: {swap_summary['io_swaps']} "
                             f"(avg: {swap_summary.get('io_avg_ms', 0):.2f}ms, total: {swap_summary.get('io_total_ms', 0):.2f}ms)", 
-                            category="blockswap")
+                            category="blockswap", indent_level=1)
 
         # Cleanup DiT as it's no longer needed after upscaling
         cleanup_dit(runner=runner, debug=debug, cache_model=cache_model)
@@ -1185,7 +1201,8 @@ def decode_all_batches(
                 tensor_name=f"upscaled_latent_{decode_idx+1}",
                 dtype=ctx['compute_dtype'],
                 debug=debug,
-                reason="VAE decoding"
+                reason="VAE decoding",
+                indent_level=1
             )
             
             # Decode latent
@@ -1208,7 +1225,8 @@ def decode_all_batches(
                         tensor_name=f"sample_{decode_idx+1}",
                         dtype=ctx['compute_dtype'],
                         debug=debug,
-                        reason="storing decoded samples for post-processing (VAE dtype → compute dtype)"
+                        reason="storing decoded samples for post-processing (VAE dtype → compute dtype)",
+                        indent_level=1
                     )
             else:
                 # No offload device, but still convert to compute dtype
@@ -1218,7 +1236,8 @@ def decode_all_batches(
                     tensor_name=f"sample_{decode_idx+1}",
                     dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="VAE dtype → compute dtype"
+                    reason="VAE dtype → compute dtype",
+                    indent_level=1
                 )
             ctx['batch_samples'][decode_idx] = samples
             
@@ -1378,7 +1397,8 @@ def postprocess_all_batches(
                     tensor_name=f"sample_{batch_idx+1}_{i}",
                     dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="post-processing"
+                    reason="post-processing",
+                    indent_level=1
                 )
                 
                 # Get original length for trimming (always available)
@@ -1416,29 +1436,30 @@ def postprocess_all_batches(
                                 target_device=sample.device,
                                 tensor_name=f"input_video_{batch_idx+1}",
                                 debug=debug,
-                                reason="color correction"
+                                reason="color correction",
+                                indent_level=1
                             )
                         
                         # Apply selected color correction method
                         debug.start_timer(f"color_correction_{color_correction}")
                         
                         if color_correction == "lab":
-                            debug.log("  Applying LAB perceptual color transfer", category="video", force=True)
+                            debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
                             sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
                         elif color_correction == "wavelet_adaptive":
-                            debug.log("  Applying wavelet with adaptive saturation correction", category="video", force=True)
+                            debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
                             sample = wavelet_adaptive_color_correction(sample, input_video, debug)
                         elif color_correction == "wavelet":
-                            debug.log("  Applying wavelet color reconstruction", category="video", force=True)
+                            debug.log("Applying wavelet color reconstruction", category="video", force=True, indent_level=1)
                             sample = wavelet_reconstruction(sample, input_video, debug)
                         elif color_correction == "hsv":
-                            debug.log("  Applying HSV hue-conditional saturation matching", category="video", force=True)
+                            debug.log("Applying HSV hue-conditional saturation matching", category="video", force=True, indent_level=1)
                             sample = hsv_saturation_histogram_match(sample, input_video, debug)
                         elif color_correction == "adain":
-                            debug.log("  Applying AdaIN color correction", category="video", force=True)
+                            debug.log("Applying AdaIN color correction", category="video", force=True, indent_level=1)
                             sample = adaptive_instance_normalization(sample, input_video)
                         else:
-                            debug.log(f"  Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True)
+                            debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True, indent_level=1)
                         
                         debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                         
@@ -1452,7 +1473,7 @@ def postprocess_all_batches(
                             sample = torch.cat([sample, alpha_channel], dim=1)
                 
                 else:
-                    debug.log("  Color correction disabled (set to none)", category="video")
+                    debug.log("Color correction disabled (set to none)", category="video", indent_level=1)
                 
                 # Free the original length entry
                 if 'all_ori_lengths' in ctx and video_idx < len(ctx['all_ori_lengths']):
@@ -1483,7 +1504,8 @@ def postprocess_all_batches(
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"sample_{batch_idx+1}_{i}_final",
                         debug=debug,
-                        reason="storing final processed samples"
+                        reason="storing final processed samples",
+                        indent_level=1
                     )
                 
                 # Get batch dimensions

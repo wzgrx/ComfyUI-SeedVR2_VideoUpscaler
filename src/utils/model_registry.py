@@ -24,11 +24,11 @@ MODEL_CLASSES = {
 class ModelInfo:
     """Model metadata"""
     repo: str = "numz/SeedVR2_comfyUI"
-    category: str = "dit"  # 'model' or 'vae'
-    precision: str = "fp16"  # 'fp16', 'fp8_e4m3fn', 'Q4_K_M', etc.
-    size: str = "3B"  # '3B', '7B', etc.
-    variant: Optional[str] = None  # 'sharp', etc.
-    sha256: Optional[str] = None  # Cached hash
+    category: str = "dit" # 'model' or 'vae'
+    precision: str = "fp16" # 'fp16', 'fp8_e4m3fn', 'Q4_K_M', etc.
+    size: str = "3B" # '3B', '7B', etc.
+    variant: Optional[str] = None # 'sharp', etc.
+    sha256: Optional[str] = None # Cached hash
 
 # Model registry with metadata
 MODEL_REGISTRY = {

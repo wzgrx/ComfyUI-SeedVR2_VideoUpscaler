@@ -74,15 +74,16 @@ class Debug:
         
 
     @torch._dynamo.disable  # Skip tracing to avoid datetime.now() warnings
-    def log(self, message: str, level: str = "INFO", category: str = "general", force: bool = False) -> None:
+    def log(self, message: str, level: str = "INFO", category: str = "general", force: bool = False, indent_level: int = 0) -> None:
         """
-        Log a categorized message with optional timestamp
+        Log a categorized message with optional timestamp and indentation
         
         Args:
             message: Message to log
             level: Log level (INFO, WARN, ERROR)
             category: Category for the message
             force: If True, always log regardless of enabled state (for critical messages)
+            indent_level: Indentation level (0=no indent, 1=2 spaces, 2=4 spaces, etc.)
         """
         # Always log forced messages or if debugging is enabled - early return if not
         if not (self.enabled or force):
@@ -107,7 +108,10 @@ class Debug:
         if level != "INFO":
             prefix += f" [{level}]"
         
-        print(f"{prefix} {message}")
+        # Add indentation
+        indent = " " * (indent_level * 2)
+        
+        print(f"{prefix} {indent}{message}")
 
 
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
@@ -194,7 +198,7 @@ class Debug:
                 
                 for child_name, child_duration in sorted_children:
                     if child_duration >= 0.01:  # Only show if >= 10ms
-                        self.log(f"  └─ {child_name}: {child_duration:.2f}s", category="timing", force=force)
+                        self.log(f"└─ {child_name}: {child_duration:.2f}s", category="timing", force=force, indent_level=1)
             else:
                 # Use automatic hierarchy tracking
                 children = self.timer_hierarchy.get(name, [])
@@ -210,7 +214,7 @@ class Debug:
                     child_duration = self.timer_durations.get(child, 0)
                     if child_duration >= 0.01:  # Only show if >= 10ms
                         child_message = self.timer_messages.get(child, child)
-                        self.log(f"  └─ {child_message}: {child_duration:.2f}s", category="timing", force=force)
+                        self.log(f"└─ {child_message}: {child_duration:.2f}s", category="timing", force=force, indent_level=1)
                         
                         # Recursively show grandchildren
                         if child in self.timer_hierarchy:
@@ -221,10 +225,10 @@ class Debug:
                                 grandchild_duration = self.timer_durations.get(grandchild, 0)
                                 if grandchild_duration >= 0.01:  # Only show if >= 10ms
                                     grandchild_message = self.timer_messages.get(grandchild, grandchild)
-                                    self.log(f"    └─ {grandchild_message}: {grandchild_duration:.2f}s", category="timing", force=force)
+                                    self.log(f"└─ {grandchild_message}: {grandchild_duration:.2f}s", category="timing", force=force, indent_level=2)
             
             if unaccounted > 0.01:  # Show if more than 10ms unaccounted
-                self.log(f"  └─ (other operations): {unaccounted:.2f}s", category="timing", force=force)
+                self.log(f"└─ (other operations): {unaccounted:.2f}s", category="timing", force=force, indent_level=1)
         
         return duration
 
@@ -407,41 +411,41 @@ class Debug:
         # GPU tensors
         if details['gpu_tensors']:
             gpu_total_gb = sum(t['size_mb'] for t in details['gpu_tensors']) / 1024
-            self.log(f"  GPU tensors: {len(details['gpu_tensors'])} using {gpu_total_gb:.2f}GB", category="memory", force=force)
+            self.log(f"GPU tensors: {len(details['gpu_tensors'])} using {gpu_total_gb:.2f}GB", category="memory", force=force, indent_level=1)
             
             # Show top 5 largest
             largest = sorted(details['gpu_tensors'], key=lambda x: x['size_mb'], reverse=True)[:5]
             for t in largest:
-                self.log(f"  {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
+                self.log(f"{t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force, indent_level=1)
         
         # Large CPU tensors
         if details['large_cpu_tensors']:
             cpu_large_gb = sum(t['size_mb'] for t in details['large_cpu_tensors']) / 1024
-            self.log(f"  Large CPU tensors (>10MB):", category="memory", force=force)
-            self.log(f"  {len(details['large_cpu_tensors'])} using {cpu_large_gb:.2f}GB", category="memory", force=force)
+            self.log(f"Large CPU tensors (>10MB):", category="memory", force=force, indent_level=1)
+            self.log(f"{len(details['large_cpu_tensors'])} using {cpu_large_gb:.2f}GB", category="memory", force=force, indent_level=1)
             
             # Show top 3 largest
             largest = sorted(details['large_cpu_tensors'], key=lambda x: x['size_mb'], reverse=True)[:3]
             for t in largest:
-                self.log(f"  {t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force)
+                self.log(f"{t['shape']}: {t['size_mb']:.2f}MB, {t['dtype']}", category="memory", force=force, indent_level=1)
         
         # Common shape patterns
         if details['shape_patterns']:
             common_shapes = sorted(details['shape_patterns'].items(), 
                                   key=lambda x: x[1], reverse=True)[:5]
             if len(common_shapes) > 0:
-                self.log("  Common tensor shapes:", category="memory", force=force)
+                self.log("Common tensor shapes:", category="memory", force=force, indent_level=1)
                 for shape, count in common_shapes:
                     if count > 1:
-                        self.log(f"  {shape}: {count} instances", category="memory", force=force)
+                        self.log(f"{shape}: {count} instances", category="memory", force=force, indent_level=1)
         
         # Module instances
         if details['module_types']:
             multi_instance = [(k, v) for k, v in details['module_types'].items() if v > 1]
             if multi_instance:
-                self.log("  Multiple module instances:", category="memory", force=force)
+                self.log("Multiple module instances:", category="memory", force=force, indent_level=1)
                 for mtype, count in sorted(multi_instance, key=lambda x: x[1], reverse=True)[:5]:
-                    self.log(f"  {mtype}: {count} instances", category="memory", force=force)
+                    self.log(f"{mtype}: {count} instances", category="memory", force=force, indent_level=1)
     
 
     def _log_memory_diff(self, current_metrics: Dict[str, Any], force: bool = False) -> None:
@@ -460,7 +464,7 @@ class Debug:
             diffs.append(f"RAM {sign}{ram_diff:.2f}GB")
         
         if diffs:
-            self.log(f"  Memory changes: {', '.join(diffs)}", category="memory", force=force)
+            self.log(f"Memory changes: {', '.join(diffs)}", category="memory", force=force, indent_level=1)
     
 
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
