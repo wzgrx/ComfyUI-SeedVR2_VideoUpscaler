@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from typing import Optional, Any, List
 from ..common.half_precision_fixes import ensure_float32_precision
-from ..optimization.memory_manager import manage_tensor_device
+from ..optimization.memory_manager import manage_tensor
 
 
 def process_alpha_for_batch(
@@ -20,6 +20,7 @@ def process_alpha_for_batch(
     alpha_original: torch.Tensor,
     rgb_original: torch.Tensor,
     device: torch.device,
+    compute_dtype: torch.dtype,
     debug: Optional[Any] = None
 ) -> List[torch.Tensor]:
     """
@@ -27,24 +28,25 @@ def process_alpha_for_batch(
     Called during postprocess phase when VRAM is available.
     
     Args:
-        rgb_samples: List of decoded RGB samples
+        rgb_samples: List of decoded RGB samples from VAE
         alpha_original: Original Alpha channel (C, T, H, W)
         rgb_original: Original RGB for guidance (C, T, H, W)
-        device: Target device for processing
-        debug: Debug instance
+        device: Target device for processing (typically CUDA)
+        compute_dtype: Pipeline compute dtype (e.g., bfloat16) for final output.
+        debug: Debug instance for logging
         
     Returns:
-        List of RGBA samples with Alpha merged
+        List of RGBA samples with Alpha merged, in compute_dtype
     """
     # Move alpha and RGB guidance tensors to processing device (GPU)
-    alpha_original = manage_tensor_device(
+    alpha_original = manage_tensor(
         tensor=alpha_original,
         target_device=device,
         tensor_name="alpha_original",
         debug=debug,
         reason="Alpha processing"
     )
-    rgb_original = manage_tensor_device(
+    rgb_original = manage_tensor(
         tensor=rgb_original,
         target_device=device,
         tensor_name="rgb_original",
@@ -57,7 +59,7 @@ def process_alpha_for_batch(
     
     for rgb_sample in rgb_samples:
         # Move RGB sample to processing device before use
-        rgb_sample = manage_tensor_device(
+        rgb_sample = manage_tensor(
             tensor=rgb_sample,
             target_device=device,
             tensor_name="rgb_sample",
@@ -86,6 +88,17 @@ def process_alpha_for_batch(
             method='guided',
             debug=debug
         )
+        
+        # Convert Alpha from float32 to compute dtype
+        if alpha_upscaled.dtype != compute_dtype:
+            alpha_upscaled = manage_tensor(
+                tensor=alpha_upscaled,
+                target_device=alpha_upscaled.device,
+                tensor_name="alpha_upscaled",
+                dtype=compute_dtype,
+                debug=debug,
+                reason="dtype alignment for RGBA concatenation"
+            )
         
         # Concatenate RGB and upscaled alpha to create RGBA output (T, 4, H, W)
         rgba_sample = torch.cat([rgb_sample_4d[:, :3, :, :], alpha_upscaled], dim=1)
@@ -158,7 +171,7 @@ def detect_edges_batch(
     edges = edges.unsqueeze(1)
     
     # Move back to images device after CPU numpy processing
-    edges = manage_tensor_device(
+    edges = manage_tensor(
         tensor=edges,
         target_device=images.device,
         tensor_name="edge_map",
@@ -203,7 +216,7 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
     
     # Restore original dtype after float32 processing
     if output.dtype != guide_dtype:
-        output = manage_tensor_device(
+        output = manage_tensor(
             tensor=output,
             target_device=output.device,
             tensor_name="filtered_output",
@@ -400,17 +413,6 @@ def edge_guided_alpha_upscale(
     
    # Clamp output to valid alpha range [0, 1]
     alpha_final = alpha_final.clamp(0, 1)
-
-    # Restore original dtype after float32 processing
-    if alpha_final.dtype != alpha_dtype:
-        alpha_final = manage_tensor_device(
-            tensor=alpha_final,
-            target_device=alpha_final.device,
-            tensor_name="alpha_final",
-            dtype=alpha_dtype,
-            debug=debug,
-            reason="dtype restoration"
-        )
     
     if debug:
         final_values = alpha_final.flatten()

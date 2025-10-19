@@ -549,7 +549,7 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional[Any] 
             debug.log(f"Failed to release model memory: {e}", level="WARNING", category="memory", force=True)
 
 
-def manage_tensor_device(
+def manage_tensor(
     tensor: torch.Tensor,
     target_device: torch.device,
     tensor_name: str = "tensor",
@@ -559,24 +559,27 @@ def manage_tensor_device(
     reason: Optional[str] = None
 ) -> torch.Tensor:
     """
-    Move tensor to target device with consistent logging.
+    Unified tensor management for device movement and dtype conversion.
+    
+    Handles both device transfers (CPU ↔ GPU) and dtype conversions (e.g., float16 ↔ bfloat16)
+    with intelligent early-exit optimization and comprehensive logging.
     
     Args:
-        tensor: Tensor to move
+        tensor: Tensor to manage
         target_device: Target device (torch.device object)
         tensor_name: Descriptive name for logging (e.g., "latent", "sample", "alpha_channel")
         dtype: Optional target dtype to cast to (if None, keeps original dtype)
         non_blocking: Whether to use non-blocking transfer
         debug: Debug instance for logging
-        reason: Optional reason for the movement (e.g., "inference", "offload", "color correction")
+        reason: Optional reason for the operation (e.g., "inference", "offload", "dtype alignment")
         
     Returns:
         Tensor on target device with optional dtype conversion
         
     Note:
-        - Skips movement if tensor already on target device and dtype
-        - Logs movements consistently with model movements for tracking
-        - Optimized to avoid unnecessary data transfers
+        - Skips operation if tensor already has target device and dtype (zero-copy)
+        - Uses PyTorch's optimized .to() for efficient device/dtype handling
+        - Logs all operations consistently for tracking and debugging
     """
     if tensor is None:
         return tensor
@@ -617,8 +620,16 @@ def manage_tensor_device(
             category="general"
         )
     
-    # Perform the movement
-    return tensor.to(target_device, dtype=target_dtype, non_blocking=non_blocking)
+    # Perform the operation based on what needs to change
+    if needs_device_move and needs_dtype_change:
+        # Both device and dtype need to change
+        return tensor.to(target_device, dtype=target_dtype, non_blocking=non_blocking)
+    elif needs_device_move:
+        # Only device needs to change
+        return tensor.to(target_device, non_blocking=non_blocking)
+    else:
+        # Only dtype needs to change
+        return tensor.to(dtype=target_dtype)
 
 
 def manage_model_device(model: torch.nn.Module, target_device: torch.device, model_name: str,

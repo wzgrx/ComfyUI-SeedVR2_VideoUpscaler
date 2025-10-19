@@ -32,6 +32,7 @@ from .alpha_upscaling import process_alpha_for_batch
 from .infer import VideoDiffusionInfer
 from .model_manager import configure_runner, materialize_model, apply_model_specific_config
 from ..common.seed import set_seed
+from ..common.half_precision_fixes import ensure_float32_precision
 from ..data.image.transforms.divisible_crop import DivisibleCrop
 from ..data.image.transforms.na_resize import NaResize
 from ..optimization.memory_manager import (
@@ -39,7 +40,7 @@ from ..optimization.memory_manager import (
     cleanup_vae,
     cleanup_text_embeddings,
     clear_memory,
-    manage_tensor_device,
+    manage_tensor,
     manage_model_device,
     release_tensor_memory,
     release_tensor_collection
@@ -135,7 +136,7 @@ def load_text_embeddings(script_directory: str, device: torch.device,
     text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt'))
     text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt'))
     
-    text_pos_embeds = manage_tensor_device(
+    text_pos_embeds = manage_tensor(
         tensor=text_pos_embeds,
         target_device=device,
         tensor_name="text_pos_embeds",
@@ -143,7 +144,7 @@ def load_text_embeddings(script_directory: str, device: torch.device,
         debug=debug,
         reason="DiT inference"
     )
-    text_neg_embeds = manage_tensor_device(
+    text_neg_embeds = manage_tensor(
         tensor=text_neg_embeds,
         target_device=device,
         tensor_name="text_neg_embeds",
@@ -690,7 +691,7 @@ def encode_all_batches(
             # Process current batch
             video = images[start_idx:end_idx]
             video = video.permute(0, 3, 1, 2)
-            video = manage_tensor_device(
+            video = manage_tensor(
                 tensor=video,
                 target_device=ctx['vae_device'],
                 tensor_name=f"video_batch_{encode_idx+1}",
@@ -751,7 +752,7 @@ def encode_all_batches(
             # Store transformed video on offload device if needed for color correction
             if color_correction != "none":
                 if ctx['tensor_offload_device'] is not None and (transformed_video.is_cuda or transformed_video.is_mps):
-                    ctx['all_transformed_videos'][encode_idx] = manage_tensor_device(
+                    ctx['all_transformed_videos'][encode_idx] = manage_tensor(
                         tensor=transformed_video,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"transformed_video_{encode_idx+1}",
@@ -774,14 +775,14 @@ def encode_all_batches(
                 
                 # Store on tensor_offload_device to save VRAM (or keep on device if none)
                 if ctx['tensor_offload_device'] is not None:
-                    ctx['all_alpha_channels'][encode_idx] = manage_tensor_device(
+                    ctx['all_alpha_channels'][encode_idx] = manage_tensor(
                         tensor=alpha_channel,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"alpha_channel_{encode_idx+1}",
                         debug=debug,
                         reason="storing Alpha channel for upscaling"
                     )
-                    ctx['all_input_rgb'][encode_idx] = manage_tensor_device(
+                    ctx['all_input_rgb'][encode_idx] = manage_tensor(
                         tensor=rgb_video_original,
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"rgb_original_{encode_idx+1}",
@@ -797,7 +798,7 @@ def encode_all_batches(
             del video
 
             # Move to VAE device with correct dtype for encoding (no-op if already there)
-            transformed_video = manage_tensor_device(
+            transformed_video = manage_tensor(
                 tensor=transformed_video,
                 target_device=ctx['vae_device'],
                 tensor_name=f"transformed_video_{encode_idx+1}",
@@ -808,17 +809,26 @@ def encode_all_batches(
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
             
-            # Offload latents to avoid VRAM accumulation
+            # Convert from VAE dtype to compute dtype and offload to avoid VRAM accumulation
             if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps):
-                ctx['all_latents'][encode_idx] = manage_tensor_device(
+                ctx['all_latents'][encode_idx] = manage_tensor(
                     tensor=cond_latents[0],
                     target_device=ctx['tensor_offload_device'],
                     tensor_name=f"latent_{encode_idx+1}",
+                    dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="storing encoded latents for upscaling"
+                    reason="storing encoded latents for upscaling (VAE dtype → compute dtype)"
                 )
             else:
-                ctx['all_latents'][encode_idx] = cond_latents[0]
+                # Stay on current device but convert to compute dtype
+                ctx['all_latents'][encode_idx] = manage_tensor(
+                    tensor=cond_latents[0],
+                    target_device=cond_latents[0].device,
+                    tensor_name=f"latent_{encode_idx+1}",
+                    dtype=ctx['compute_dtype'],
+                    debug=debug,
+                    reason="VAE dtype → compute dtype"
+                )
             
             del cond_latents, transformed_video
             
@@ -970,7 +980,7 @@ def upscale_all_batches(
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
             
             # Move to DiT device with correct dtype for upscaling (no-op if already there)
-            latent = manage_tensor_device(
+            latent = manage_tensor(
                 tensor=latent,
                 target_device=ctx['dit_device'],
                 tensor_name=f"latent_{upscale_idx+1}",
@@ -1020,7 +1030,7 @@ def upscale_all_batches(
             
             # Offload upscaled latents to avoid VRAM accumulation
             if ctx['tensor_offload_device'] is not None and (upscaled_latents[0].is_cuda or upscaled_latents[0].is_mps):
-                ctx['all_upscaled_latents'][upscale_idx] = manage_tensor_device(
+                ctx['all_upscaled_latents'][upscale_idx] = manage_tensor(
                     tensor=upscaled_latents[0],
                     target_device=ctx['tensor_offload_device'],
                     tensor_name=f"upscaled_latent_{upscale_idx+1}",
@@ -1169,7 +1179,7 @@ def decode_all_batches(
             debug.start_timer(f"decode_batch_{decode_idx+1}")
             
             # Move to VAE device with correct dtype for decoding (no-op if already there)
-            upscaled_latent = manage_tensor_device(
+            upscaled_latent = manage_tensor(
                 tensor=upscaled_latent,
                 target_device=ctx['vae_device'],
                 tensor_name=f"upscaled_latent_{decode_idx+1}",
@@ -1183,22 +1193,33 @@ def decode_all_batches(
             samples = runner.vae_decode([upscaled_latent])
             debug.end_timer("vae_decode", "VAE decode")
             
-           # Process samples
+            # Process samples
             debug.start_timer("optimized_video_rearrange")
             samples = optimized_video_rearrange(samples)
             debug.end_timer("optimized_video_rearrange", "Video rearrange")
             
-            # Offload decoded samples to avoid VRAM accumulation
+            # Convert from VAE dtype to compute dtype and offload to avoid VRAM accumulation
             if ctx['tensor_offload_device'] is not None:
                 # samples is always a single-element list from vae_decode([upscaled_latent])]
                 if samples[0].is_cuda or samples[0].is_mps:
-                    samples[0] = manage_tensor_device(
+                    samples[0] = manage_tensor(
                         tensor=samples[0],
                         target_device=ctx['tensor_offload_device'],
                         tensor_name=f"sample_{decode_idx+1}",
+                        dtype=ctx['compute_dtype'],
                         debug=debug,
-                        reason="storing decoded latents for post-processing"
+                        reason="storing decoded samples for post-processing (VAE dtype → compute dtype)"
                     )
+            else:
+                # No offload device, but still convert to compute dtype
+                samples[0] = manage_tensor(
+                    tensor=samples[0],
+                    target_device=samples[0].device,
+                    tensor_name=f"sample_{decode_idx+1}",
+                    dtype=ctx['compute_dtype'],
+                    debug=debug,
+                    reason="VAE dtype → compute dtype"
+                )
             ctx['batch_samples'][decode_idx] = samples
             
             # Free the upscaled latent and GPU samples
@@ -1322,6 +1343,7 @@ def postprocess_all_batches(
                     alpha_original=ctx['all_alpha_channels'][batch_idx],
                     rgb_original=ctx['all_input_rgb'][batch_idx],
                     device=ctx['vae_device'],
+                    compute_dtype=ctx['compute_dtype'],
                     debug=debug
                 )
                 
@@ -1350,7 +1372,7 @@ def postprocess_all_batches(
             # Post-process each sample in the batch
             for i, sample in enumerate(samples):
                 # Move to VAE device with correct dtype for processing (no-op if already there)
-                sample = manage_tensor_device(
+                sample = manage_tensor(
                     tensor=sample,
                     target_device=ctx['vae_device'],
                     tensor_name=f"sample_{batch_idx+1}_{i}",
@@ -1389,7 +1411,7 @@ def postprocess_all_batches(
                         
                         # Ensure both tensors are on same device (GPU) for color correction
                         if input_video.device != sample.device:
-                            input_video = manage_tensor_device(
+                            input_video = manage_tensor(
                                 tensor=input_video,
                                 target_device=sample.device,
                                 tensor_name=f"input_video_{batch_idx+1}",
@@ -1456,15 +1478,13 @@ def postprocess_all_batches(
                 
                 # Move to tensor_offload_device if specified
                 if ctx['tensor_offload_device'] is not None:
-                    if sample.is_cuda or sample.is_mps:
-                        sample = manage_tensor_device(
-                            tensor=sample,
-                            target_device=ctx['tensor_offload_device'],
-                            tensor_name=f"final_sample_{batch_idx+1}",
-                            debug=debug,
-                            reason="storing final assembly"
-                        )
-                # If no tensor_offload_device, sample stays on VAE device (no movement needed)
+                    sample = manage_tensor(
+                        tensor=sample,
+                        target_device=ctx['tensor_offload_device'],
+                        tensor_name=f"sample_{batch_idx+1}_{i}_final",
+                        debug=debug,
+                        reason="storing final processed samples"
+                    )
                 
                 # Get batch dimensions
                 batch_frames = sample.shape[0]
