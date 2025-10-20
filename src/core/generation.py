@@ -1326,6 +1326,21 @@ def postprocess_all_batches(
     # Count valid samples for progress reporting
     num_valid_samples = len([s for s in ctx['batch_samples'] if s is not None])
     
+    # Calculate total post-processing work units
+    # For RGBA: each batch needs 2 steps (alpha processing + color correction/assembly)
+    # For RGB: each batch needs 1 step (color correction/assembly only)
+    has_alpha_processing = (ctx.get('is_rgba', False) and 
+                           'all_alpha_channels' in ctx and 
+                           'all_input_rgb' in ctx and
+                           isinstance(ctx.get('all_alpha_channels'), list))
+    
+    if has_alpha_processing:
+        total_postprocess_steps = num_valid_samples * 2  # Alpha + main processing
+    else:
+        total_postprocess_steps = num_valid_samples  # Main processing only
+    
+    current_postprocess_step = 0
+    
     # Pre-allocation will happen after processing first sample to get exact dimensions
     ctx['final_video'] = None
     current_frame_idx = 0
@@ -1374,6 +1389,12 @@ def postprocess_all_batches(
                 ctx['all_input_rgb'][batch_idx] = None
             
                 debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
+                
+                # Update progress for alpha processing step
+                current_postprocess_step += 1
+                if progress_callback:
+                    progress_callback(current_postprocess_step, total_postprocess_steps,
+                                    1, "Phase 4: Post-processing")
 
         debug.log("Alpha processing complete for all batches", category="alpha")
     
@@ -1536,8 +1557,10 @@ def postprocess_all_batches(
             
             debug.end_timer(f"postprocess_batch_{batch_idx+1}", f"Post-processed batch {batch_idx+1}")
             
+            # Update progress for main processing step
+            current_postprocess_step += 1
             if progress_callback:
-                progress_callback(batch_idx+1, num_valid_samples,
+                progress_callback(current_postprocess_step, total_postprocess_steps,
                                 1, "Phase 4: Post-processing")
 
         # Verify final assembly

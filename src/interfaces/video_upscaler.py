@@ -552,16 +552,16 @@ class SeedVR2VideoUpscaler:
         
         # Define phase weights and offsets for overall progress
         phase_weights = {
-            "Phase 1: Encoding": 0.25,
-            "Phase 2: Upscaling": 0.50,
-            "Phase 3: Decoding": 0.20,
+            "Phase 1: Encoding": 0.2,
+            "Phase 2: Upscaling": 0.25,
+            "Phase 3: Decoding": 0.5,
             "Phase 4: Post-processing": 0.05
         }
-        
+
         phase_offset = {
             "Phase 1: Encoding": 0.0,
-            "Phase 2: Upscaling": 0.25,
-            "Phase 3: Decoding": 0.75,
+            "Phase 2: Upscaling": 0.2,
+            "Phase 3: Decoding": 0.45,
             "Phase 4: Post-processing": 0.95
         }
         
