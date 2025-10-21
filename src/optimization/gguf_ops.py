@@ -8,14 +8,13 @@ import torch
 import torch.nn as nn
 from typing import Optional, Dict, Tuple
 from ..utils.debug import Debug
+from ..optimization.compatibility import GGUF_AVAILABLE, validate_gguf_availability
 
-# Import GGUF with fallback
-try:
+# Import GGUF-specific modules
+if GGUF_AVAILABLE:
     import gguf
     from .gguf_dequant import dequantize_tensor, is_torch_compatible, is_quantized as is_gguf_quantized
-    GGUF_AVAILABLE = True
-except ImportError:
-    GGUF_AVAILABLE = False
+else:
     gguf = None
     
     # Fallback functions when GGUF not available
@@ -40,7 +39,6 @@ class _GGUFQuantizedBase(nn.Module):
         super().__init__()
         self.weight = None
         self.bias = None
-        self.quantized_weight = None
         self.weight_qtype = None
         self.weight_shape = None
         self.debug = debug
@@ -48,8 +46,16 @@ class _GGUFQuantizedBase(nn.Module):
     def load_quantized_weight(self, weight_tensor: torch.Tensor, bias_tensor: Optional[torch.Tensor] = None) -> None:
         """Load quantized weight tensor with debug logging"""
         if hasattr(weight_tensor, 'tensor_type') and hasattr(weight_tensor, 'tensor_shape'):
-            # This is a quantized tensor
-            self.quantized_weight = weight_tensor
+            # This is a quantized tensor - register as non-persistent buffer
+            # Non-persistent buffers are moved with model.to() but not saved in state_dict
+            # Check if buffer already exists (for model reloading scenarios)
+            if hasattr(self, 'quantized_weight'):
+                # Replace existing buffer
+                self._buffers['quantized_weight'] = weight_tensor
+            else:
+                # Register new buffer
+                self.register_buffer('quantized_weight', weight_tensor, persistent=False)
+            
             self.weight_qtype = weight_tensor.tensor_type
             self.weight_shape = weight_tensor.tensor_shape
         else:
@@ -59,6 +65,20 @@ class _GGUFQuantizedBase(nn.Module):
         if bias_tensor is not None:
             self.bias = nn.Parameter(bias_tensor, requires_grad=False)
     
+    def _apply(self, fn):
+        """
+        Override _apply to handle GGUF quantized weight device movement properly.
+        This ensures model.to(device) works correctly with quantized weights.
+        """
+        # Handle quantized weight if it exists
+        if 'quantized_weight' in self._buffers:
+            # Apply the function (device/dtype conversion) to the quantized weight
+            self._buffers['quantized_weight'] = fn(self._buffers['quantized_weight'])
+        
+        # Let parent class handle parameters and other buffers
+        return super()._apply(fn)
+    
+    @torch._dynamo.disable
     def dequantize_weight(self, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float16) -> torch.Tensor:
         """Dequantize weight tensor on-the-fly"""
         if self.quantized_weight is None:
@@ -88,6 +108,7 @@ class _GGUFQuantizedBase(nn.Module):
             if self.debug:
                 self.debug.end_timer("gguf_dequant", "Weight dequantization completed")
 
+    @torch._dynamo.disable
     def get_dequantized_weight_for_compute(self, input: torch.Tensor) -> torch.Tensor:
         """
         Get dequantized weight optimized for computation.
@@ -205,7 +226,7 @@ def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix=
         - quant_types: Dict mapping quantization type names to counts
     """
     if not GGUF_AVAILABLE:
-        return 0
+        return 0, {}
     
     replacements_made = 0
     quant_types = {}  # Track quantization types found

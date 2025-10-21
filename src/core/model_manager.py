@@ -31,23 +31,27 @@ except ImportError:
 # Import Debug for type annotations
 from ..utils.debug import Debug
 
-# Import GGUF with fallback  
-try:
-    import gguf
-    from gguf import GGMLQuantizationType
-    import traceback
-    from ..optimization.gguf_dequant import dequantize_tensor
-    from ..optimization.gguf_ops import replace_linear_with_quantized
-    GGUF_AVAILABLE = True
-except ImportError:
-    GGUF_AVAILABLE = False
-    GGMLQuantizationType = None
-    
 from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
 from ..common.config import load_config, create_object
 from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
-from ..optimization.compatibility import FP8CompatibleDiT
+from ..optimization.compatibility import (
+    FP8CompatibleDiT,
+    TRITON_AVAILABLE,
+    FLASH_ATTN_AVAILABLE,
+    GGUF_AVAILABLE,
+    GGMLQuantizationType,
+    validate_flash_attention_availability,
+    validate_gguf_availability
+)
+
+# GGUF-specific imports (only when available)
+if GGUF_AVAILABLE:
+    import gguf
+    import traceback
+    from ..optimization.gguf_dequant import dequantize_tensor
+    from ..optimization.gguf_ops import replace_linear_with_quantized
+
 from ..optimization.blockswap import is_blockswap_enabled, apply_block_swap_to_dit, cleanup_blockswap
 from ..optimization.memory_manager import cleanup_dit, cleanup_vae
 from ..utils.constants import get_script_directory, find_model_file, suppress_tensor_warnings
@@ -143,6 +147,27 @@ def _describe_compile_config(config: Optional[Dict[str, Any]]) -> str:
     return f"enabled ({', '.join(parts)})"
 
 
+def _describe_attention_mode(attention_mode: Optional[str]) -> str:
+    """
+    Generate human-readable description of attention mode configuration.
+    
+    Args:
+        attention_mode: Attention mode string ('sdpa' or 'flash_attn')
+        
+    Returns:
+        Human-readable description string
+    """
+    if attention_mode is None:
+        return "sdpa (default)"
+    
+    mode_descriptions = {
+        'sdpa': 'PyTorch SDPA',
+        'flash_attn': 'Flash Attention 2'
+    }
+    
+    return mode_descriptions.get(attention_mode, attention_mode)
+    
+
 def _describe_tiling_config(encode_tiled: bool, encode_tile_size: Optional[Tuple[int, int]], 
                            encode_tile_overlap: Optional[Tuple[int, int]],
                            decode_tiled: bool, decode_tile_size: Optional[Tuple[int, int]], 
@@ -179,6 +204,7 @@ def _update_model_config(
     model_type: str,
     new_configs: Dict[str, Any],
     cached_config_attrs: Dict[str, str],
+    model_config_attrs: Dict[str, str],
     config_describers: Dict[str, Callable],
     special_handlers: Optional[Dict[str, Callable]] = None,
     debug: Debug = None
@@ -197,6 +223,8 @@ def _update_model_config(
                     e.g., {'torch_compile': ..., 'block_swap': ...}
         cached_config_attrs: Dict mapping config names to runner attribute names
                            e.g., {'torch_compile': '_dit_compile_args', ...}
+        model_config_attrs: Dict mapping config names to model storage attribute names.
+                            e.g., {'torch_compile': '_config_compile', ...}
         config_describers: Dict mapping config names to description functions
                           e.g., {'torch_compile': _describe_compile_config, ...}
         special_handlers: Optional dict of config-specific handlers
@@ -267,6 +295,8 @@ def _update_model_config(
                     display_name = 'torch.compile'
                 elif config_name == 'block_swap':
                     display_name = 'BlockSwap'
+                elif config_name == 'attention_mode':
+                    display_name = 'Attention Mode'
                     
                 config_changes.append(f"{display_name}: {old_desc} → {new_desc}")
     
@@ -312,7 +342,11 @@ def _update_model_config(
     
     # Store on model so config travels with the model when cached
     for config_name, attr_name in cached_config_attrs.items():
-        model_attr_name = f'_config_{config_name.split("_")[-1]}'
+        # Use explicit mapping if provided, otherwise derive from config name
+        if model_config_attrs and config_name in model_config_attrs:
+            model_attr_name = model_config_attrs[config_name]
+        else:
+            model_attr_name = f'_config_{config_name.split("_")[-1]}'
         setattr(model, model_attr_name, new_configs.get(config_name))
     
     # Mark that configs need to be applied
@@ -361,14 +395,15 @@ def _update_dit_config(
     runner: 'VideoDiffusionInfer',
     block_swap_config: Optional[Dict[str, Any]],
     torch_compile_args: Optional[Dict[str, Any]],
+    attention_mode: Optional[str],
     debug: Debug
 ) -> bool:
     """
     Update DiT model configuration when reusing cached model.
     
     Compares new configuration settings against cached config to detect changes.
-    Handles BlockSwap and torch.compile configuration updates with proper cleanup
-    and reapplication when settings change.
+    Handles BlockSwap, torch.compile, and attention_mode configuration updates with 
+    proper cleanup and reapplication when settings change.
     
     Args:
         runner: VideoDiffusionInfer instance with cached DiT model
@@ -382,6 +417,7 @@ def _update_dit_config(
             - dynamic: bool - Enable dynamic shapes
             - dynamo_cache_size_limit: int - Cache size limit
             - dynamo_recompile_limit: int - Recompilation limit
+        attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         debug: Debug instance for logging
         
     Returns:
@@ -393,15 +429,23 @@ def _update_dit_config(
         model_type='DiT',
         new_configs={
             'torch_compile': torch_compile_args,
-            'block_swap': block_swap_config
+            'block_swap': block_swap_config,
+            'attention_mode': attention_mode
         },
         cached_config_attrs={
             'torch_compile': '_dit_compile_args',
-            'block_swap': '_dit_block_swap_config'
+            'block_swap': '_dit_block_swap_config',
+            'attention_mode': '_dit_attention_mode'
+        },
+        model_config_attrs={
+            'torch_compile': '_config_compile',
+            'block_swap': '_config_swap',
+            'attention_mode': '_config_attn'
         },
         config_describers={
             'torch_compile': _describe_compile_config,
-            'block_swap': _describe_blockswap_config
+            'block_swap': _describe_blockswap_config,
+            'attention_mode': _describe_attention_mode
         },
         special_handlers={
             'block_swap': _handle_blockswap_change
@@ -450,6 +494,10 @@ def _update_vae_config(
             'torch_compile': '_vae_compile_args',
             'tiling': '_vae_tiling_config'
         },
+        model_config_attrs={
+            'torch_compile': '_config_compile',
+            'tiling': '_config_tiling'
+        },
         config_describers={
             'torch_compile': _describe_compile_config,
             'tiling': _describe_tiling_config
@@ -475,6 +523,7 @@ def configure_runner(
     decode_tiled: bool = False,
     decode_tile_size: Optional[Tuple[int, int]] = None,
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
@@ -499,6 +548,7 @@ def configure_runner(
         decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
         decode_tile_size: Tile size for decoding (height, width)
         decode_tile_overlap: Tile overlap for decoding (height, width)
+        attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
@@ -536,6 +586,7 @@ def configure_runner(
         runner, 
         encode_tiled, encode_tile_size, encode_tile_overlap,
         decode_tiled, decode_tile_size, decode_tile_overlap,
+        attention_mode,
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
@@ -757,6 +808,7 @@ def _configure_runner_settings(
     decode_tiled: bool,
     decode_tile_size: Optional[Tuple[int, int]],
     decode_tile_overlap: Optional[Tuple[int, int]],
+    attention_mode: str,
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
@@ -778,6 +830,7 @@ def _configure_runner_settings(
         decode_tiled: Enable tiled VAE decoding to reduce VRAM during decoding
         decode_tile_size: Tile dimensions (height, width) for decoding in pixels
         decode_tile_overlap: Overlap dimensions (height, width) between decoding tiles
+        attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
@@ -796,6 +849,7 @@ def _configure_runner_settings(
     runner._new_dit_compile_args = torch_compile_args_dit
     runner._new_vae_compile_args = torch_compile_args_vae
     runner._new_dit_block_swap_config = block_swap_config
+    runner._new_dit_attention_mode = attention_mode
     runner._new_vae_tiling_config = {
         'encode_tiled': encode_tiled,
         'encode_tile_size': encode_tile_size,
@@ -851,15 +905,17 @@ def _setup_models(
     # Only update DiT config if model was cached/reused (not newly created)
     if not dit_created and hasattr(runner, 'dit') and runner.dit is not None:
         _update_dit_config(runner, runner._new_dit_block_swap_config, 
-                         runner._new_dit_compile_args, debug)
+                         runner._new_dit_compile_args, runner._new_dit_attention_mode, debug)
     elif dit_created:
         # For newly created models, just set initial config attributes (no comparison needed)
         runner._dit_compile_args = runner._new_dit_compile_args
         runner._dit_block_swap_config = runner._new_dit_block_swap_config
+        runner._dit_attention_mode = runner._new_dit_attention_mode
         # Also store on model so config travels with the model when cached
         if hasattr(runner, 'dit') and runner.dit:
             runner.dit._config_compile = runner._new_dit_compile_args
             runner.dit._config_swap = runner._new_dit_block_swap_config
+            runner.dit._config_attn = runner._new_dit_attention_mode
     
     # Setup VAE
     vae_created = _setup_vae_model(runner, cache_context, vae_model, base_cache_dir, debug)
@@ -877,7 +933,7 @@ def _setup_models(
             runner.vae._config_tiling = runner._new_vae_tiling_config
     
     # Clean up temporary attributes
-    for attr in ['_new_dit_compile_args', '_new_vae_compile_args', '_new_dit_block_swap_config', '_new_vae_tiling_config']:
+    for attr in ['_new_dit_compile_args', '_new_vae_compile_args', '_new_dit_block_swap_config', '_new_dit_attention_mode', '_new_vae_tiling_config']:
         if hasattr(runner, attr):
             delattr(runner, attr)
     
@@ -933,6 +989,7 @@ def _setup_dit_model(
         # Restore config attributes from model to runner (config travels with model)
         runner._dit_compile_args = getattr(runner.dit, '_config_compile', None)
         runner._dit_block_swap_config = getattr(runner.dit, '_config_swap', None)
+        runner._dit_attention_mode = getattr(runner.dit, '_config_attn', None)
         
         # blockswap_active will be set by apply_block_swap_to_dit
         # when the model is materialized to the inference device
@@ -1076,17 +1133,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
             raise ImportError(error_msg)
         state = load_safetensors_file(checkpoint_path, device=device_str)
     elif checkpoint_path.endswith('.gguf'):
-        if not GGUF_AVAILABLE:
-            error_msg = (
-                f"Cannot load {os.path.basename(checkpoint_path)}\n"
-                f"GGUF library is required but not installed.\n"
-                f"Please install it with: pip install gguf"
-            )
-            if debug:
-                debug.log(error_msg, level="ERROR", category="dit", force=True)
-                debug.log("This is a one-time installation that will enable loading of quantized GGUF models", 
-                         level="INFO", category="info", force=True)
-            raise ImportError(error_msg)
+        validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
         state = _load_gguf_state(
                     checkpoint_path=checkpoint_path, 
                     device=device, 
@@ -1933,6 +1980,27 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.end_timer("FP8CompatibleDiT", "FP8/RoPE compatibility wrapper application")
         else:
             debug.log("Reusing existing FP8/RoPE compatibility wrapper", category="reuse")
+        
+        # Apply attention mode to all FlashAttentionVarlen modules
+        if hasattr(runner, '_dit_attention_mode'):
+            requested_attention_mode = runner._dit_attention_mode or 'sdpa'
+            
+            # Validate and get final attention_mode (with warning if fallback needed)
+            attention_mode = validate_flash_attention_availability(requested_attention_mode, debug)
+            
+            debug.log(f"Applying {attention_mode} attention mode", category="setup")
+            # Get the actual model (unwrap if needed)
+            actual_model = model.dit_model if hasattr(model, 'dit_model') else model
+            
+            # Update all FlashAttentionVarlen instances
+            updated_count = 0
+            for module in actual_model.modules():
+                if type(module).__name__ == 'FlashAttentionVarlen':
+                    module.attention_mode = attention_mode
+                    updated_count += 1
+            
+            if updated_count > 0:
+                debug.log(f"Applied {attention_mode} to {updated_count} modules", category="success")
 
         # Apply BlockSwap before torch.compile (only if not already active)
         # BlockSwap wraps forward methods, and torch.compile needs to capture the wrapped version
@@ -2006,9 +2074,11 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
 def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str, 
                             debug: Optional[Debug]) -> Tuple[Dict[str, Any], bool]:
     """
-    Extract and configure torch.compile settings.
+    Extract and configure torch.compile settings with dependency validation.
     
     Centralizes common configuration logic for both full model and submodule compilation.
+    Validates that required dependencies (like Triton for inductor backend) are available
+    before attempting compilation to provide early, clear error messages.
     
     Args:
         compile_args: Compilation configuration dictionary
@@ -2018,6 +2088,9 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
     Returns:
         Tuple of (compile_settings dict, success boolean)
         compile_settings contains: backend, mode, fullgraph, dynamic
+        
+    Raises:
+        RuntimeError: If inductor backend is requested but Triton is not available
     """
     # Extract settings with defaults
     settings = {
@@ -2029,6 +2102,27 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
     
     dynamo_cache_size_limit = compile_args.get('dynamo_cache_size_limit', 64)
     dynamo_recompile_limit = compile_args.get('dynamo_recompile_limit', 128)
+    
+    # Check Triton availability for inductor backend BEFORE attempting compilation
+    if settings['backend'] == 'inductor':
+        if not TRITON_AVAILABLE:
+            error_msg = (
+                f"Cannot use torch.compile with 'inductor' backend: Triton is not installed.\n"
+                f"\n"
+                f"Triton is required for the inductor backend which performs kernel fusion and optimization.\n"
+                f"\n"
+                f"To fix this issue:\n"
+                f"  1. Install Triton: pip install triton\n"
+                f"  2. OR change backend to 'cudagraphs' (lightweight, no Triton needed)\n"
+                f"  3. OR disable torch.compile\n"
+                f"\n"
+                f"For more info: https://github.com/triton-lang/triton"
+            )
+            debug.log(error_msg, level="ERROR", category="setup", force=True)
+            raise RuntimeError(
+                "torch.compile with inductor backend requires Triton. "
+                "Install with: pip install triton"
+            )
     
     # Log compilation configuration
     debug.log(f"Configuring torch.compile for {model_type}...", category="setup", force=True)

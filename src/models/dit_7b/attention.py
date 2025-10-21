@@ -15,7 +15,8 @@
 import torch
 import torch.nn.functional as F
 
-from flash_attn import flash_attn_varlen_func
+# Import flash_attn with automatic fallback from compatibility layer
+from ...optimization.compatibility import flash_attn_varlen_func, FLASH_ATTN_AVAILABLE
 
 from torch import nn
 
@@ -75,6 +76,8 @@ def _call_flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen
     2. It requires Python int scalars for max_seqlen parameters
     3. Disabling compilation here keeps the rest of the model compilable
     """
+    if not FLASH_ATTN_AVAILABLE:
+        raise ImportError("flash_attn is not available")
     
     # Convert tensor max_seqlen to Python int if needed
     if torch.is_tensor(max_seqlen_q):
@@ -109,12 +112,24 @@ class TorchAttention(nn.Module):
 
 class FlashAttentionVarlen(nn.Module):
     """
-    Variable-length flash attention with automatic fallback to PyTorch.
+    Variable-length attention with configurable backend (Flash Attention or PyTorch SDPA).
     
+    Backend selection is validated during model configuration (see model_manager.py).
     Compilation behavior:
-    - PyTorch fallback: Fully compilable, optimal performance
-    - Flash attention: Uses @torch._dynamo.disable wrapper (flash_attn is C++ anyway)
+    - SDPA: Fully compilable, optimal performance
+    - Flash Attention: Uses @torch._dynamo.disable wrapper (C++ extension)
     """
+
+    def __init__(self, attention_mode: str = 'sdpa'):
+        """
+        Initialize with specified attention backend.
+        
+        Args:
+            attention_mode: 'flash_attn' or 'sdpa' (validated externally by validate_flash_attention_availability)
+        """
+        super().__init__()
+        self.attention_mode = attention_mode
+
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
         cu_seqlens_k = kwargs["cu_seqlens_k"]
@@ -126,14 +141,13 @@ class FlashAttentionVarlen(nn.Module):
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
         
-        try:
-            # Use flash_attn if available (via non-compiled wrapper)
+        if self.attention_mode == 'flash_attn':
             return _call_flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, 
                 max_seqlen_q, max_seqlen_k, **kwargs
             )
-        except ImportError:
-            # Fall back to PyTorch implementation (fully compilable)
+        else:
+            # PyTorch SDPA
             return pytorch_varlen_attention(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs

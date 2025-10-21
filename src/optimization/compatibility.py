@@ -8,6 +8,155 @@ Extracted from: seedvr2.py (lines 1045-1630)
 import torch
 import types
 
+# Flash Attention & Triton Compatibility Layer
+# 1. Flash Attention - speedup for attention operations
+try:
+    from flash_attn import flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    flash_attn_varlen_func = None
+    FLASH_ATTN_AVAILABLE = False
+
+def validate_flash_attention_availability(requested_mode: str, debug=None) -> str:
+    """
+    Validate Flash Attention availability and warn if fallback needed.
+    
+    Args:
+        requested_mode: Either 'flash_attn' or 'sdpa'
+        debug: Optional debug instance for logging
+        
+    Returns:
+        Validated mode ('flash_attn' or 'sdpa')
+    """
+    if requested_mode == 'flash_attn' and not FLASH_ATTN_AVAILABLE:
+        error_msg = (
+            f"Cannot use 'flash_attn' attention mode: Flash Attention is not installed.\n"
+            f"\n"
+            f"Flash Attention provides speedup on some hardware through optimized CUDA kernels.\n"
+            f"Falling back to PyTorch SDPA (scaled dot-product attention).\n"
+            f"\n"
+            f"To fix this issue:\n"
+            f"  1. Install Flash Attention: pip install flash-attn\n"
+            f"  2. OR change attention_mode to 'sdpa' (default, always available)\n"
+            f"\n"
+            f"For more info: https://github.com/Dao-AILab/flash-attention"
+        )
+        if debug:
+            debug.log(error_msg, level="WARNING", category="setup", force=True)
+        
+        return 'sdpa'
+    
+    return requested_mode
+
+
+# 2. Triton - Required for torch.compile with inductor backend
+try:
+    import triton
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+
+# 3. GGUF - Required for quantized model loading
+try:
+    import gguf
+    from gguf import GGMLQuantizationType
+    GGUF_AVAILABLE = True
+except ImportError:
+    GGUF_AVAILABLE = False
+    gguf = None
+    GGMLQuantizationType = None
+
+
+def validate_gguf_availability(operation: str = "load GGUF model", debug=None) -> None:
+    """
+    Validate GGUF availability and raise error if not installed.
+    
+    Args:
+        operation: Description of the operation requiring GGUF
+        debug: Optional debug instance for logging
+        
+    Raises:
+        RuntimeError: If GGUF is not available
+    """
+    if not GGUF_AVAILABLE:
+        error_msg = (
+            f"Cannot {operation}: GGUF library is not installed.\n"
+            f"\n"
+            f"GGUF provides quantized model support for memory-efficient loading.\n"
+            f"\n"
+            f"To fix this issue:\n"
+            f"  1. Install GGUF: pip install gguf\n"
+            f"  2. OR use a non-quantized model format (.safetensors)\n"
+            f"\n"
+            f"For more info: https://github.com/ggerganov/ggml"
+        )
+        if debug:
+            debug.log(error_msg, level="ERROR", category="setup", force=True)
+        raise RuntimeError(f"GGUF library required to {operation}")
+
+
+# 4. NVIDIA Conv3d Memory Bug - Workaround for PyTorch 2.9-2.10 + cuDNN >= 91002
+def _check_conv3d_memory_bug():
+    """
+    Check if Conv3d memory bug workaround needed.
+    Bug: PyTorch 2.9-2.10 with cuDNN >= 91002 uses 3x memory for Conv3d 
+    with fp16/bfloat16 due to buggy dispatch layer.
+    """
+    try:
+        if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 3):
+            return False
+        
+        # Parse torch version
+        version_str = torch.__version__.split('+')[0]
+        parts = version_str.split('.')
+        torch_version = tuple(int(p) for p in parts[:2])
+        
+        if not ((2, 9) <= torch_version <= (2, 10)):
+            return False
+        
+        if not hasattr(torch.backends.cudnn, 'version'):
+            return False
+            
+        cudnn_version = torch.backends.cudnn.version()
+        if cudnn_version is None or cudnn_version < 91002:
+            return False
+        
+        return True
+    except:
+        return False
+
+NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = _check_conv3d_memory_bug()
+
+
+# Log all optimization status once on module import
+_optimization_status_logged = False
+if not _optimization_status_logged:
+    # Flash Attention & Triton status
+    has_both = FLASH_ATTN_AVAILABLE and TRITON_AVAILABLE
+    has_neither = not FLASH_ATTN_AVAILABLE and not TRITON_AVAILABLE
+    
+    if has_both:
+        print("⚡ SeedVR2 optimizations check: Flash Attention ✅ | Triton ✅")
+    elif has_neither:
+        print("⚠️  SeedVR2 optimizations check: Flash Attention ❌ | Triton ❌")
+        print("💡 For best performance: pip install flash-attn triton")
+    elif FLASH_ATTN_AVAILABLE:
+        print("⚡ SeedVR2 optimizations check: Flash Attention ✅ | Triton ❌")
+        print("💡 Install Triton for torch.compile: pip install triton")
+    else:  # TRITON_AVAILABLE only
+        print("⚠️  SeedVR2 optimizations check: Flash Attention ❌ | Triton ✅")
+        print("💡 Install Flash Attention for faster inference: pip install flash-attn")
+    
+    # Conv3d workaround status (if applicable)
+    if NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND:
+        torch_ver = torch.__version__.split('+')[0]
+        cudnn_ver = torch.backends.cudnn.version()
+        print(f"🔧 Conv3d workaround active: PyTorch {torch_ver}, cuDNN {cudnn_ver} (fixing VAE 3x memory bug)")
+    
+    _optimization_status_logged = True
+
+
 def call_rope_with_stability(method, *args, **kwargs):
     """
     Call RoPE method with stability fixes:
@@ -20,6 +169,7 @@ def call_rope_with_stability(method, *args, **kwargs):
     
     with torch.cuda.amp.autocast(enabled=False):
         return method(*args, **kwargs)
+    
     
 class FP8CompatibleDiT(torch.nn.Module):
     """
@@ -192,16 +342,12 @@ class FP8CompatibleDiT(torch.nn.Module):
     
     def _check_flash_attention_support(self) -> bool:
         """Check if Flash Attention is available"""
-        try:
-            # Check PyTorch SDPA (includes Flash Attention on H100/A100)
-            if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-                return True
-            
-            # Check flash-attn package
-            import flash_attn
+        # Check PyTorch SDPA (includes Flash Attention on H100/A100)
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
             return True
-        except ImportError:
-            return False
+        
+        # Check flash-attn package (uses module-level check from top of file)
+        return FLASH_ATTN_AVAILABLE
     
     def _is_attention_layer(self, name: str, module: torch.nn.Module) -> bool:
         """Identify if a module is an attention layer"""

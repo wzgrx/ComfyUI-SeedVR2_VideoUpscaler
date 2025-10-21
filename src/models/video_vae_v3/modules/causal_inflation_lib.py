@@ -27,6 +27,7 @@ from .global_config import get_norm_limit
 from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
 from ....optimization.memory_manager import clear_memory, retry_on_oom
+from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
@@ -47,49 +48,6 @@ def get_next_sequence_parallel_rank():
 def get_prev_sequence_parallel_rank():
     return 0
 
-def _parse_torch_version():
-    """Parse torch version to numeric tuple for comparison"""
-    try:
-        version_str = torch.__version__.split('+')[0]
-        parts = version_str.split('.')
-        return tuple(int(p) for p in parts[:2])
-    except:
-        return (0, 0)
-
-def _is_nvidia_gpu():
-    """Check if NVIDIA GPU is available"""
-    try:
-        return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 3
-    except:
-        return False
-
-def _check_conv3d_memory_bug():
-    """
-    Check if Conv3d memory bug workaround needed.
-    Bug affects: PyTorch 2.9-2.10, cuDNN >= 91002, NVIDIA GPUs, fp16/bfloat16
-    """
-    try:
-        if not _is_nvidia_gpu():
-            return False
-        
-        torch_version = _parse_torch_version()
-        if not ((2, 9) <= torch_version <= (2, 10)):
-            return False
-        
-        if not hasattr(torch.backends.cudnn, 'version'):
-            return False
-            
-        cudnn_version = torch.backends.cudnn.version()
-        if cudnn_version is None or cudnn_version < 91002:
-            return False
-        
-        return True
-    except:
-        return False
-
-# Global flag - evaluated once at import
-NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = _check_conv3d_memory_bug()
-_WORKAROUND_LOGGED = False
 
 @contextmanager
 def ignore_padding(model):
@@ -131,23 +89,9 @@ class InflatedCausalConv3d(Conv3d):
         with fp16/bfloat16 weights due to buggy dispatch layer.
         
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
+        Status is logged at startup in compatibility.py.
         """
         if NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
-            # Log detailed info only once globally
-            global _WORKAROUND_LOGGED
-            if not _WORKAROUND_LOGGED:
-                debug = getattr(self, 'debug', None)
-                if debug:
-                    torch_ver = torch.__version__.split('+')[0]
-                    cudnn_ver = torch.backends.cudnn.version()
-                    dtype_str = "fp16" if weight.dtype == torch.float16 else "bf16"
-                    
-                    debug.log(
-                        f"Using Conv3d workaround: PyTorch {torch_ver}, cuDNN {cudnn_ver}, {dtype_str} (bypassing 3x memory bug)",
-                        category="setup", indent_level=1
-                    )
-                _WORKAROUND_LOGGED = True
-            
             # Direct cuDNN call bypasses buggy PyTorch dispatch layer
             out = torch.cudnn_convolution(
                 input, weight, self.padding, self.stride, self.dilation, self.groups,

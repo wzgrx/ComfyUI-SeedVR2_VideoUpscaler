@@ -8,19 +8,14 @@ import traceback
 from typing import Optional, Tuple, List
 from ..utils.debug import Debug
 from ..utils.constants import QK_K, K_SCALE_SIZE, suppress_tensor_warnings
+from ..optimization.compatibility import GGUF_AVAILABLE, validate_gguf_availability
 
-# Import GGUF with fallback
-try:
-    import gguf
-    GGUF_AVAILABLE = True
-except ImportError:
-    GGUF_AVAILABLE = False
-    gguf = None
-
-# Only define if GGUF is available
+# Import GGUF library
 if GGUF_AVAILABLE:
+    import gguf
     TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
 else:
+    gguf = None
     TORCH_COMPATIBLE_QTYPES = (None,)
 
 
@@ -32,6 +27,7 @@ def is_quantized(tensor: torch.Tensor) -> bool:
     return not is_torch_compatible(tensor)
 
 
+@torch._dynamo.disable
 def dequantize_tensor(tensor: torch.Tensor, dtype: Optional[torch.dtype] = None, 
                      dequant_dtype: Optional[torch.dtype] = None, 
                      debug: Optional[Debug] = None) -> torch.Tensor:
@@ -72,6 +68,7 @@ def dequantize_tensor(tensor: torch.Tensor, dtype: Optional[torch.dtype] = None,
         raise NotImplementedError(f"No dequantization for {qtype}")
 
 
+@torch._dynamo.disable
 def dequantize(data: torch.Tensor, qtype: 'gguf.GGMLQuantizationType', 
               oshape: Tuple[int, ...], dtype: Optional[torch.dtype] = None, 
               debug: Optional[Debug] = None) -> torch.Tensor:
@@ -93,7 +90,7 @@ def dequantize(data: torch.Tensor, qtype: 'gguf.GGMLQuantizationType',
         RuntimeError: If dequantization fails
     """
     if not GGUF_AVAILABLE:
-        raise RuntimeError("GGUF not available but dequantize was called")
+        validate_gguf_availability("dequantize GGUF tensor", debug)
         
     if dtype is None:
         dtype = torch.float16

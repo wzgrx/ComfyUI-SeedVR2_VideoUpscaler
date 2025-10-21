@@ -359,6 +359,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         decode_tiled=shared_args["vae_decode_tiling_enabled"],
         decode_tile_size=shared_args["vae_decode_tile_size"],
         decode_tile_overlap=shared_args["vae_decode_tile_overlap"],
+        attention_mode=shared_args["attention_mode"],
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
@@ -470,6 +471,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "vae_decode_tile_overlap": args.vae_decode_tile_overlap,
         "vae_offload_device": args.vae_offload_device,
         "tensor_offload_device": args.tensor_offload_device,
+        "attention_mode": args.attention_mode,
         "compile_dit": args.compile_dit,
         "compile_vae": args.compile_vae,
         "compile_backend": args.compile_backend,
@@ -621,6 +623,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="VAE decode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
     parser.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
                         help="VAE decode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
+    parser.add_argument("--attention_mode", type=str, default="sdpa",
+                        choices=["sdpa", "flash_attn"],
+                        help="Attention computation backend: 'sdpa' (default, always available) or 'flash_attn' (requires flash-attn package, faster)")
     parser.add_argument("--compile_dit", action="store_true", 
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+)")
     parser.add_argument("--compile_vae", action="store_true",

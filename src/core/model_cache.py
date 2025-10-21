@@ -188,7 +188,7 @@ class GlobalModelCache:
             del self._dit_models[node_id]
             
             # Remove any runner templates that used this DiT
-            templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(node_id + "+")]
+            templates_to_remove = [k for k in self._runner_templates.keys() if k.startswith(str(node_id) + "+")]
             for template_key in templates_to_remove:
                 del self._runner_templates[template_key]         
             
@@ -223,7 +223,7 @@ class GlobalModelCache:
             del self._vae_models[node_id]
             
             # Remove any runner templates that used this VAE
-            templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + node_id)]
+            templates_to_remove = [k for k in self._runner_templates.keys() if k.endswith("+" + str(node_id))]
             for template_key in templates_to_remove:
                 del self._runner_templates[template_key]
             

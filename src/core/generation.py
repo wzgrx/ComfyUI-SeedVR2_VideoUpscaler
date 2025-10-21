@@ -434,6 +434,7 @@ def prepare_runner(
     decode_tiled: bool = False,
     decode_tile_size: Optional[Tuple[int, int]] = None,
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]:
@@ -458,14 +459,13 @@ def prepare_runner(
         decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
         decode_tile_size: Tile size for decoding (height, width)
         decode_tile_overlap: Tile overlap for decoding (height, width)
+        attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
     Returns:
         Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]: Tuple containing:
             - VideoDiffusionInfer: Configured runner instance with models loaded and settings applied
-            - bool: model_changed flag - True if new models were created/loaded, False if reusing
-              cached models from previous run (determined by cache_context['reusing_runner'])
             - Dict[str, Any]: Cache context dictionary containing cache state and metadata with keys:
                 - 'global_cache': GlobalModelCache instance
                 - 'dit_cache', 'vae_cache': Caching enabled flags
@@ -501,23 +501,18 @@ def prepare_runner(
         decode_tiled=decode_tiled,
         decode_tile_size=decode_tile_size,
         decode_tile_overlap=decode_tile_overlap,
+        attention_mode=attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
     
-    # Store both model names for future comparisons
-    runner._dit_model_name = dit_model
-    runner._vae_model_name = vae_model
     # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
     runner._dit_device = ctx['dit_device']
     runner._vae_device = ctx['vae_device']
     runner._dit_offload_device = ctx['dit_offload_device']
     runner._vae_offload_device = ctx['vae_offload_device']
-    
-    # Model changed if we didn't reuse an existing runner
-    model_changed = not cache_context.get('reusing_runner', False)
 
-    return runner, model_changed, cache_context
+    return runner, cache_context
 
 
 def encode_all_batches(
@@ -1426,12 +1421,22 @@ def postprocess_all_batches(
                 video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
                 ori_length = ctx['all_ori_lengths'][video_idx] if 'all_ori_lengths' in ctx else sample.shape[0]
                 
-                # Trim to original length if necessary
+                # Retrieve transformed video early for consistent trimming
+                input_video = None
+                if color_correction != "none" and ctx.get('all_transformed_videos') is not None:
+                    if video_idx < len(ctx['all_transformed_videos']) and ctx['all_transformed_videos'][video_idx] is not None:
+                        transformed_video = ctx['all_transformed_videos'][video_idx]
+                        # Convert transformed video from C T H W to T C H W format
+                        input_video = optimized_single_video_rearrange(transformed_video)
+                
+                # Trim both sample and input_video to original length if necessary (handles padding)
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
+                    if input_video is not None:
+                        input_video = input_video[:ori_length]
                 
                 # Apply color correction if enabled (RGB only)
-                if color_correction != "none" and ctx.get('all_transformed_videos') is not None:
+                if color_correction != "none" and input_video is not None:
                     # Check if RGBA (samples are in T, C, H, W format at this point)
                     has_alpha = ctx.get('is_rgba', False)
                     alpha_channel = None
@@ -1443,55 +1448,48 @@ def postprocess_all_batches(
                             alpha_channel = sample[:, 3:4, :, :]  # (T, 1, H, W)
                             sample = sample[:, :3, :, :]  # Keep only RGB (T, 3, H, W)
                     
-                    # Bounds checking for transformed videos
-                    if video_idx < len(ctx['all_transformed_videos']) and ctx['all_transformed_videos'][video_idx] is not None:
-                        transformed_video = ctx['all_transformed_videos'][video_idx]
+                    # Ensure both tensors are on same device (GPU) for color correction
+                    if input_video.device != sample.device:
+                        input_video = manage_tensor(
+                            tensor=input_video,
+                            target_device=sample.device,
+                            tensor_name=f"input_video_{batch_idx+1}",
+                            debug=debug,
+                            reason="color correction",
+                            indent_level=1
+                        )
                         
-                        # Convert transformed video from C T H W to T C H W format for color correction
-                        input_video = optimized_single_video_rearrange(transformed_video)
-                        
-                        # Ensure both tensors are on same device (GPU) for color correction
-                        if input_video.device != sample.device:
-                            input_video = manage_tensor(
-                                tensor=input_video,
-                                target_device=sample.device,
-                                tensor_name=f"input_video_{batch_idx+1}",
-                                debug=debug,
-                                reason="color correction",
-                                indent_level=1
-                            )
-                        
-                        # Apply selected color correction method
-                        debug.start_timer(f"color_correction_{color_correction}")
-                        
-                        if color_correction == "lab":
-                            debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
-                            sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
-                        elif color_correction == "wavelet_adaptive":
-                            debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
-                            sample = wavelet_adaptive_color_correction(sample, input_video, debug)
-                        elif color_correction == "wavelet":
-                            debug.log("Applying wavelet color reconstruction", category="video", force=True, indent_level=1)
-                            sample = wavelet_reconstruction(sample, input_video, debug)
-                        elif color_correction == "hsv":
-                            debug.log("Applying HSV hue-conditional saturation matching", category="video", force=True, indent_level=1)
-                            sample = hsv_saturation_histogram_match(sample, input_video, debug)
-                        elif color_correction == "adain":
-                            debug.log("Applying AdaIN color correction", category="video", force=True, indent_level=1)
-                            sample = adaptive_instance_normalization(sample, input_video)
-                        else:
-                            debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True, indent_level=1)
-                        
-                        debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
-                        
-                        # Free the transformed video
-                        ctx['all_transformed_videos'][video_idx] = None
-                        del input_video, transformed_video
+                    # Apply selected color correction method
+                    debug.start_timer(f"color_correction_{color_correction}")
+                    
+                    if color_correction == "lab":
+                        debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
+                        sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
+                    elif color_correction == "wavelet_adaptive":
+                        debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
+                        sample = wavelet_adaptive_color_correction(sample, input_video, debug)
+                    elif color_correction == "wavelet":
+                        debug.log("Applying wavelet color reconstruction", category="video", force=True, indent_level=1)
+                        sample = wavelet_reconstruction(sample, input_video, debug)
+                    elif color_correction == "hsv":
+                        debug.log("Applying HSV hue-conditional saturation matching", category="video", force=True, indent_level=1)
+                        sample = hsv_saturation_histogram_match(sample, input_video, debug)
+                    elif color_correction == "adain":
+                        debug.log("Applying AdaIN color correction", category="video", force=True, indent_level=1)
+                        sample = adaptive_instance_normalization(sample, input_video)
+                    else:
+                        debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True, indent_level=1)
+                    
+                    debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
+                    
+                    # Free the transformed video
+                    ctx['all_transformed_videos'][video_idx] = None
+                    del input_video, transformed_video
 
-                        # Recombine with Alpha if it was present in input
-                        if has_alpha and alpha_channel is not None:
-                            # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
-                            sample = torch.cat([sample, alpha_channel], dim=1)
+                    # Recombine with Alpha if it was present in input
+                    if has_alpha and alpha_channel is not None:
+                        # Concatenate in channels-first: (T, 3, H, W) + (T, 1, H, W) -> (T, 4, H, W)
+                        sample = torch.cat([sample, alpha_channel], dim=1)
                 
                 else:
                     debug.log("Color correction disabled (set to none)", category="video", indent_level=1)

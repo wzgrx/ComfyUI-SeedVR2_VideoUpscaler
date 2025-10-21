@@ -1049,6 +1049,8 @@ def cleanup_dit(runner: Any, debug: Optional[Any], cache_model: bool = False) ->
             delattr(runner, '_dit_compile_args')
         if hasattr(runner, '_dit_block_swap_config'):
             delattr(runner, '_dit_block_swap_config')
+        if hasattr(runner, '_dit_attention_mode'):
+            delattr(runner, '_dit_attention_mode')
     
     # 5. Clear DiT-related components and temporary attributes
     runner.sampler = None
@@ -1113,7 +1115,7 @@ def cleanup_vae(runner: Any, debug: Optional[Any], cache_model: bool = False) ->
     runner._vae_dtype_override = None
 
 
-def complete_cleanup(runner: Any, debug: Optional[Any], cache_dit: bool = False, cache_vae: bool = False) -> None:
+def complete_cleanup(runner: Any, debug: Optional[Any], dit_cache: bool = False, vae_cache: bool = False) -> None:
     """
     Complete cleanup of runner and remaining components with independent model caching support.
     This is a lightweight cleanup for final stage, as model-specific cleanup
@@ -1122,8 +1124,8 @@ def complete_cleanup(runner: Any, debug: Optional[Any], cache_dit: bool = False,
     Args:
         runner: Runner instance to clean up
         debug: Debug instance for logging
-        cache_dit: If True, preserve DiT model on offload_device for future runs
-        cache_vae: If True, preserve VAE model on offload_device for future runs
+        dit_cache: If True, preserve DiT model on offload_device for future runs
+        vae_cache: If True, preserve VAE model on offload_device for future runs
         
     Behavior:
         - Can cache DiT and VAE independently for flexible memory management
@@ -1139,22 +1141,22 @@ def complete_cleanup(runner: Any, debug: Optional[Any], cache_dit: bool = False,
         return
     
     if debug:
-        cleanup_type = "partial cleanup" if (cache_dit or cache_vae) else "full cleanup"
+        cleanup_type = "partial cleanup" if (dit_cache or vae_cache) else "full cleanup"
         debug.log(f"Starting {cleanup_type}", category="cleanup")
     
     # 1. Cleanup any remaining models if they still exist
     # (This handles cases where phases were skipped or errored)
     if hasattr(runner, 'dit') and runner.dit is not None:
-        cleanup_dit(runner=runner, debug=debug, cache_model=cache_dit)
+        cleanup_dit(runner=runner, debug=debug, cache_model=dit_cache)
     
     if hasattr(runner, 'vae') and runner.vae is not None:
-        cleanup_vae(runner=runner, debug=debug, cache_model=cache_vae)
+        cleanup_vae(runner=runner, debug=debug, cache_model=vae_cache)
     
     # 2. Clear remaining runtime caches
     clear_runtime_caches(runner=runner, debug=debug)
     
     # 3. Clear config and other non-model components when fully releasing runner
-    if not (cache_dit or cache_vae):
+    if not (dit_cache or vae_cache):
         # Full cleanup - clear config and model tracking
         runner.config = None
         runner._dit_model_name = None
@@ -1167,11 +1169,11 @@ def complete_cleanup(runner: Any, debug: Optional[Any], cache_dit: bool = False,
     torch._C._cuda_clearCublasWorkspaces() if hasattr(torch._C, '_cuda_clearCublasWorkspaces') else None
     
     # Log what models are cached for next run
-    if cache_dit or cache_vae:
+    if dit_cache or vae_cache:
         cached_models = []
-        if cache_dit and hasattr(runner, '_dit_model_name'):
+        if dit_cache and hasattr(runner, '_dit_model_name'):
             cached_models.append(f"DiT ({runner._dit_model_name})")
-        if cache_vae and hasattr(runner, '_vae_model_name'):
+        if vae_cache and hasattr(runner, '_vae_model_name'):
             cached_models.append(f"VAE ({runner._vae_model_name})")
         
         if cached_models:

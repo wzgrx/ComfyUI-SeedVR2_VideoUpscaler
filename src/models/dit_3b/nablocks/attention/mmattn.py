@@ -45,6 +45,7 @@ class NaMMAttention(nn.Module):
         rope_type: Optional[str],
         rope_dim: int,
         shared_weights: bool,
+        attention_mode: str = 'sdpa',
         **kwargs,
     ):
         super().__init__()
@@ -72,7 +73,7 @@ class NaMMAttention(nn.Module):
         )
 
         self.rope = get_na_rope(rope_type=rope_type, dim=rope_dim)
-        self.attn = FlashAttentionVarlen()
+        self.attn = FlashAttentionVarlen(attention_mode=attention_mode)
 
     def forward(
         self,
@@ -146,9 +147,10 @@ class NaSwinAttention(NaMMAttention):
         *args,
         window: Union[int, Tuple[int, int, int]],
         window_method: str,
+        attention_mode: str = 'sdpa',
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, attention_mode=attention_mode, **kwargs)
         self.window = _triple(window)
         self.window_method = window_method
         assert all(map(lambda v: isinstance(v, int) and v >= 0, self.window))
