@@ -22,7 +22,7 @@ class GlobalModelCache:
         # Storage for runner templates: "dit_id+vae_id" -> runner
         self._runner_templates: Dict[str, Any] = {}
     
-    def get_dit(self, dit_config: Dict[str, Any], debug: Optional[Any] = None) -> Optional[Any]:
+    def get_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> Optional[Any]:
         """
         Get cached DiT model if available.
         
@@ -42,7 +42,7 @@ class GlobalModelCache:
             return model
         return None
     
-    def get_vae(self, vae_config: Dict[str, Any], debug: Optional[Any] = None) -> Optional[Any]:
+    def get_vae(self, vae_config: Dict[str, Any], debug: Optional['Debug'] = None) -> Optional[Any]:
         """
         Get cached VAE model if available.
         
@@ -63,7 +63,7 @@ class GlobalModelCache:
         return None
     
     def get_runner(self, dit_id: Optional[int], vae_id: Optional[int],
-                        debug: Optional[Any] = None) -> Optional[Any]:
+                        debug: Optional['Debug'] = None) -> Optional[Any]:
         """
         Get cached runner template if available.
         
@@ -83,7 +83,7 @@ class GlobalModelCache:
             return self._runner_templates[runner_key]
         return None
     
-    def set_dit(self, dit_config: Dict[str, Any], model: Any, model_name: str, debug: Optional[Any] = None) -> Optional[str]:
+    def set_dit(self, dit_config: Dict[str, Any], model: Any, model_name: str, debug: Optional['Debug'] = None) -> Optional[str]:
         """
         Store DiT model in cache.
         
@@ -108,7 +108,7 @@ class GlobalModelCache:
         
         return node_id
 
-    def set_vae(self, vae_config: Dict[str, Any], model: Any, model_name: str, debug: Optional[Any] = None) -> Optional[str]:
+    def set_vae(self, vae_config: Dict[str, Any], model: Any, model_name: str, debug: Optional['Debug'] = None) -> Optional[str]:
         """
         Store VAE model in cache.
         
@@ -134,7 +134,7 @@ class GlobalModelCache:
         return node_id
     
     def set_runner(self, dit_id: Optional[int], vae_id: Optional[int],
-                    runner: Any, debug: Optional[Any] = None) -> Optional[str]:
+                    runner: Any, debug: Optional['Debug'] = None) -> Optional[str]:
         """
         Store runner template in cache.
         
@@ -160,7 +160,7 @@ class GlobalModelCache:
         
         return None
     
-    def remove_dit(self, dit_config: Dict[str, Any], debug: Optional[Any] = None) -> bool:
+    def remove_dit(self, dit_config: Dict[str, Any], debug: Optional['Debug'] = None) -> bool:
         """
         Remove DiT model from cache if it exists.
         
@@ -195,7 +195,7 @@ class GlobalModelCache:
             return True
         return False
     
-    def remove_vae(self, vae_config: Dict[str, Any], debug: Optional[Any] = None) -> bool:
+    def remove_vae(self, vae_config: Dict[str, Any], debug: Optional['Debug'] = None) -> bool:
         """
         Remove VAE model from cache if it exists.
         

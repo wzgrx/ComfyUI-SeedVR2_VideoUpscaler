@@ -106,7 +106,7 @@ else:
     print(f"⚠️ Memory check failed: {vram_info['error']} - No available backend!")
 
 
-def get_vram_usage(device: Optional[torch.device] = None, debug: Optional[Any] = None) -> Tuple[float, float, float]:
+def get_vram_usage(device: Optional[torch.device] = None, debug: Optional['Debug'] = None) -> Tuple[float, float, float]:
     """
     Get current VRAM usage metrics for monitoring.
     Used for tracking memory consumption during processing.
@@ -141,7 +141,7 @@ def get_vram_usage(device: Optional[torch.device] = None, debug: Optional[Any] =
     return 0.0, 0.0, 0.0
 
 
-def get_ram_usage(debug: Optional[Any] = None) -> Tuple[float, float, float, float]:
+def get_ram_usage(debug: Optional['Debug'] = None) -> Tuple[float, float, float, float]:
     """
     Get current RAM usage metrics for the current process.
     Provides accurate tracking of process-specific memory consumption.
@@ -184,7 +184,7 @@ def get_ram_usage(debug: Optional[Any] = None) -> Tuple[float, float, float, flo
 _os_memory_lib = None
 
 
-def clear_memory(debug: Optional[Any] = None, deep: bool = False, force: bool = True, 
+def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: bool = True, 
                 timer_name: Optional[str] = None) -> None:
     """
     Clear memory caches with two-tier approach for optimal performance.
@@ -368,7 +368,7 @@ def retry_on_oom(func, *args, debug=None, operation_name="operation", **kwargs):
             raise
 
 
-def reset_vram_peak(device: Optional[torch.device] = None, debug: Optional[Any] = None) -> None:
+def reset_vram_peak(device: Optional[torch.device] = None, debug: Optional['Debug'] = None) -> None:
     """
     Reset VRAM peak memory statistics for fresh tracking.
     
@@ -391,7 +391,7 @@ def reset_vram_peak(device: Optional[torch.device] = None, debug: Optional[Any] 
             debug.log(f"Failed to reset peak memory stats: {e}", level="WARNING", category="memory", force=True)
 
 
-def clear_rope_lru_caches(model: Optional[torch.nn.Module], debug: Optional[Any] = None) -> int:
+def clear_rope_lru_caches(model: Optional[torch.nn.Module], debug: Optional['Debug'] = None) -> int:
     """
     Clear ALL LRU caches from RoPE modules.
     
@@ -465,7 +465,7 @@ def release_tensor_collection(collection: Any, recursive: bool = True) -> None:
                 release_tensor_memory(item)
 
 
-def release_text_embeddings(*embeddings: torch.Tensor, debug: Optional[Any] = None, names: Optional[List[str]] = None) -> None:
+def release_text_embeddings(*embeddings: torch.Tensor, debug: Optional['Debug'] = None, names: Optional[List[str]] = None) -> None:
     """
     Release memory for text embeddings
     
@@ -481,7 +481,7 @@ def release_text_embeddings(*embeddings: torch.Tensor, debug: Optional[Any] = No
                 debug.log(f"Cleaned up {names[i]}", category="cleanup")
 
 
-def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional[Any] = None) -> None:
+def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional['Debug'] = None) -> None:
     """
     Clean up text embeddings from a context dictionary.
     Extracts embeddings, releases memory, and clears the context entry.
@@ -509,7 +509,7 @@ def cleanup_text_embeddings(ctx: Dict[str, Any], debug: Optional[Any] = None) ->
     ctx['text_embeds'] = None
 
     
-def release_model_memory(model: Optional[torch.nn.Module], debug: Optional[Any] = None) -> None:
+def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debug'] = None) -> None:
     """
     Release all GPU/MPS memory from model in-place without CPU transfer.
     
@@ -555,7 +555,7 @@ def manage_tensor(
     tensor_name: str = "tensor",
     dtype: Optional[torch.dtype] = None,
     non_blocking: bool = False,
-    debug: Optional[Any] = None,
+    debug: Optional['Debug'] = None,
     reason: Optional[str] = None,
     indent_level: int = 0
 ) -> torch.Tensor:
@@ -636,7 +636,7 @@ def manage_tensor(
 
 
 def manage_model_device(model: torch.nn.Module, target_device: torch.device, model_name: str,
-                       debug: Optional[Any] = None, reason: Optional[str] = None,
+                       debug: Optional['Debug'] = None, reason: Optional[str] = None,
                        runner: Optional[Any] = None) -> bool:
     """
     Move model to target device with optimizations.
@@ -709,7 +709,7 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
 def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module, 
                                     current_device: torch.device, target_device: torch.device, 
                                     target_type: str, model_name: str,
-                                    debug: Optional[Any], reason: Optional[str]) -> bool:
+                                    debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
     """
     Handle device movement for BlockSwap-enabled models.
     
@@ -838,7 +838,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
 
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
                             target_device: torch.device, target_type: str, model_name: str,
-                            debug: Optional[Any], reason: Optional[str]) -> bool:
+                            debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
     """
     Handle standard (non-BlockSwap) model movement.
     
@@ -897,7 +897,7 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     return True
 
 
-def clear_runtime_caches(runner: Any, debug: Optional[Any]) -> int:
+def clear_runtime_caches(runner: Any, debug: Optional['Debug'] = None) -> int:
     """
     Clear all runtime caches and temporary attributes.
     """
@@ -976,7 +976,7 @@ def clear_runtime_caches(runner: Any, debug: Optional[Any]) -> int:
     return cleaned_items
 
 
-def cleanup_dit(runner: Any, debug: Optional[Any], cache_model: bool = False) -> None:
+def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool = False) -> None:
     """
     Cleanup DiT model and BlockSwap state after upscaling phase.
     Called at the end of upscale_all_batches when DiT is no longer needed.
@@ -1058,7 +1058,7 @@ def cleanup_dit(runner: Any, debug: Optional[Any], cache_model: bool = False) ->
     runner.schedule = None
 
 
-def cleanup_vae(runner: Any, debug: Optional[Any], cache_model: bool = False) -> None:
+def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool = False) -> None:
     """
     Cleanup VAE model after decoding phase.
     Called at the end of decode_all_batches when VAE is no longer needed.
@@ -1115,7 +1115,7 @@ def cleanup_vae(runner: Any, debug: Optional[Any], cache_model: bool = False) ->
     runner._vae_dtype_override = None
 
 
-def complete_cleanup(runner: Any, debug: Optional[Any], dit_cache: bool = False, vae_cache: bool = False) -> None:
+def complete_cleanup(runner: Any, debug: Optional['Debug'] = None, dit_cache: bool = False, vae_cache: bool = False) -> None:
     """
     Complete cleanup of runner and remaining components with independent model caching support.
     This is a lightweight cleanup for final stage, as model-specific cleanup

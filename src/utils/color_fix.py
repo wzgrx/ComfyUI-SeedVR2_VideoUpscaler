@@ -45,7 +45,7 @@ def adain_color_fix(target: Image.Image, source: Image.Image) -> Image.Image:
     return result_image
 
 
-def wavelet_color_fix(target: Image.Image, source: Image.Image, debug) -> Image.Image:
+def wavelet_color_fix(target: Image.Image, source: Image.Image, debug: Optional['Debug'] = None) -> Image.Image:
     """
     Apply wavelet-based color correction to PIL images.
     
@@ -181,7 +181,7 @@ def wavelet_decomposition(image: Tensor, levels: int = 5) -> tuple[Tensor, Tenso
     return high_freq, low_freq
 
 
-def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug) -> Tensor:
+def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Optional['Debug'] = None) -> Tensor:
     """
     Apply wavelet-based color transfer from style to content.
     
@@ -475,7 +475,7 @@ def lab_color_transfer(
     return result
 
 
-def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, debug) -> Tensor:
+def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, debug: Optional['Debug'] = None) -> Tensor:
     """
     Hue-conditional saturation histogram matching in HSV color space.
     
@@ -695,7 +695,7 @@ def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, deb
     return result
 
 
-def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, debug) -> Tensor:
+def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, debug: Optional['Debug'] = None) -> Tensor:
     """
     Adaptive hybrid color correction combining wavelet and HSV methods.
     

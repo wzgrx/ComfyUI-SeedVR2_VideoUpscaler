@@ -28,9 +28,6 @@ try:
 except ImportError:
     SAFETENSORS_AVAILABLE = False
 
-# Import Debug for type annotations
-from ..utils.debug import Debug
-
 from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
 from ..common.config import load_config, create_object
@@ -207,7 +204,7 @@ def _update_model_config(
     model_config_attrs: Dict[str, str],
     config_describers: Dict[str, Callable],
     special_handlers: Optional[Dict[str, Callable]] = None,
-    debug: Debug = None
+    debug: Optional['Debug'] = None
 ) -> bool:
     """
     Update model configuration uniformly for DiT or VAE.
@@ -360,7 +357,7 @@ def _handle_blockswap_change(
     runner: 'VideoDiffusionInfer',
     attr_name: str,
     new_config: Optional[Dict[str, Any]],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> None:
     """
     Handle BlockSwap-specific configuration changes with proper cleanup.
@@ -396,7 +393,7 @@ def _update_dit_config(
     block_swap_config: Optional[Dict[str, Any]],
     torch_compile_args: Optional[Dict[str, Any]],
     attention_mode: Optional[str],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> bool:
     """
     Update DiT model configuration when reusing cached model.
@@ -457,7 +454,7 @@ def _update_dit_config(
 def _update_vae_config(
     runner: 'VideoDiffusionInfer',
     torch_compile_args: Optional[Dict[str, Any]],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> bool:
     """
     Update VAE model configuration when reusing cached model.
@@ -511,7 +508,7 @@ def configure_runner(
     dit_model: str,
     vae_model: str,
     base_cache_dir: str,
-    debug: Optional[Debug] = None,
+    debug: 'Debug',
     dit_cache: bool = False,
     vae_cache: bool = False,
     dit_id: Optional[int] = None,
@@ -607,7 +604,7 @@ def _initialize_cache_context(
     vae_id: Optional[int],
     dit_model: str,
     vae_model: str,
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> Dict[str, Any]:
     """
     Initialize cache context with global cache lookups and model name validation.
@@ -707,7 +704,7 @@ def _acquire_runner(
     dit_model: str,
     vae_model: str,
     base_cache_dir: str,
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> VideoDiffusionInfer:
     """
     Get or create VideoDiffusionInfer runner instance using unified caching approach.
@@ -758,7 +755,7 @@ def _create_new_runner(
     dit_model: str,
     vae_model: str,
     base_cache_dir: str,
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> VideoDiffusionInfer:
     """
     Create a new VideoDiffusionInfer runner instance from scratch.
@@ -812,7 +809,7 @@ def _configure_runner_settings(
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> None:
     """
     Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
@@ -869,7 +866,7 @@ def _setup_models(
     vae_model: str,
     base_cache_dir: str,
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> None:
     """
     Setup DiT and VAE models from cache or create new structures.
@@ -946,7 +943,7 @@ def _setup_dit_model(
     dit_model: str,
     base_cache_dir: str,
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> bool:
     """
     Setup DiT model from cache or create new meta device structure.
@@ -1000,7 +997,7 @@ def _setup_dit_model(
         # Create new DiT model
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
-                                        runner.config, block_swap_config, debug)
+                                        runner.config, debug, block_swap_config)
         runner._dit_model_name = dit_model
         return True
     else:
@@ -1014,7 +1011,7 @@ def _setup_vae_model(
     cache_context: Dict[str, Any],
     vae_model: str,
     base_cache_dir: str,
-    debug: Debug
+    debug: Optional['Debug'] = None
 ) -> bool:
     """
     Setup VAE model from cache or create new meta device structure.
@@ -1080,7 +1077,7 @@ def _setup_vae_model(
         
         vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
         runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
-                                        runner.config, None, debug)
+                                        runner.config, debug, None)
         
         debug.log(
             f"VAE downsample factors configured "
@@ -1098,7 +1095,7 @@ def _setup_vae_model(
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
-                              debug: Optional[Debug] = None) -> Dict[str, torch.Tensor]:
+                              debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
     """
     Load model state dict from checkpoint with support for multiple formats.
     
@@ -1148,7 +1145,7 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
     return state
 
 
-def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional[Debug],
+def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
                     handle_prefix: str = "model.diffusion_model.") -> Dict[str, torch.Tensor]:
     """
     Load GGUF state dict
@@ -1394,10 +1391,14 @@ class GGUFTensor(torch.Tensor):
         return super().__torch_function__(func, types, args, kwargs)
 
 
-def prepare_model_structure(runner: VideoDiffusionInfer, model_type: str, 
-                           checkpoint_path: str, config: OmegaConf, 
-                           block_swap_config: Optional[Dict[str, Any]] = None,
-                           debug: Optional[Debug] = None) -> VideoDiffusionInfer:
+def prepare_model_structure(
+    runner: VideoDiffusionInfer,
+    model_type: str,
+    checkpoint_path: str,
+    config: OmegaConf,
+    debug: 'Debug',
+    block_swap_config: Optional[Dict[str, Any]] = None
+) -> VideoDiffusionInfer:
     """
     Prepare model structure on meta device without loading weights.
     This uses zero memory as meta device doesn't allocate real memory.
@@ -1407,8 +1408,8 @@ def prepare_model_structure(runner: VideoDiffusionInfer, model_type: str,
         model_type: "dit" or "vae"
         checkpoint_path: Path to checkpoint (stored for later loading)
         config: Model configuration
-        block_swap_config: BlockSwap config (stored for DiT)
-        debug: Debug instance
+        debug: Debug instance for logging (required)
+        block_swap_config: BlockSwap config (stored for DiT, optional)
         
     Returns:
         runner: Updated runner with model structure on meta device
@@ -1445,7 +1446,7 @@ def prepare_model_structure(runner: VideoDiffusionInfer, model_type: str,
 
 
 def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torch.device, 
-                     config: OmegaConf, debug: Optional[Debug] = None) -> None:
+                     config: OmegaConf, debug: 'Debug') -> None:
     """
     Materialize model weights from checkpoint to memory.
     Call this right before the model is needed.
@@ -1488,11 +1489,16 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     # For DiT with BlockSwap, materialize to offload device (blocks distributed later)
     # For VAE or DiT without BlockSwap, materialize to inference device
     offload_reason = ""
-    if is_dit:
-        blockswap_active = hasattr(runner, '_blockswap_active') and runner._blockswap_active
-        if blockswap_active:
-            # BlockSwap: materialize to offload device, blocks will be distributed
-            target_device = runner._block_swap_config.get("offload_device")
+    if is_dit:        
+        # Check if BlockSwap config exists and is enabled
+        blockswap_enabled = (
+            hasattr(runner, '_dit_block_swap_config') and 
+            is_blockswap_enabled(runner._dit_block_swap_config)
+        )
+        
+        if blockswap_enabled:
+            # BlockSwap: materialize to offload device, blocks will be distributed later
+            target_device = runner._dit_block_swap_config.get("offload_device")
             if target_device is None:
                 target_device = torch.device("cpu")
             offload_reason = f" (BlockSwap offload device)"
@@ -1527,7 +1533,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
 
 def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: torch.device, 
                         used_meta: bool, model_type: str, cpu_reason: str, 
-                        debug: Debug, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
+                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """
     Load model weights from checkpoint file with optimized GGUF support.
     
@@ -1584,7 +1590,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
 
 
 def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dtype, 
-                        model_type: str, debug: Debug) -> Dict[str, torch.Tensor]:
+                        model_type: str, debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
     """Convert floating point tensors in state dict to target dtype."""
     debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
@@ -1597,7 +1603,7 @@ def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dty
     return state
 
 
-def _log_weight_stats(state: Dict[str, torch.Tensor], used_meta: bool, model_type: str, debug: Debug) -> None:
+def _log_weight_stats(state: Dict[str, torch.Tensor], used_meta: bool, model_type: str, debug: Optional['Debug'] = None) -> None:
     """Log statistics about loaded weights."""
     num_params = len(state)
     total_size_mb = sum(p.nelement() * p.element_size() for p in state.values()) / (1024 * 1024)
@@ -1608,7 +1614,7 @@ def _log_weight_stats(state: Dict[str, torch.Tensor], used_meta: bool, model_typ
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
-                          debug: Debug) -> torch.nn.Module:
+                          debug: Optional['Debug'] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
     model.load_state_dict(state, strict=False, assign=True)
@@ -1625,7 +1631,7 @@ def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor
 
 
 def _load_gguf_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
-                      used_meta: bool, model_type_lower: str, debug: Debug) -> torch.nn.Module:
+                      used_meta: bool, model_type_lower: str, debug: Optional['Debug'] = None) -> torch.nn.Module:
     """
     Load GGUF quantized weights into model with architecture validation.
     
@@ -1686,7 +1692,7 @@ def _load_gguf_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor],
 
 
 def _validate_gguf_architecture(state: Dict[str, torch.Tensor], 
-                                model_state: Dict[str, torch.Tensor], debug: Debug) -> None:
+                                model_state: Dict[str, torch.Tensor], debug: Optional['Debug'] = None) -> None:
     """
     Validate GGUF model architecture matches target model.
     
@@ -1725,7 +1731,7 @@ def _validate_gguf_architecture(state: Dict[str, torch.Tensor],
 
 
 def _apply_gguf_parameters(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
-                           model_state: Dict[str, torch.Tensor], debug: Debug) -> Dict[str, Any]:
+                           model_state: Dict[str, torch.Tensor], debug: Optional['Debug'] = None) -> Dict[str, Any]:
     """
     Apply GGUF parameters to model, handling both meta and materialized models.
     
@@ -1766,7 +1772,7 @@ def _apply_gguf_parameters(model: torch.nn.Module, state: Dict[str, torch.Tensor
 
 
 def _set_parameter_on_meta_model(model: torch.nn.Module, param_name: str, 
-                                 param_value: torch.Tensor, debug: Debug) -> None:
+                                 param_value: torch.Tensor, debug: Optional['Debug'] = None) -> None:
     """Set parameter on meta device model."""
     module, attr_name = _navigate_to_parameter(model, param_name)
     new_param = _create_gguf_parameter(param_value, debug)
@@ -1774,7 +1780,7 @@ def _set_parameter_on_meta_model(model: torch.nn.Module, param_name: str,
 
 
 def _set_parameter_on_materialized_model(model: torch.nn.Module, param_name: str, 
-                                         param_value: torch.Tensor, debug: Debug) -> None:
+                                         param_value: torch.Tensor, debug: Optional['Debug'] = None) -> None:
     """Set parameter on already materialized model."""
     module, attr_name = _navigate_to_parameter(model, param_name)
     
@@ -1809,7 +1815,7 @@ def _navigate_to_parameter(model: torch.nn.Module, param_path: str) -> Tuple[tor
     return module, path_parts[-1]
 
 
-def _create_gguf_parameter(tensor: torch.Tensor, debug: Optional[Debug]) -> torch.nn.Parameter:
+def _create_gguf_parameter(tensor: torch.Tensor, debug: Optional['Debug'] = None) -> torch.nn.Parameter:
     """
     Create a parameter from a GGUF tensor, preserving quantization info.
     
@@ -1833,7 +1839,7 @@ def _create_gguf_parameter(tensor: torch.Tensor, debug: Optional[Debug]) -> torc
     return param
 
 
-def _create_dequantize_method(tensor: torch.Tensor, debug: Optional[Debug]) -> callable:
+def _create_dequantize_method(tensor: torch.Tensor, debug: Optional['Debug'] = None) -> callable:
     """
     Create a dequantization method for a GGUF tensor.
     
@@ -1879,7 +1885,7 @@ def _is_quantized_tensor(tensor: torch.Tensor) -> bool:
 
 def _report_parameter_mismatches(state: Dict[str, torch.Tensor], 
                                  model_state: Dict[str, torch.Tensor], 
-                                 loaded_names: set, debug: Debug) -> None:
+                                 loaded_names: set, debug: Optional['Debug'] = None) -> None:
     """Report any parameter mismatches between GGUF and model."""
     # Check for unmatched GGUF parameters
     unmatched = [name for name in state if name not in model_state]
@@ -1896,7 +1902,7 @@ def _report_parameter_mismatches(state: Dict[str, torch.Tensor],
         debug.log(f"First few missing: {missing[:5]}", level="WARNING", category="dit", force=True, indent_level=1)
 
 
-def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: torch.device, debug: Debug) -> None:
+def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: torch.device, debug: Optional['Debug'] = None) -> None:
     """Initialize meta buffers with timing."""
     debug.start_timer("buffer_init")
     initialized = _initialize_meta_buffers(model, target_device, debug)
@@ -1905,7 +1911,7 @@ def _initialize_meta_buffers_wrapped(model: torch.nn.Module, target_device: torc
     debug.end_timer("buffer_init", "Buffer initialization")
 
 
-def _initialize_meta_buffers(model: torch.nn.Module, target_device: torch.device, debug: Optional[Debug]) -> int:
+def _initialize_meta_buffers(model: torch.nn.Module, target_device: torch.device, debug: Optional['Debug'] = None) -> int:
     """
     Initialize any buffers still on meta device after materialization.
     
@@ -1948,7 +1954,7 @@ def _initialize_meta_buffers(model: torch.nn.Module, target_device: torch.device
 
 def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionInfer, 
                                 config: OmegaConf, is_dit: bool, 
-                                debug: Optional[Debug]) -> torch.nn.Module:
+                                debug: Optional['Debug'] = None) -> torch.nn.Module:
     """
     Apply model-specific configurations (FP8, BlockSwap, torch.compile).
     
@@ -1976,7 +1982,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
         if not isinstance(model, FP8CompatibleDiT):
             debug.log("Applying FP8/RoPE compatibility wrapper to DiT model", category="setup")
             debug.start_timer("FP8CompatibleDiT")
-            model = FP8CompatibleDiT(model, skip_conversion=False, debug=debug)
+            model = FP8CompatibleDiT(model, debug, skip_conversion=False)
             debug.end_timer("FP8CompatibleDiT", "FP8/RoPE compatibility wrapper application")
         else:
             debug.log("Reusing existing FP8/RoPE compatibility wrapper", category="reuse")
@@ -2072,7 +2078,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
 
 
 def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str, 
-                            debug: Optional[Debug]) -> Tuple[Dict[str, Any], bool]:
+                            debug: Optional['Debug'] = None) -> Tuple[Dict[str, Any], bool]:
     """
     Extract and configure torch.compile settings with dependency validation.
     
@@ -2146,7 +2152,7 @@ def _configure_torch_compile(compile_args: Dict[str, Any], model_type: str,
 
 
 def _apply_torch_compile(model: torch.nn.Module, compile_args: Dict[str, Any], 
-                        model_type: str, debug: Optional[Debug]) -> torch.nn.Module:
+                        model_type: str, debug: Optional['Debug'] = None) -> torch.nn.Module:
     """
     Apply torch.compile to entire model with configured settings.
     
@@ -2192,7 +2198,7 @@ def _disable_compile_for_dynamic_modules(module: torch.nn.Module) -> None:
 
 
 def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str, Any], 
-                                 debug: Optional[Debug]) -> torch.nn.Module:
+                                 debug: Optional['Debug'] = None) -> torch.nn.Module:
     """
     Apply torch.compile to VAE core submodules instead of entire model.
     
@@ -2249,7 +2255,7 @@ def _apply_vae_submodule_compile(model: torch.nn.Module, compile_args: Dict[str,
         return model
 
 
-def _propagate_debug_to_modules(module: torch.nn.Module, debug: Optional[Debug]) -> None:
+def _propagate_debug_to_modules(module: torch.nn.Module, debug: 'Debug') -> None:
     """
     Propagate debug instance to specific submodules that need it.
     Only targets modules that actually use debug to avoid unnecessary memory overhead.

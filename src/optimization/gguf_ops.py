@@ -7,7 +7,6 @@ Provides runtime quantization support with proper debug logging and memory manag
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Tuple
-from ..utils.debug import Debug
 from ..optimization.compatibility import GGUF_AVAILABLE, validate_gguf_availability
 
 # Import GGUF-specific modules
@@ -26,7 +25,7 @@ else:
     
     def dequantize_tensor(tensor: torch.Tensor, dtype: Optional[torch.dtype] = None, 
                      dequant_dtype: Optional[torch.dtype] = None, 
-                     debug: Optional[Debug] = None) -> torch.Tensor:
+                     debug: Optional['Debug'] = None) -> torch.Tensor:
         if dtype is not None:
             return tensor.to(dtype)
         return tensor
@@ -35,7 +34,7 @@ else:
 class _GGUFQuantizedBase(nn.Module):
     """Base class for GGUF quantized layers with shared dequantization logic"""
     
-    def __init__(self, debug: Optional[Debug] = None):
+    def __init__(self, debug: Optional['Debug'] = None):
         super().__init__()
         self.weight = None
         self.bias = None
@@ -140,7 +139,7 @@ class GGUFQuantizedLinear(_GGUFQuantizedBase):
     """Quantized Linear layer with on-the-fly dequantization"""
     
     def __init__(self, in_features: int, out_features: int, bias: bool = True, 
-                 device=None, dtype=None, debug: Optional[Debug] = None):
+                 device=None, dtype=None, debug: Optional['Debug'] = None):
         super().__init__(debug)
         self.in_features = in_features
         self.out_features = out_features
@@ -164,7 +163,7 @@ class GGUFQuantizedConv2d(_GGUFQuantizedBase):
     
     def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, 
                  padding=0, dilation=1, groups=1, bias=True, device=None, dtype=None,
-                 debug: Optional[Debug] = None):
+                 debug: Optional['Debug'] = None):
         super().__init__(debug)
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -211,7 +210,7 @@ def is_quantized_tensor(tensor: torch.Tensor) -> bool:
     return is_gguf_quantized(tensor) if callable(is_gguf_quantized) else False
 
 
-def replace_linear_with_quantized(module, debug: Optional[Debug] = None, prefix="") -> Tuple[int, Dict[str, int]]:
+def replace_linear_with_quantized(module, debug: Optional['Debug'] = None, prefix="") -> Tuple[int, Dict[str, int]]:
     """
     Replace Linear and Conv2d layers with quantized versions if they have GGUF quantized weights
     

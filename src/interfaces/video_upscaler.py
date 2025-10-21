@@ -87,6 +87,13 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     step=4,
                     tooltip="Frames processed per batch. Minimum 5 for temporal consistency. Higher = better quality but more VRAM."
                 ),
+                io.Float.Input("cfg_scale",
+                    default=1.0,
+                    min=0.0,
+                    max=100,
+                    step=0.01,
+                    tooltip="Classifier-free guidance scale. 1.0 = default upscaling strength. <1.0 = reduced upscaling effect. >1.0 = increased upscaling effect."
+                ),
                 io.Combo.Input("color_correction",
                     options=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
                     default="wavelet",
@@ -97,7 +104,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     default=0.0,
                     min=0.0,
                     max=1.0,
-                    step=0.01,
+                    step=0.001,
                     optional=True,
                     tooltip="Input noise injection scale [0.0-1.0]. Adds variation to input. 0.0 = disabled."
                 ),
@@ -105,7 +112,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     default=0.0,
                     min=0.0,
                     max=1.0,
-                    step=0.01,
+                    step=0.001,
                     optional=True,
                     tooltip="Latent noise injection scale [0.0-1.0]. Adds variation to latent space. 0.0 = disabled."
                 ),
@@ -129,9 +136,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, pixels: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
-                color_correction: str = "wavelet", input_noise_scale: float = 0.0, 
-                latent_noise_scale: float = 0.0, offload_device: str = "none", 
-                enable_debug: bool = False) -> io.NodeOutput:
+                cfg_scale: float = 1.0, color_correction: str = "wavelet",  
+                input_noise_scale: float = 0.0, latent_noise_scale: float = 0.0, 
+                offload_device: str = "none", enable_debug: bool = False) -> io.NodeOutput:
         """
         Execute SeedVR2 video upscaling with progress reporting
         
@@ -146,6 +153,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             seed: Random seed for reproducible generation
             new_resolution: Target resolution for shortest edge (maintains aspect ratio)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
+            cfg_scale: Classifier-free guidance scale (1.0 = default, <1.0 = reduced, >1.0 = increased upscaling)
             color_correction: Color correction method
             input_noise_scale: Input noise injection scale [0.0-1.0]
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
@@ -277,7 +285,6 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         vae_torch_compile_args = vae.get("torch_compile_args")
 
         # Constants
-        cfg_scale = 1.0
         temporal_overlap = 0
         
         # Intro logo
@@ -369,17 +376,19 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             transformed_sample = ctx['video_transform'](sample_frame)
             output_h, output_w = transformed_sample.shape[-2:]
             
-            debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Batch size: {batch_size}, Channels: {channels_info}", category="generation", force=True, indent_level=1)
+            debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Channels: {channels_info}", category="generation", force=True, indent_level=1)
+            debug.log(f"Batch size: {batch_size}, Seed: {seed}, CFG scale: {cfg_scale}", category="generation", force=True, indent_level=1)
 
             # Phase 1: Encode
             ctx = encode_all_batches(
-                runner, 
-                ctx=ctx, 
-                images=pixels, 
-                batch_size=batch_size, 
-                debug=debug, 
-                progress_callback=progress_callback, 
-                temporal_overlap=temporal_overlap, 
+                runner,
+                ctx=ctx,
+                images=pixels,
+                debug=debug,
+                batch_size=batch_size,
+                seed=seed,
+                progress_callback=progress_callback,
+                temporal_overlap=temporal_overlap,
                 res_w=new_resolution,
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
@@ -387,11 +396,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             # Phase 2: Upscale
             ctx = upscale_all_batches(
-                runner, 
-                ctx=ctx, 
-                debug=debug, 
-                progress_callback=progress_callback, 
-                cfg_scale=cfg_scale, 
+                runner,
+                ctx=ctx,
+                debug=debug,
+                progress_callback=progress_callback,
+                cfg_scale=cfg_scale,
                 seed=seed,
                 latent_noise_scale=latent_noise_scale,
                 cache_model=dit_cache
@@ -399,9 +408,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             # Phase 3: Decode
             ctx = decode_all_batches(
-                runner, 
-                ctx=ctx, 
-                debug=debug, 
+                runner,
+                ctx=ctx,
+                debug=debug,
                 progress_callback=progress_callback,
                 cache_model=vae_cache
             )

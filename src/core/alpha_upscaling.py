@@ -21,7 +21,7 @@ def process_alpha_for_batch(
     rgb_original: torch.Tensor,
     device: torch.device,
     compute_dtype: torch.dtype,
-    debug: Optional[Any] = None
+    debug: Optional['Debug'] = None
 ) -> List[torch.Tensor]:
     """
     Process Alpha channel for an entire batch with temporal consistency.
@@ -125,7 +125,7 @@ def process_alpha_for_batch(
 def detect_edges_batch(
     images: torch.Tensor,
     method: str = 'sobel',
-    debug: Optional[Any] = None
+    debug: Optional['Debug'] = None
     ) -> torch.Tensor:
     """
     Detect edges in a batch of images using Sobel or Canny.
@@ -189,8 +189,7 @@ def detect_edges_batch(
 
 
 def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor, 
-                          radius: int = 8, eps: float = 0.01,
-                          debug: Optional[Any] = None) -> torch.Tensor:
+                          radius: int = 8, eps: float = 0.01) -> torch.Tensor:
     """
     Apply guided filter for edge-preserving smoothing.
     
@@ -199,7 +198,6 @@ def guided_filter_pytorch(guide: torch.Tensor, src: torch.Tensor,
         src: Input to filter (T, 1, H, W)
         radius: Filter radius
         eps: Regularization parameter
-        debug: Debug instance for logging (unused, kept for API compatibility)
         
     Returns:
         Filtered output (T, 1, H, W)
@@ -293,7 +291,7 @@ def edge_guided_alpha_upscale(
     input_rgb: torch.Tensor,
     upscaled_rgb: torch.Tensor,
     method: str = 'guided',
-    debug: Optional[Any] = None
+    debug: Optional['Debug'] = None
 ) -> torch.Tensor:
     """
     Upscale Alpha channel using RGB edge structure as guidance.
@@ -356,8 +354,7 @@ def edge_guided_alpha_upscale(
             guide=rgb_normalized,
             src=alpha_upscaled,
             radius=2,  # Reduced from 3 for tighter edges
-            eps=0.002,  # Slightly increased for more edge preservation
-            debug=None
+            eps=0.002
         )
         
         # Step 3: Create tight transition zone using 3x3 max pooling on edge map
@@ -412,8 +409,7 @@ def edge_guided_alpha_upscale(
             guide=rgb_normalized,
             src=alpha_final,
             radius=3,
-            eps=0.002,
-            debug=None
+            eps=0.002
         )
     
    # Clamp output to valid alpha range [0, 1]

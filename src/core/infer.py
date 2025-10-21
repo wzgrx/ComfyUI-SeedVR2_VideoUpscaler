@@ -62,14 +62,11 @@ def optimized_channels_to_second(tensor):
         return tensor.permute(*dims)
 
 class VideoDiffusionInfer():
-    def __init__(self, config: DictConfig, debug=None,  
+    def __init__(self, config: DictConfig, debug: 'Debug',
                  encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
                  encode_tile_overlap: Tuple[int, int] = (64, 64),
                  decode_tiled: bool = False, decode_tile_size: Tuple[int, int] = (512, 512),
                  decode_tile_overlap: Tuple[int, int] = (64, 64)):
-        # Check if debug instance is available
-        if debug is None:
-            raise ValueError("Debug instance must be provided to VideoDiffusionInfer")
         self.config = config
         self.debug = debug
         # Store separate encode and decode tiling parameters

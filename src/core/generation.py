@@ -58,12 +58,11 @@ from ..utils.color_fix import (
     adaptive_instance_normalization
 )
 from ..utils.constants import get_script_directory
-from ..utils.debug import Debug
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
 
-def prepare_video_transforms(res_w: int, debug: Optional[Debug] = None) -> Compose:
+def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Compose:
     """
     Prepare optimized video transformation pipeline
     
@@ -96,7 +95,7 @@ def prepare_video_transforms(res_w: int, debug: Optional[Debug] = None) -> Compo
     ])
 
 
-def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Debug) -> None:
+def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debug'] = None) -> None:
     """
     Setup video transformation pipeline in context with consistent timing and logging.
     
@@ -114,7 +113,7 @@ def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Debug) -> None
 
 
 def load_text_embeddings(script_directory: str, device: torch.device, 
-                        dtype: torch.dtype, debug: Optional[Debug] = None) -> Dict[str, List[torch.Tensor]]:
+                        dtype: torch.dtype, debug: Optional['Debug'] = None) -> Dict[str, List[torch.Tensor]]:
     """
     Load and prepare text embeddings for generation
     
@@ -446,7 +445,7 @@ def prepare_runner(
         dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         model_dir: Base directory containing model files
-        debug: Debug instance for logging
+        debug: Debug instance for logging (required)
         ctx: Generation context from setup_generation_context
         dit_cache: Whether to cache DiT model between runs
         vae_cache: Whether to cache VAE model between runs
@@ -517,10 +516,11 @@ def prepare_runner(
 
 def encode_all_batches(
     runner: 'VideoDiffusionInfer',
-    ctx: Optional[Dict[str, Any]] = None,
-    images: Optional[torch.Tensor] = None,
+    ctx: Dict[str, Any],
+    images: torch.Tensor,
+    debug: 'Debug',
     batch_size: int = 5,
-    debug: Optional['Debug'] = None,
+    seed: int = 42,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     temporal_overlap: int = 0,
     res_w: int = 1072,
@@ -536,10 +536,10 @@ def encode_all_batches(
     Args:
         runner: VideoDiffusionInfer instance with loaded models (required)
         ctx: Generation context from setup_generation_context (required)
-        images: Input frames tensor [T, H, W, C] range [0,1]. 
-                Required if ctx doesn't contain 'input_images'
-        batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
+        images: Input frames tensor [T, H, W, C] range [0,1] (required) 
         debug: Debug instance for logging (required)
+        batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
+        seed: Random seed for deterministic VAE sampling (default: 42)
         progress_callback: Optional callback(current, total, frames, phase_name)
         temporal_overlap: Overlapping frames between batches for continuity
         res_w: Target resolution for shortest edge
@@ -570,13 +570,10 @@ def encode_all_batches(
         raise ValueError("Generation context must be provided to encode_all_batches")
     
     # Validate and store inputs
-    if images is None and 'input_images' not in ctx:
-        raise ValueError("Either images must be provided or ctx must contain 'input_images'")
-    
-    if images is not None:
-        ctx['input_images'] = images
+    if images is None:
+        raise ValueError("Images to encode must be provided")
     else:
-        images = ctx['input_images']
+        ctx['input_images'] = images
     
     # Get total frame count from context (set in video_upscaler before encoding)
     total_frames = ctx.get('total_frames', len(images))
@@ -658,6 +655,13 @@ def encode_all_batches(
                 runner.vae, ctx['cache_context']['vae_model'], debug
             )
             ctx['cache_context']['vae_newly_cached'] = True
+        
+        # Set deterministic seed for VAE encoding (separate from diffusion noise)
+        # Uses seed + 1,000,000 to avoid collision with upscaling batch seeds
+        # This ensures VAE sampling is deterministic while maintaining quality
+        seed_vae = seed + 1000000
+        set_seed(seed_vae)
+        debug.log(f"Using seed: {seed_vae} (VAE uses seed+1000000 for deterministic sampling)", category="vae")
         
         # Move VAE to GPU for encoding (no-op if already there)
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
@@ -866,8 +870,8 @@ def encode_all_batches(
 
 def upscale_all_batches(
     runner: 'VideoDiffusionInfer',
-    ctx: Optional[Dict[str, Any]] = None,
-    debug: Optional['Debug'] = None,
+    ctx: Dict[str, Any],
+    debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cfg_scale: float = 7.5,
     seed: int = 42,
@@ -886,7 +890,7 @@ def upscale_all_batches(
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         cfg_scale: Classifier-free guidance scale (default: 1.0)
-        seed: Random seed for noise generation
+        seed: Random seed for reproducible generation
         latent_noise_scale: Noise scale for latent space augmentation (0.0-1.0).
                            Adds noise during diffusion conditioning. Can soften details
                            but may help with certain artifacts. 0.0 = no noise (crisp),
@@ -926,10 +930,7 @@ def upscale_all_batches(
     runner.config.diffusion.cfg.rescale = 0.0
     runner.config.diffusion.timesteps.sampling.steps = 1
     runner.configure_diffusion(device=ctx['dit_device'], dtype=ctx['compute_dtype'])
-    
-    # Set seed for generation
-    set_seed(seed)
-    
+
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_latents'] if l is not None])
 
@@ -972,7 +973,12 @@ def upscale_all_batches(
                     ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
                     runner, debug
                 )
-
+        
+        # Set base seed for DiT noise generation
+        # Ensures deterministic noise across all batches in this upscaling phase
+        set_seed(seed)
+        debug.log(f"Using seed: {seed}, CFG scale: {cfg_scale}", category="dit")
+        
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
                             model_name="DiT", debug=debug, runner=runner)
@@ -1116,8 +1122,8 @@ def upscale_all_batches(
 
 def decode_all_batches(
     runner: 'VideoDiffusionInfer',
-    ctx: Optional[Dict[str, Any]] = None,
-    debug: Optional['Debug'] = None,
+    ctx: Dict[str, Any],
+    debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     cache_model: bool = False
 ) -> Dict[str, Any]:
@@ -1268,8 +1274,8 @@ def decode_all_batches(
 
 
 def postprocess_all_batches(
-    ctx: Optional[Dict[str, Any]] = None,
-    debug: Optional['Debug'] = None,
+    ctx: Dict[str, Any],
+    debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     color_correction: str = "wavelet"
 ) -> Dict[str, Any]:

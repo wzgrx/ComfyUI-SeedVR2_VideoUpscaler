@@ -4,8 +4,8 @@ Configure VAE (Variational Autoencoder) model with tiling support
 """
 
 from comfy_api.latest import io
+from comfy_execution.utils import get_executing_context
 from typing import Dict, Any, Tuple
-from ..utils.constants import get_unique_id
 from ..utils.model_registry import get_available_vae_models, DEFAULT_VAE
 from ..optimization.memory_manager import get_device_list
 
@@ -158,6 +158,6 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
             "torch_compile_args": torch_compile_args,
-            "node_id": get_unique_id(),
+            "node_id": get_executing_context().node_id,
         }
         return io.NodeOutput(config)

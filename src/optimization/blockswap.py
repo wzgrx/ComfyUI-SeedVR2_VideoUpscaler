@@ -85,19 +85,26 @@ def get_module_memory_mb(module: torch.nn.Module) -> float:
     return total_bytes / (1024 * 1024)
 
 
-def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) -> None:
+def apply_block_swap_to_dit(
+    runner: 'VideoDiffusionInfer',
+    block_swap_config: Dict[str, Any],
+    debug: 'Debug'
+) -> None:
     """
-    Apply block swapping configuration to a DIT model with OOM protection.
+    Apply block swapping configuration to a DiT model with OOM protection.
     
     This is the main entry point for configuring block swapping on a model.
-    It handles block selection, I/O component offloading, and device placement.
+    Handles block selection, I/O component offloading, device placement, and
+    forward method wrapping for dynamic memory management.
     
     Args:
         runner: VideoDiffusionInfer instance containing the model
         block_swap_config: Configuration dictionary with keys:
             - blocks_to_swap: Number of blocks to swap (from the start)
-            - swap_io_components: Whether to offload I/O components
+            - swap_io_components: Whether to offload I/O components  
             - enable_debug: Whether to enable debug logging
+            - offload_device: Device to offload to (default: 'cpu')
+        debug: Debug instance for logging (required)
     """
     # Early return if BlockSwap not enabled
     if not is_blockswap_enabled(block_swap_config):
@@ -204,9 +211,33 @@ def apply_block_swap_to_dit(runner, block_swap_config: Dict[str, Any], debug) ->
     debug.end_timer("apply_blockswap", "BlockSwap configuration application")
     
 
-def _configure_io_components(model, device: torch.device, offload_device: torch.device, 
-                            swap_io_components: bool, debug) -> Dict[str, Any]:
-    """Configure I/O component placement and wrapping with memory tracking."""
+def _configure_io_components(
+    model: torch.nn.Module,
+    device: torch.device,
+    offload_device: torch.device,
+    swap_io_components: bool,
+    debug: 'Debug'
+) -> Dict[str, Any]:
+    """
+    Configure I/O component placement and wrapping with memory tracking.
+    
+    Handles all non-block modules (embeddings, normalization layers, etc.) by
+    either keeping them on GPU or offloading them with dynamic swapping wrappers.
+    
+    Args:
+        model: DiT model containing named children to configure
+        device: Main computation device (typically GPU)
+        offload_device: Device for offloaded components (typically CPU)
+        swap_io_components: If True, offload I/O components with dynamic swapping
+        debug: Debug instance for logging (required)
+        
+    Returns:
+        Dictionary containing:
+            - components: List of offloaded component names
+            - memory_mb: Total memory of offloaded components in MB
+            - gpu_components: List of components remaining on GPU
+            - gpu_memory_mb: Total memory of GPU components in MB
+    """
     io_components_offloaded = []
     io_components_on_gpu = []
     io_memory_mb = 0.0
@@ -237,9 +268,31 @@ def _configure_io_components(model, device: torch.device, offload_device: torch.
     }
 
 
-def _configure_blocks(model, device: torch.device, offload_device: torch.device, 
-                     debug) -> Dict[str, float]:
-    """Configure block placement and calculate memory statistics."""
+def _configure_blocks(
+    model: torch.nn.Module,
+    device: torch.device,
+    offload_device: torch.device,
+    debug: 'Debug'
+) -> Dict[str, float]:
+    """
+    Configure transformer block placement and calculate memory statistics.
+    
+    Moves blocks to their designated devices based on model.blocks_to_swap
+    attribute. Blocks with index <= blocks_to_swap go to offload device,
+    others stay on main device.
+    
+    Args:
+        model: DiT model with blocks attribute and blocks_to_swap configured
+        device: Main computation device for non-swapped blocks
+        offload_device: Device for swapped blocks  
+        debug: Debug instance for logging (required)
+        
+    Returns:
+        Dictionary containing:
+            - offload_memory: Total memory of offloaded blocks in MB
+            - main_memory: Total memory of blocks on main device in MB
+            - io_components: Empty list (populated by caller)
+    """
     total_offload_memory = 0.0
     total_main_memory = 0.0
 
@@ -268,10 +321,30 @@ def _configure_blocks(model, device: torch.device, offload_device: torch.device,
     }
 
 
-def _log_memory_summary(memory_stats: Dict[str, float], offload_device: torch.device, 
-                       device: torch.device, swap_io_components: bool,
-                       debug) -> None:
-    """Log memory usage summary with complete breakdown."""
+def _log_memory_summary(
+    memory_stats: Dict[str, float],
+    offload_device: torch.device,
+    device: torch.device,
+    swap_io_components: bool,
+    debug: 'Debug'
+) -> None:
+    """
+    Log comprehensive memory usage summary for BlockSwap configuration.
+    
+    Displays detailed breakdown of memory distribution across devices,
+    including transformer blocks and I/O components.
+    
+    Args:
+        memory_stats: Dictionary containing:
+            - offload_memory: Memory offloaded from blocks (MB)
+            - main_memory: Memory remaining on main device (MB)
+            - io_memory_mb: Memory from offloaded I/O components (MB)
+            - io_gpu_memory_mb: Memory from I/O components on GPU (MB)
+        offload_device: Device used for offloading
+        device: Main computation device
+        swap_io_components: Whether I/O components are being swapped
+        debug: Debug instance for logging (required)
+    """
     debug.log("BlockSwap memory configuration:", category="blockswap")
     
     # Log transformer blocks memory
@@ -305,8 +378,29 @@ def _log_memory_summary(memory_stats: Dict[str, float], offload_device: torch.de
         debug.log(f"Total VRAM saved: {total_offloaded:.2f}MB (~{total_offloaded/1024:.2f}GB)", category="blockswap", indent_level=1)
 
 
-def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.Module, debug) -> None:
-    """Wrap individual block forward to handle device movement using weak references to prevent leaks."""
+def _wrap_block_forward(
+    block: torch.nn.Module,
+    block_idx: int,
+    model: torch.nn.Module,
+    debug: 'Debug'
+) -> None:
+    """
+    Wrap individual transformer block forward for dynamic device swapping.
+    
+    Creates a wrapped forward method that automatically:
+    1. Moves block to GPU before computation
+    2. Executes original forward pass
+    3. Moves block back to offload device after computation
+    4. Logs timing and manages memory pressure
+    
+    Uses weak references to prevent memory leaks from closure retention.
+    
+    Args:
+        block: Individual transformer block to wrap
+        block_idx: Index of this block in model.blocks
+        model: Parent DiT model (used for device references)
+        debug: Debug instance for logging (required)
+    """
     if hasattr(block, '_original_forward'):
         return  # Already wrapped
 
@@ -364,8 +458,27 @@ def _wrap_block_forward(block: torch.nn.Module, block_idx: int, model: torch.nn.
     block._original_forward = original_forward
 
 
-def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.Module, debug) -> None:
-    """Wrap I/O component forward using weak references to prevent memory leaks."""
+def _wrap_io_forward(
+    module: torch.nn.Module,
+    module_name: str,
+    model: torch.nn.Module,
+    debug: 'Debug'
+) -> None:
+    """
+    Wrap I/O component forward for dynamic device swapping.
+    
+    Similar to _wrap_block_forward but for I/O components (embeddings,
+    normalization layers, etc.). Handles swapping between GPU and CPU
+    during forward passes.
+    
+    Uses weak references to prevent circular dependencies and memory leaks.
+    
+    Args:
+        module: I/O component module to wrap
+        module_name: Name identifier for logging (e.g., 'x_embedder')
+        model: Parent DiT model (used for device references)
+        debug: Debug instance for logging (required)
+    """
     if hasattr(module, '_is_io_wrapped') and module._is_io_wrapped:
         debug.log(f"Reusing existing I/O wrapper for {module_name}", category="reuse")
         return  # Already wrapped
@@ -425,13 +538,20 @@ def _wrap_io_forward(module: torch.nn.Module, module_name: str, model: torch.nn.
     model._io_swappers.append((module, module_name))
 
 
-def _patch_rope_for_blockswap(model, debug) -> None:
+def _patch_rope_for_blockswap(
+    model: torch.nn.Module,
+    debug: 'Debug'
+) -> None:
     """
-    Patch RoPE modules to handle device mismatches gracefully.
+    Patch RoPE (Rotary Position Embedding) modules for device-aware fallback.
     
-    This complements the stability wrapper from compatibility.py by adding
-    device-aware error handling. Only handles device/memory errors, letting
-    other exceptions bubble up to the stability wrapper if present.
+    Adds CPU fallback logic to RoPE modules to handle device mismatch errors
+    that can occur during BlockSwap operations. Complements the stability
+    wrapper from compatibility.py with device-specific error handling.
+    
+    Args:
+        model: DiT model containing RoPE modules to patch
+        debug: Debug instance for logging (required)
     """
     rope_patches = []
     
@@ -521,12 +641,22 @@ def _patch_rope_for_blockswap(model, debug) -> None:
         debug.log(f"Patched {len(rope_patches)} RoPE modules with device handling", category="success")
 
 
-def _protect_model_from_move(model, runner, debug) -> None:
+def _protect_model_from_move(
+    model: torch.nn.Module,
+    runner: 'VideoDiffusionInfer',
+    debug: 'Debug'
+) -> None:
     """
-    Protect model from being moved entirely to GPU when BlockSwap is active.
+    Protect model from unintended full device movement during BlockSwap.
     
-    This prevents other code from accidentally moving the entire model to GPU
-    which would defeat the purpose of block swapping.
+    Wraps model.to() method to prevent other code from accidentally moving
+    the entire model to GPU, which would defeat BlockSwap's memory savings.
+    Allows movement only when explicitly bypassed via runner flag.
+    
+    Args:
+        model: DiT model to protect
+        runner: VideoDiffusionInfer instance (stored as weak reference)
+        debug: Debug instance for logging (required)
     """
     if not hasattr(model, '_original_to'):
         # Store runner reference as weak reference to avoid circular refs

@@ -181,12 +181,10 @@ class FP8CompatibleDiT(torch.nn.Module):
     - Flash Attention: Automatic optimization of attention layers
     """
     
-    def __init__(self, dit_model, skip_conversion=False, debug=None):
+    def __init__(self, dit_model, debug: 'Debug', skip_conversion: bool = False):
         super().__init__()
         self.dit_model = dit_model
-        if debug is None:
-            raise ValueError("Debug instance must be provided to FP8CompatibleDiT")
-        self.debug = debug if debug is not None else None
+        self.debug = debug
         self.model_dtype = self._detect_model_dtype()
         self.is_fp8_model = self.model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         self.is_fp16_model = self.model_dtype == torch.float16
