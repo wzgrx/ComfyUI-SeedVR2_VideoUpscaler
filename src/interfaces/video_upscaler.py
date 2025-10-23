@@ -96,9 +96,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 ),
                 io.Combo.Input("color_correction",
                     options=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
-                    default="wavelet",
-                    optional=True,
-                    tooltip="Color correction method to match upscaled output to input. 'wavelet' and 'wavelet_adaptive' provide best results."
+                    default="lab",
+                    tooltip="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)"
                 ),
                 io.Float.Input("input_noise_scale",
                     default=0.0,

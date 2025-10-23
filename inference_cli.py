@@ -614,18 +614,19 @@ def parse_arguments() -> argparse.Namespace:
                         help="Device to offload intermediate tensors between phases (default: cpu). "
                              "Options: 'cpu', 'none'. Use 'cpu' to prevent VRAM accumulation for long videos (recommended), "
                              "'none' to keep all tensors on GPU (faster but uses more VRAM)")
-    parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
-                        help="Enable VAE encode tiling for improved VRAM usage")
-    parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
-                        help="VAE encode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_encode_tiling_enabled is set")
+    parser.add_argument("--disable_vae_encode_tiling", action="store_false", 
+                        dest="vae_encode_tiling_enabled", default=True,
+                        help="Disable VAE encode tiling. By default, tiling is enabled to prevent noise artifacts at high resolution.")
+    parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
+                        help="VAE encode tile size in pixels (default: 1024). Only used when encode tiling is enabled. Can be reduced for memory, but increasing above 1024 causes noise artifacts. Use single integer or two integers 'h w'.")
     parser.add_argument("--vae_encode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="VAE encode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_encode_tiling_enabled is set")
+                        help="VAE encode tile overlap in pixels (default: 128). Only used when encode tiling is enabled. Higher values improve blending at the cost of slower processing. Use single integer or two integers 'h w'.")
     parser.add_argument("--vae_decode_tiling_enabled", action="store_true",
-                        help="Enable VAE decode tiling for improved VRAM usage")
-    parser.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(512, 512),
-                        help="VAE decode tile size (default: 512). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
+                        help="Enable VAE decode tiling for VRAM reduction during decoding. Disabled by default.")
+    parser.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
+                        help="VAE decode tile size in pixels (default: 1024). Only used when decode tiling is enabled. Adjust based on available VRAM. Use single integer or two integers 'h w'.")
     parser.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="VAE decode tile overlap (default: 128). Use single integer or two integers 'h w'. Only used if --vae_decode_tiling_enabled is set")
+                        help="VAE decode tile overlap in pixels (default: 128). Only used when decode tiling is enabled. Higher values improve blending at the cost of slower processing. Use single integer or two integers 'h w'.")
     parser.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn"],
                         help="Attention computation backend: 'sdpa' (default, always available) or 'flash_attn' (requires flash-attn package, faster)")

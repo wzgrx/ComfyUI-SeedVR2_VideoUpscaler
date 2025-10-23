@@ -15,7 +15,7 @@ Key Features:
 - Four-phase pipeline (encode-all → upscale-all → decode-all → postprocess-all) for efficiency
 - Native FP8 pipeline support for 2x speedup and 50% VRAM reduction
 - Temporal overlap support for smooth transitions between batches
-- Adaptive dtype detection and optimal autocast configuration
+- Adaptive dtype detection and configuration
 - Memory-efficient pre-allocated batch processing
 - Stream-based assembly eliminates memory spikes for long videos
 - Advanced video format handling (4n+1 constraint)
@@ -256,19 +256,21 @@ def _ensure_precision_initialized(
     debug: Optional['Debug'] = None
 ) -> None:
     """
-    Initialize compute_dtype and autocast_dtype based on actual model dtypes.
+    Log model dtypes for debugging. Compute dtype is hardcoded in context.
     
-    Lazily initializes compute_dtype and autocast_dtype by inspecting actual
-    model weights to determine optimal precision settings. Only checks models
-    that are materialized (not on meta device). Safe to call multiple times.
+    Since compute_dtype is hardcoded to bfloat16 in setup_generation_context(),
+    this function only logs model dtypes for informational purposes.
     
     Args:
-        ctx: Generation context dictionary to update with precision settings
+        ctx: Generation context dictionary (compute_dtype already set)
         runner: VideoDiffusionInfer instance with loaded models
         debug: Optional Debug instance for logging
     """
+    if not debug:
+        return
+    
     try:
-        # Check which models are materialized (not on meta device)
+        # Get model dtypes for informational logging
         dit_dtype = None
         vae_dtype = None
         
@@ -288,34 +290,19 @@ def _ensure_precision_initialized(
             except StopIteration:
                 pass
         
-        # Need at least one materialized model
-        if dit_dtype is None and vae_dtype is None:
-            return
+        # Build precision info string
+        parts = []
+        if dit_dtype is not None:
+            parts.append(f"DiT={dit_dtype}")
+        if vae_dtype is not None:
+            parts.append(f"VAE={vae_dtype}")
+        parts.append(f"compute={ctx['compute_dtype']}")
         
-        # Initialize compute dtype once
-        if ctx.get('compute_dtype') is None:
-            ctx['compute_dtype'] = torch.bfloat16
-            ctx['autocast_dtype'] = torch.bfloat16
-        
-        # Always log current state (what's materialized)
-        if debug:
-            parts = []
-            if dit_dtype is not None:
-                parts.append(f"DiT={dit_dtype}")
-            if vae_dtype is not None:
-                parts.append(f"VAE={vae_dtype}")
-            parts.append(f"compute={ctx['compute_dtype']}")
-            parts.append(f"autocast={ctx['autocast_dtype']}")
-            
-            debug.log(f"Initialized precision: {', '.join(parts)}", category="precision")
+        if parts:
+            debug.log(f"Model precision: {', '.join(parts)}", category="precision")
             
     except Exception as e:
-        # Fallback to safe defaults
-        ctx['compute_dtype'] = torch.bfloat16
-        ctx['autocast_dtype'] = torch.bfloat16
-        
-        if debug:
-            debug.log(f"Could not detect model dtypes: {e}, falling back to BFloat16", level="WARNING", category="model", force=True)
+        debug.log(f"Could not log model dtypes: {e}", level="WARNING", category="precision", force=True)
 
 
 def setup_generation_context(
@@ -347,11 +334,6 @@ def setup_generation_context(
             - offload device configurations
             - state containers (latents, samples, etc.)
             - ComfyUI integration hooks
-            
-    Note:
-        Precision settings (compute_dtype, autocast_dtype) are lazily initialized
-        when first needed via _ensure_precision_initialized() to detect actual
-        model dtypes and configure optimal computation settings.
     """
     # Apply default devices if not specified
     default_device = "cpu"
@@ -380,8 +362,8 @@ def setup_generation_context(
         'dit_offload_device': dit_offload_device,
         'vae_offload_device': vae_offload_device,
         'tensor_offload_device': tensor_offload_device,
-        'compute_dtype': None,
-        'autocast_dtype': None,
+        'compute_dtype': torch.bfloat16, # Hardcoded - gives the best compromise between memory & quality without artifacts
+        'interrupt_fn': interrupt_fn,
         'video_transform': None,
         'text_embeds': None,
         'all_transformed_videos': [],
@@ -412,6 +394,7 @@ def setup_generation_context(
             f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
             category="setup"
         )
+        debug.log(f"Unified compute dtype: torch.bfloat16 across entire pipeline for maximum compatibility", category="precision")
     
     return ctx
 
@@ -489,6 +472,7 @@ def prepare_runner(
         vae_model=vae_model,
         base_cache_dir=model_dir,
         debug=debug,
+        ctx=ctx,
         dit_cache=dit_cache,
         vae_cache=vae_cache,
         dit_id=dit_id,
@@ -504,12 +488,6 @@ def prepare_runner(
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
-    
-    # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
-    runner._dit_device = ctx['dit_device']
-    runner._vae_device = ctx['vae_device']
-    runner._dit_offload_device = ctx['dit_offload_device']
-    runner._vae_offload_device = ctx['vae_offload_device']
 
     return runner, cache_context
 
@@ -828,7 +806,7 @@ def encode_all_batches(
                     tensor_name=f"latent_{encode_idx+1}",
                     dtype=ctx['compute_dtype'],
                     debug=debug,
-                    reason="storing encoded latents for upscaling (VAE dtype → compute dtype)",
+                    reason="storing encoded latents for upscaling",
                     indent_level=1
                 )
             else:
@@ -1036,7 +1014,7 @@ def upscale_all_batches(
             # Run inference
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
-                with torch.autocast(str(ctx['dit_device']), ctx['autocast_dtype'], enabled=True):
+                with torch.autocast(str(ctx['dit_device']), ctx['compute_dtype'], enabled=True):
                     upscaled_latents = runner.inference(
                         noises=noises,
                         conditions=conditions,
@@ -1226,7 +1204,7 @@ def decode_all_batches(
                         tensor_name=f"sample_{decode_idx+1}",
                         dtype=ctx['compute_dtype'],
                         debug=debug,
-                        reason="storing decoded samples for post-processing (VAE dtype → compute dtype)",
+                        reason="storing decoded samples for post-processing",
                         indent_level=1
                     )
             else:

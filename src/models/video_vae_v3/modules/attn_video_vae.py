@@ -1307,6 +1307,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             x = x.unsqueeze(2)
 
         b, c, f, H, W = x.shape
+        tile_h, tile_w = tile_size
+        
+        # Only tile if input resolution requires multiple tiles
+        if H <= tile_h and W <= tile_w:
+            return self.slicing_encode(x)
+        else:
+            self.debug.log(f"Using VAE tiled encoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
 
         # Spatial scale factor (output/latent)
         scale_factor = self.spatial_downsample_factor
@@ -1368,19 +1375,15 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 tile_id += 1
                 tile_sample = x[:, :, :, y_out:y_out_end, x_out:x_out_end]
 
-                # Log progress periodically instead of every tile
-                if self.debug and (tile_id == 1 or tile_id % 5 == 0 or tile_id == num_tiles):
-                    end_tile = min(tile_id + 4, num_tiles)
+                # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
+                if self.debug and (tile_id % 5 == 1 or tile_id == num_tiles):
                     if tile_id == num_tiles:
-                        self.debug.log(
-                            f"Encoding tile {tile_id} / {num_tiles}",
-                            category="vae",
-                        )
+                        # Only log final tile if not covered by previous range
+                        if (tile_id - 1) % 5 == 0:
+                            self.debug.log(f"Encoding tile {tile_id} / {num_tiles}", category="vae")
                     else:
-                        self.debug.log(
-                            f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}",
-                            category="vae",
-                        )
+                        end_tile = min(tile_id + 4, num_tiles)
+                        self.debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae")
 
                 encoded_tile = self.slicing_encode(tile_sample)
 
@@ -1451,6 +1454,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         
         latent_tile_h = max(1, tile_h // scale_factor)
         latent_tile_w = max(1, tile_w // scale_factor)
+        
+        # Only tile if latent resolution requires multiple tiles
+        if H <= latent_tile_h and W <= latent_tile_w:
+            return self.slicing_decode(z)
+        else:
+            self.debug.log(f"Using VAE tiled decoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
+        
         latent_overlap_h = max(0, min((overlap_h // scale_factor), latent_tile_h - 1))
         latent_overlap_w = max(0, min((overlap_w // scale_factor), latent_tile_w - 1))
 
@@ -1494,19 +1504,15 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 tile_id += 1
                 tile_latent = z[:, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
 
-                # Log progress periodically instead of every tile
-                if self.debug and (tile_id == 1 or tile_id % 5 == 0 or tile_id == num_tiles):
-                    end_tile = min(tile_id + 4, num_tiles)
+                # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
+                if self.debug and (tile_id % 5 == 1 or tile_id == num_tiles):
                     if tile_id == num_tiles:
-                        self.debug.log(
-                            f"Decoding tile {tile_id} / {num_tiles}",
-                            category="vae",
-                        )
+                        # Only log final tile if not covered by previous range
+                        if (tile_id - 1) % 5 == 0:
+                            self.debug.log(f"Decoding tile {tile_id} / {num_tiles}", category="vae")
                     else:
-                        self.debug.log(
-                            f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}",
-                            category="vae",
-                        )
+                        end_tile = min(tile_id + 4, num_tiles)
+                        self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae")
 
                 decoded_tile = self.slicing_decode(tile_latent)
 

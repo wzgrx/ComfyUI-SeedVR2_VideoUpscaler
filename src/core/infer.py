@@ -168,10 +168,6 @@ class VideoDiffusionInfer():
             else:
                 batches = [sample.unsqueeze(0) for sample in samples]
 
-            use_encode_tiling = self.encode_tiled
-            if use_encode_tiling:
-                self.debug.log(f"Using VAE tiled encoding (Tile: {self.encode_tile_size}, Overlap: {self.encode_tile_overlap})", category="vae", force=True, indent_level=1)
-
             # VAE process by each group.
             for sample in batches:
                 sample = sample.to(device, dtype)
@@ -180,11 +176,11 @@ class VideoDiffusionInfer():
                     sample = self.vae.preprocess(sample)
 
                 if use_sample:
-                    latent = self.vae.encode(sample, tiled=use_encode_tiling, tile_size=self.encode_tile_size, 
+                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size, 
                                             tile_overlap=self.encode_tile_overlap).latent
                 else:
                     # Deterministic vae encode, only used for i2v inference (optionally)
-                    latent = self.vae.encode(sample, tiled=use_encode_tiling, tile_size=self.encode_tile_size,
+                    latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                              tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
@@ -231,10 +227,6 @@ class VideoDiffusionInfer():
             else:
                 latents = [latent.unsqueeze(0) for latent in latents]
 
-            use_decode_tiling = self.decode_tiled
-            if use_decode_tiling:
-                self.debug.log(f"Using VAE tiled decoding (Tile: {self.decode_tile_size}, Overlap: {self.decode_tile_overlap})", category="vae", force=True, indent_level=1)
-
             self.debug.log(f"Latents shape: {latents[0].shape}", category="info", indent_level=1)
 
             for i, latent in enumerate(latents):
@@ -245,7 +237,7 @@ class VideoDiffusionInfer():
 
                 sample = self.vae.decode(
                     latent,
-                    tiled=use_decode_tiling, tile_size=self.decode_tile_size,
+                    tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                     tile_overlap=self.decode_tile_overlap).sample
 
                 if hasattr(self.vae, "postprocess"):

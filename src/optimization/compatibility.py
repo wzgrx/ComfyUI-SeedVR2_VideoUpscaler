@@ -174,35 +174,44 @@ def call_rope_with_stability(method, *args, **kwargs):
 class FP8CompatibleDiT(torch.nn.Module):
     """
     Wrapper for DiT models with automatic compatibility management + advanced optimizations
-    - FP8: Keeps native FP8 parameters, converts inputs/outputs
-    - FP16: Uses native FP16
-    - Mixed Precision: Stabilizes RoPE for models with FP16 blocks
-    - RoPE: Converted from FP8 to BFloat16 only when detected as FP8
+    
+    Precision Handling:
+    - FP8: Keeps native FP8 parameters (memory efficient), converts inputs/outputs to compute_dtype for arithmetic
+    - FP16: Uses native FP16 precision throughout
+    - BFloat16: Uses native BFloat16 precision throughout
+    - Float32: Uses full precision for maximum quality
+    - RoPE: Converted from FP8 to compute_dtype for numerical consistency
+    
+    Optimizations:
     - Flash Attention: Automatic optimization of attention layers
+    - RoPE Stabilization: Error handling for numerical stability in mixed precision
+    - MPS Compatibility: Unified dtype conversion for Apple Silicon backends
     """
     
-    def __init__(self, dit_model, debug: 'Debug', skip_conversion: bool = False):
+    def __init__(self, dit_model, debug: 'Debug', compute_dtype: torch.dtype = torch.bfloat16, skip_conversion: bool = False):
         super().__init__()
         self.dit_model = dit_model
         self.debug = debug
+        self.compute_dtype = compute_dtype
         self.model_dtype = self._detect_model_dtype()
         self.is_fp8_model = self.model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         self.is_fp16_model = self.model_dtype == torch.float16
 
         # Only convert if not already done (e.g., when reusing cached weights)
         if not skip_conversion and self.is_fp8_model:
-            # Only FP8 models need RoPE frequency conversion
+            # FP8 models need RoPE frequency conversion to compute dtype
             model_variant = self._get_model_variant()
             self.debug.log(f"Detected NaDiT {model_variant} FP8 - Converting RoPE freqs for FP8 compatibility", 
-                          category="precision")
+                        category="precision")
             self.debug.start_timer("_convert_rope_freqs")
-            self._convert_rope_freqs()
+            self._convert_rope_freqs(target_dtype=self.compute_dtype)
             self.debug.end_timer("_convert_rope_freqs", "RoPE freqs conversion")
+            
             if torch.mps.is_available():
                 self.debug.log(f"Also converting NaDiT parameters/buffers for MPS backend", category="setup", force=True)
-                self.debug.start_timer("_force_nadit_bfloat16")
-                self._force_nadit_bfloat16()
-                self.debug.end_timer("_force_nadit_bfloat16", "NaDiT parameters/buffers conversion")
+                self.debug.start_timer("_force_nadit_precision")
+                self._force_nadit_precision(target_dtype=self.compute_dtype)
+                self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
             
         # Apply RoPE stabilization for numerical stability
         self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
@@ -232,52 +241,66 @@ class FP8CompatibleDiT(torch.nn.Module):
         else:
             return "Unknown"
         
-    def _convert_rope_freqs(self) -> None:
-        """Convert RoPE frequency buffers from FP8 to BFloat16 for compatibility"""
+    def _convert_rope_freqs(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
+        """
+        Convert RoPE frequency buffers from FP8 to target dtype for compatibility.
+        
+        Args:
+            target_dtype: Target dtype for RoPE freqs (default: bfloat16 for stability)
+        """
         converted = 0
         for module in self.dit_model.modules():
             if 'RotaryEmbedding' in type(module).__name__:
                 if hasattr(module, 'rope') and hasattr(module.rope, 'freqs'):
                     if module.rope.freqs.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                        if  module.rope.freqs.device.type == "mps":
-                            module.rope.freqs.data = module.rope.freqs.to("cpu").to(torch.bfloat16).to("mps")
+                        if module.rope.freqs.device.type == "mps":
+                            module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("mps")
                         else:
-                            module.rope.freqs.data = module.rope.freqs.to(torch.bfloat16)
+                            module.rope.freqs.data = module.rope.freqs.to(target_dtype)
                         converted += 1
-        self.debug.log(f"Converted {converted} RoPE frequency buffers from FP8 to BFloat16 for compatibility", category="success")
+        self.debug.log(f"Converted {converted} RoPE frequency buffers from FP8 to {target_dtype} for compatibility", category="success")
                         
-    def _force_nadit_bfloat16(self) -> None:
-        """🎯 Force ALL NaDiT parameters to BFloat16 to avoid promotion errors"""
+    def _force_nadit_precision(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
+        """
+        Force ALL NaDiT parameters to target dtype to avoid promotion errors (MPS requirement).
+        
+        Args:
+            target_dtype: Target dtype for all parameters (default: bfloat16 for MPS compatibility)
+        """
         converted_count = 0
         original_dtype = None
         
-        # Convert ALL parameters to BFloat16 (FP8, FP16, etc.)
+        # Convert ALL parameters to target dtype
         for name, param in self.dit_model.named_parameters():
             if original_dtype is None:
                 original_dtype = param.dtype
-            if param.dtype != torch.bfloat16:
+            if param.dtype != target_dtype:
                 if param.device.type == "mps":
-                    param_data = param.data.to("cpu").to(torch.bfloat16).to("mps")
+                    temp_cpu = param.data.to("cpu")
+                    temp_converted = temp_cpu.to(target_dtype)
+                    param.data = temp_converted.to("mps")
+                    del temp_cpu, temp_converted
                 else:
-                    param_data = param.data.to(torch.bfloat16)
-                param.data = param_data
+                    param.data = param.data.to(target_dtype)
                 converted_count += 1
                 
         # Also convert buffers
         for name, buffer in self.dit_model.named_buffers():
-            if buffer.dtype != torch.bfloat16:
-                if param.device.type == "mps":
-                    buffer_data = buffer.data.to("cpu").to(torch.bfloat16).to("mps")
+            if buffer.dtype != target_dtype:
+                if buffer.device.type == "mps":
+                    temp_cpu = buffer.data.to("cpu")
+                    temp_converted = temp_cpu.to(target_dtype)
+                    buffer.data = temp_converted.to("mps")
+                    del temp_cpu, temp_converted
                 else:
-                    buffer_data = buffer.data.to(torch.bfloat16)
-                buffer.data = buffer_data
+                    buffer.data = buffer.data.to(target_dtype)
                 converted_count += 1
         
-        self.debug.log(f"Converted {converted_count} NaDiT parameters/buffers for MPS", category="success")
+        self.debug.log(f"Converted {converted_count} NaDiT parameters/buffers to {target_dtype} for MPS", category="success")
         
         # Update detected dtype
-        self.model_dtype = torch.bfloat16
-        self.is_fp8_model = False  # Model is no longer FP8 after conversion
+        self.model_dtype = target_dtype
+        self.is_fp8_model = (target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2))
 
     def _stabilize_rope_computations(self):
         """
@@ -523,23 +546,25 @@ class FP8CompatibleDiT(torch.nn.Module):
             return module._original_forward(x, *args, **kwargs)
     
     def forward(self, *args, **kwargs):
-        """Forward pass with minimal dtype conversion overhead
+        """
+        Forward pass with minimal dtype conversion overhead
         
         Conversion strategy:
-        - FP16 models: Keep everything in FP16 (no conversion needed)
-        - FP8 models: Convert FP8 tensors to BFloat16 (required for arithmetic)
-        - BFloat16 models: No conversion needed
+            - FP16/BFloat16/Float32 models: Use native precision (no conversion needed)
+            - FP8 models: Convert FP8 tensors to compute_dtype for arithmetic operations
+            (FP8 parameters stay in FP8 for memory efficiency, only converted for computation)
         """
         
         # Only convert if we have an FP8 model for arithmetic operations 
         if self.is_fp8_model:
             fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+            target_dtype = self.compute_dtype
             
             # Convert args
             converted_args = []
             for arg in args:
                 if isinstance(arg, torch.Tensor) and arg.dtype in fp8_dtypes:
-                    converted_args.append(arg.to(torch.bfloat16))
+                    converted_args.append(arg.to(target_dtype))
                 else:
                     converted_args.append(arg)
             
@@ -547,7 +572,7 @@ class FP8CompatibleDiT(torch.nn.Module):
             converted_kwargs = {}
             for key, value in kwargs.items():
                 if isinstance(value, torch.Tensor) and value.dtype in fp8_dtypes:
-                    converted_kwargs[key] = value.to(torch.bfloat16)
+                    converted_kwargs[key] = value.to(target_dtype)
                 else:
                     converted_kwargs[key] = value
             
@@ -560,7 +585,7 @@ class FP8CompatibleDiT(torch.nn.Module):
         except Exception as e:
             self.debug.log(f"Forward pass error: {e}", level="ERROR", category="generation", force=True)
             if self.is_fp8_model:
-                self.debug.log(f"FP8 model - converted FP8 tensors to BFloat16", category="info", force=True)
+                self.debug.log(f"FP8 model - converted FP8 tensors to {self.compute_dtype}", category="info", force=True)
             else:
                 self.debug.log(f"{self.model_dtype} model - no conversion applied", category="info", force=True)
             raise

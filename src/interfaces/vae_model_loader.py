@@ -50,23 +50,23 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Device for VAE inference (encoding/decoding)"
                 ),
                 io.Boolean.Input("encode_tiled",
-                    default=False,
+                    default=True,
                     optional=True,
-                    tooltip="Enable tiled encoding to reduce VRAM during encoding"
+                    tooltip="Enable tiled encoding (ON by default to prevent noise artifacts at high resolution). Disable only for low-resolution inputs to improve speed."
                 ),
                 io.Int.Input("encode_tile_size",
-                    default=512,
+                    default=1024,
                     min=64,
                     step=32,
                     optional=True,
-                    tooltip="Size of encoding tiles in pixels. Smaller = less VRAM but more seams/artifacts and slower. Larger = more VRAM but better quality and faster."
+                    tooltip="Encoding tile size in pixels (default: 1024). Can be reduced if running out of memory, but increasing above 1024 is not recommended as it causes noise artifacts in the latent."
                 ),
                 io.Int.Input("encode_tile_overlap",
-                    default=64,
+                    default=128,
                     min=0,
                     step=32,
                     optional=True,
-                    tooltip="Pixel overlap between encoding tiles to reduce visible seams. Higher = better blending but slower processing."
+                    tooltip="Pixel overlap between encoding tiles to reduce visible seams (default: 128). Higher values improve blending at the cost of slower processing."
                 ),
                 io.Boolean.Input("decode_tiled",
                     default=False,
@@ -74,18 +74,18 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Enable tiled decoding to reduce VRAM during decoding"
                 ),
                 io.Int.Input("decode_tile_size",
-                    default=512,
+                    default=1024,
                     min=64,
                     step=32,
                     optional=True,
-                    tooltip="Size of decoding tiles in pixels. Smaller = less VRAM but more seams/artifacts and slower. Larger = more VRAM but better quality and faster."
+                    tooltip="Decoding tile size in pixels (default: 1024). Adjust based on available VRAM."
                 ),
                 io.Int.Input("decode_tile_overlap",
-                    default=64,
+                    default=128,
                     min=0,
                     step=32,
                     optional=True,
-                    tooltip="Pixel overlap between decoding tiles to reduce visible seams. Higher = better blending but slower processing."
+                    tooltip="Pixel overlap between decoding tiles to reduce visible seams (default: 128). Higher values improve blending at the cost of slower processing."
                 ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),

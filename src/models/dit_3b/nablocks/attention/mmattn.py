@@ -122,10 +122,11 @@ class NaMMAttention(nn.Module):
 
         concat, unconcat = cache("mm_pnp", lambda: na.concat_idx(vid_len, txt_len))
 
+        # Attention handles dtype conversion internally using pipeline compute_dtype
         attn = self.attn(
-            q=concat(vid_q, txt_q).bfloat16(),
-            k=concat(vid_k, txt_k).bfloat16(),
-            v=concat(vid_v, txt_v).bfloat16(),
+            q=concat(vid_q, txt_q),
+            k=concat(vid_k, txt_k),
+            v=concat(vid_v, txt_v),
             cu_seqlens_q=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
             cu_seqlens_k=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
             max_seqlen_q=cache("mm_maxlen", lambda: all_len.max()),
@@ -240,10 +241,11 @@ class NaSwinAttention(NaMMAttention):
             else:
                 vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
             
+        # Attention handles dtype conversion internally using pipeline compute_dtype
         out = self.attn(
-            q=concat_win(vid_q, txt_q).bfloat16(),
-            k=concat_win(vid_k, txt_k).bfloat16(),
-            v=concat_win(vid_v, txt_v).bfloat16(),
+            q=concat_win(vid_q, txt_q),
+            k=concat_win(vid_k, txt_k),
+            v=concat_win(vid_v, txt_v),
             cu_seqlens_q=cache_win(
                 "vid_seqlens_q", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
             ),

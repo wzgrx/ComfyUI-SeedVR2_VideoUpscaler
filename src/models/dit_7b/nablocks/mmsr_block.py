@@ -127,10 +127,11 @@ class NaSwinAttention(MMWindowAttention):
         if self.rope:
             vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
 
+        # Attention handles dtype conversion internally using pipeline compute_dtype
         out = self.attn(
-            q=concat_win(vid_q, txt_q).bfloat16(),
-            k=concat_win(vid_k, txt_k).bfloat16(),
-            v=concat_win(vid_v, txt_v).bfloat16(),
+            q=concat_win(vid_q, txt_q),
+            k=concat_win(vid_k, txt_k),
+            v=concat_win(vid_v, txt_v),
             cu_seqlens_q=cache_win(
                 "vid_seqlens_q", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
             ),

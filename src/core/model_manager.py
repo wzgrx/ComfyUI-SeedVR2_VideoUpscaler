@@ -509,6 +509,7 @@ def configure_runner(
     vae_model: str,
     base_cache_dir: str,
     debug: 'Debug',
+    ctx: Dict[str, Any],
     dit_cache: bool = False,
     vae_cache: bool = False,
     dit_id: Optional[int] = None,
@@ -534,6 +535,7 @@ def configure_runner(
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         base_cache_dir: Base directory containing model files
         debug: Debug instance for logging (required)
+        ctx: Generation context from setup_generation_context
         dit_cache: Whether to cache DiT model between runs
         vae_cache: Whether to cache VAE model between runs
         dit_id: Node instance ID for DiT model caching (required if dit_cache=True)
@@ -580,7 +582,7 @@ def configure_runner(
     
     # Phase 3: Configure runner settings
     _configure_runner_settings(
-        runner, 
+        runner, ctx,
         encode_tiled, encode_tile_size, encode_tile_overlap,
         decode_tiled, decode_tile_size, decode_tile_overlap,
         attention_mode,
@@ -799,6 +801,7 @@ def _create_new_runner(
 
 def _configure_runner_settings(
     runner: VideoDiffusionInfer,
+    ctx: Dict[str, Any],
     encode_tiled: bool,
     encode_tile_size: Optional[Tuple[int, int]],
     encode_tile_overlap: Optional[Tuple[int, int]],
@@ -821,6 +824,7 @@ def _configure_runner_settings(
     
     Args:
         runner: VideoDiffusionInfer instance to configure
+        ctx: Generation context from setup_generation_context
         encode_tiled: Enable tiled VAE encoding to reduce VRAM during encoding
         encode_tile_size: Tile dimensions (height, width) for encoding in pixels
         encode_tile_overlap: Overlap dimensions (height, width) between encoding tiles
@@ -856,6 +860,13 @@ def _configure_runner_settings(
         'decode_tile_overlap': decode_tile_overlap
     }
     
+    # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
+    runner._dit_device = ctx['dit_device']
+    runner._vae_device = ctx['vae_device']
+    runner._dit_offload_device = ctx['dit_offload_device']
+    runner._vae_offload_device = ctx['vae_offload_device']
+    runner._compute_dtype = ctx['compute_dtype']
+
     runner.debug = debug
 
 
@@ -1069,11 +1080,11 @@ def _setup_vae_model(
 
         runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
         
-        if torch.mps.is_available():
-            original_vae_dtype = runner.config.vae.dtype
-            runner.config.vae.dtype = "bfloat16"
-            debug.log(f"MPS detected: Setting VAE dtype from {original_vae_dtype} to {runner.config.vae.dtype} for compatibility", 
-                    category="precision", force=True)
+        # Set VAE dtype from runner's compute_dtype
+        compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+        vae_dtype_str = str(compute_dtype).split('.')[-1]
+        runner.config.vae.dtype = vae_dtype_str
+        runner._vae_dtype_override = compute_dtype
         
         vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
         runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
@@ -1439,8 +1450,6 @@ def prepare_model_structure(
     else:
         runner.vae = model  
         runner._vae_checkpoint = checkpoint_path
-        # Store VAE dtype override if needed
-        runner._vae_dtype_override = getattr(torch, config.vae.dtype) if torch.mps.is_available() else None
     
     return runner
 
@@ -1978,23 +1987,28 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
     """
     if is_dit:
         # DiT-specific
-        # Apply FP8 compatibility wrapper 
+        # Apply FP8 compatibility wrapper with compute_dtype
         if not isinstance(model, FP8CompatibleDiT):
             debug.log("Applying FP8/RoPE compatibility wrapper to DiT model", category="setup")
             debug.start_timer("FP8CompatibleDiT")
-            model = FP8CompatibleDiT(model, debug, skip_conversion=False)
+            # Get compute_dtype from runner if available, fallback to bfloat16
+            compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+            model = FP8CompatibleDiT(model, debug, compute_dtype=compute_dtype, skip_conversion=False)
             debug.end_timer("FP8CompatibleDiT", "FP8/RoPE compatibility wrapper application")
         else:
             debug.log("Reusing existing FP8/RoPE compatibility wrapper", category="reuse")
         
-        # Apply attention mode to all FlashAttentionVarlen modules
+        # Apply attention mode and compute_dtype to all FlashAttentionVarlen modules
         if hasattr(runner, '_dit_attention_mode'):
             requested_attention_mode = runner._dit_attention_mode or 'sdpa'
             
             # Validate and get final attention_mode (with warning if fallback needed)
             attention_mode = validate_flash_attention_availability(requested_attention_mode, debug)
             
-            debug.log(f"Applying {attention_mode} attention mode", category="setup")
+            # Get compute_dtype from runner
+            compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)            
+            debug.log(f"Applying {attention_mode} attention mode and {compute_dtype} compute dtype to model", category="setup")
+            
             # Get the actual model (unwrap if needed)
             actual_model = model.dit_model if hasattr(model, 'dit_model') else model
             
@@ -2003,10 +2017,11 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             for module in actual_model.modules():
                 if type(module).__name__ == 'FlashAttentionVarlen':
                     module.attention_mode = attention_mode
+                    module.compute_dtype = compute_dtype
                     updated_count += 1
             
             if updated_count > 0:
-                debug.log(f"Applied {attention_mode} to {updated_count} modules", category="success")
+                debug.log(f"Applied {attention_mode} and compute_dtype={compute_dtype} to {updated_count} modules", category="success")
 
         # Apply BlockSwap before torch.compile (only if not already active)
         # BlockSwap wraps forward methods, and torch.compile needs to capture the wrapped version

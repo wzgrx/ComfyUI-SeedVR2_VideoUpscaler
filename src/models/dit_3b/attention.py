@@ -120,15 +120,17 @@ class FlashAttentionVarlen(nn.Module):
     - Flash Attention: Uses @torch._dynamo.disable wrapper (C++ extension)
     """
 
-    def __init__(self, attention_mode: str = 'sdpa'):
+    def __init__(self, attention_mode: str = 'sdpa', compute_dtype: torch.dtype = None):
         """
         Initialize with specified attention backend.
         
         Args:
             attention_mode: 'flash_attn' or 'sdpa' (validated externally by validate_flash_attention_availability)
+            compute_dtype: Compute dtype for attention (set by pipeline, defaults to None for auto-detection)
         """
         super().__init__()
         self.attention_mode = attention_mode
+        self.compute_dtype = compute_dtype
 
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
@@ -140,6 +142,12 @@ class FlashAttentionVarlen(nn.Module):
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
+        
+        # Convert to pipeline compute_dtype if configured (handles FP8 → fp16/bf16)
+        if self.compute_dtype is not None and q.dtype != self.compute_dtype:
+            q = q.to(self.compute_dtype)
+            k = k.to(self.compute_dtype)
+            v = v.to(self.compute_dtype)
         
         if self.attention_mode == 'flash_attn':
             return _call_flash_attn_varlen_func(
