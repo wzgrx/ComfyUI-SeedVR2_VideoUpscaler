@@ -50,16 +50,16 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     tooltip="Device for VAE inference (encoding/decoding)"
                 ),
                 io.Boolean.Input("encode_tiled",
-                    default=True,
+                    default=False,
                     optional=True,
-                    tooltip="Enable tiled encoding (ON by default to prevent noise artifacts at high resolution). Disable only for low-resolution inputs to improve speed."
+                    tooltip="Enable tiled decoding to reduce VRAM during decoding"
                 ),
                 io.Int.Input("encode_tile_size",
                     default=1024,
                     min=64,
                     step=32,
                     optional=True,
-                    tooltip="Encoding tile size in pixels (default: 1024). Can be reduced if running out of memory, but increasing above 1024 is not recommended as it causes noise artifacts in the latent."
+                    tooltip="Encoding tile size in pixels (default: 1024). Adjust based on available VRAM."
                 ),
                 io.Int.Input("encode_tile_overlap",
                     default=128,
@@ -87,6 +87,12 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     optional=True,
                     tooltip="Pixel overlap between decoding tiles to reduce visible seams (default: 128). Higher values improve blending at the cost of slower processing."
                 ),
+                io.Combo.Input("tile_debug",
+                    options=["false", "encode", "decode"],
+                    default="false",
+                    optional=True,
+                    tooltip="Enable tile debug visualization: 'false' (no overlay), 'encode' (show encode tiles), 'decode' (show decode tiles). Only works when respective tiling is enabled."
+                ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="none",
@@ -113,7 +119,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      cache_model: bool = False, encode_tiled: bool = False,
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
-                     decode_tile_overlap: int = 64, torch_compile_args: Dict[str, Any] = None
+                     decode_tile_overlap: int = 64, tile_debug: str = "false",
+                     torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
         Create VAE model configuration for SeedVR2 main node
@@ -129,6 +136,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             decode_tiled: Enable tiled decoding
             decode_tile_size: Tile size for decoding
             decode_tile_overlap: Tile overlap for decoding
+            tile_debug: Tile visualization mode (false/encode/decode)
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -157,6 +165,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "decode_tiled": decode_tiled,
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
+            "tile_debug": tile_debug,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
         }

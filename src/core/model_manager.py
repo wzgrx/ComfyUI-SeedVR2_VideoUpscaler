@@ -521,6 +521,7 @@ def configure_runner(
     decode_tiled: bool = False,
     decode_tile_size: Optional[Tuple[int, int]] = None,
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
@@ -547,6 +548,7 @@ def configure_runner(
         decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
         decode_tile_size: Tile size for decoding (height, width)
         decode_tile_overlap: Tile overlap for decoding (height, width)
+        tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
@@ -585,7 +587,7 @@ def configure_runner(
         runner, ctx,
         encode_tiled, encode_tile_size, encode_tile_overlap,
         decode_tiled, decode_tile_size, decode_tile_overlap,
-        attention_mode,
+        tile_debug, attention_mode,
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
@@ -808,6 +810,7 @@ def _configure_runner_settings(
     decode_tiled: bool,
     decode_tile_size: Optional[Tuple[int, int]],
     decode_tile_overlap: Optional[Tuple[int, int]],
+    tile_debug: str,
     attention_mode: str,
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
@@ -831,6 +834,7 @@ def _configure_runner_settings(
         decode_tiled: Enable tiled VAE decoding to reduce VRAM during decoding
         decode_tile_size: Tile dimensions (height, width) for decoding in pixels
         decode_tile_overlap: Overlap dimensions (height, width) between decoding tiles
+        tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
@@ -844,6 +848,7 @@ def _configure_runner_settings(
     runner.decode_tiled = decode_tiled
     runner.decode_tile_size = decode_tile_size
     runner.decode_tile_overlap = decode_tile_overlap
+    runner.tile_debug = tile_debug
     
     # Store the new configs temporarily for later comparison
     # Don't set them as attributes yet - let the update functions handle that
@@ -1006,6 +1011,12 @@ def _setup_dit_model(
         return False
     elif not hasattr(runner, 'dit') or runner.dit is None:
         # Create new DiT model
+        # Set DiT dtype from runner's compute_dtype
+        compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+        dit_dtype_str = str(compute_dtype).split('.')[-1]
+        runner.config.dit.dtype = dit_dtype_str
+        runner._dit_dtype_override = compute_dtype
+        
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
                                         runner.config, debug, block_swap_config)
@@ -1080,7 +1091,7 @@ def _setup_vae_model(
 
         runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
         
-        # Set VAE dtype from runner's compute_dtype
+        # Set VAE dtype & tile_debug from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
         vae_dtype_str = str(compute_dtype).split('.')[-1]
         runner.config.vae.dtype = vae_dtype_str
@@ -1478,12 +1489,12 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
         model = runner.dit
         checkpoint_path = runner._dit_checkpoint
         block_swap_config = runner._dit_block_swap_config
-        override_dtype = None
+        override_dtype = getattr(runner, '_dit_dtype_override', None)
     else:
         model = runner.vae
         checkpoint_path = runner._vae_checkpoint
         block_swap_config = None
-        override_dtype = runner._vae_dtype_override
+        override_dtype = getattr(runner, '_vae_dtype_override', None)
     
     # Check if already materialized
     if model is None:
@@ -1535,6 +1546,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     # for configuration change detection on subsequent runs
     if is_dit:
         runner._dit_checkpoint = None
+        runner._dit_dtype_override = None
     else:
         runner._vae_checkpoint = None
         runner._vae_dtype_override = None

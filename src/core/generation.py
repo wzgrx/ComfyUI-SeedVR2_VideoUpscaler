@@ -62,6 +62,7 @@ from ..utils.constants import get_script_directory
 # Get script directory for embeddings
 script_directory = get_script_directory()
 
+
 def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Compose:
     """
     Prepare optimized video transformation pipeline
@@ -244,6 +245,115 @@ def cut_videos(videos: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def _draw_tile_boundaries(image: torch.Tensor, debug: 'Debug', tile_boundaries: list, phase: str) -> torch.Tensor:
+    """
+    Draw tile boundary overlays on all frames for debugging (non-destructive).
+    
+    Args:
+        image: Image tensor [T, H, W, C] or [H, W, C] in range [0, 1]
+        debug: Debug instance for logging
+        tile_boundaries: List of tile boundary info dictionaries
+        phase: Phase name ('encode' or 'decode') for logging
+        
+    Returns:
+        Image with boundary overlays drawn inside tiles on all frames
+    """
+    if not tile_boundaries:
+        return image
+
+    # Try to import required libraries
+    try:
+        import cv2
+        import numpy as np
+        import random
+        import colorsys
+    except ImportError as e:
+        debug.log(f"Tile debug ignored: missing imports ({e})", level="WARNING", category="video")
+        return image
+
+    # Handle both [T, H, W, C] and [H, W, C]
+    squeeze_t = False
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+        squeeze_t = True
+    
+    T, H, W, C = image.shape
+    original_dtype = image.dtype
+    
+    log_frames = f"all {T} frames" if T > 1 else "1 frame"
+    debug.log(f"Drawing {phase} tile boundaries ({len(tile_boundaries)} tiles) on {log_frames}", category="video", indent_level=1, force=True)
+
+    # Scale line thickness and font size based on video width
+    # Reference points: 512px (min) to 1920px (max)
+    min_width, max_width = 512, 1920
+    min_line_thickness, max_line_thickness = 2, 6
+    min_font_scale, max_font_scale = 0.8, 2.5
+    min_text_thickness, max_text_thickness = 2, 4
+    
+    # Calculate scale factor (clamped between 0 and 1)
+    scale_factor = max(0.0, min(1.0, (W - min_width) / (max_width - min_width)))
+    
+    # Apply scaling
+    line_thickness = int(min_line_thickness + scale_factor * (max_line_thickness - min_line_thickness))
+    font_scale = min_font_scale + scale_factor * (max_font_scale - min_font_scale)
+    text_thickness = int(min_text_thickness + scale_factor * (max_text_thickness - min_text_thickness))
+    
+    # Generate high-contrast colors using HSV color space
+    num_tiles = len(tile_boundaries)
+    colors = []
+    for i in range(num_tiles):
+        hue = (i * 360 / num_tiles) % 360
+        saturation = 0.9 + (i % 2) * 0.1
+        brightness = 0.8 + ((i // 2) % 2) * 0.2
+        r, g, b = colorsys.hsv_to_rgb(hue / 360, saturation, brightness)
+        colors.append((int(b * 255), int(g * 255), int(r * 255)))  # BGR for OpenCV
+    
+    random.seed(42)
+    random.shuffle(colors)
+    
+    # Process all frames
+    annotated_frames = []
+    for frame_idx in range(T):
+        # Convert frame to numpy (handle RGB and RGBA)
+        img = (image[frame_idx].float().cpu().numpy() * 255).astype(np.uint8)  # [H, W, C]
+        
+        # Draw boundary lines inside each tile
+        for idx, tile_info in enumerate(tile_boundaries):
+            tile_id = tile_info['id']
+            x, y = tile_info['x'], tile_info['y']
+            w, h = tile_info['w'], tile_info['h']
+            color = colors[idx]
+            
+            inset = line_thickness // 2
+            
+            # Draw four edges
+            cv2.line(img, (x, y + inset), (x + w, y + inset), color, line_thickness)
+            cv2.line(img, (x, y + h - inset), (x + w, y + h - inset), color, line_thickness)
+            cv2.line(img, (x + inset, y), (x + inset, y + h), color, line_thickness)
+            cv2.line(img, (x + w - inset, y), (x + w - inset, y + h), color, line_thickness)
+            
+            # Draw tile number
+            text = str(tile_id)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
+            margin = int(15 * scale_factor) if scale_factor > 0.5 else 8  # Scale margin too
+            text_x = x + margin
+            text_y = y + text_h + margin
+            cv2.putText(img, text, (text_x, text_y), font, font_scale, color, text_thickness, cv2.LINE_AA)
+        
+        # Convert back to tensor
+        frame_tensor = torch.from_numpy(img.astype(np.float32) / 255.0).to(device=image.device, dtype=original_dtype)
+        annotated_frames.append(frame_tensor)
+    
+    # Stack all frames
+    image = torch.stack(annotated_frames, dim=0)
+    
+    if squeeze_t:
+        image = image.squeeze(0)
+    
+    return image
+
+
 def check_interrupt(ctx: Dict[str, Any]) -> None:
     """Single interrupt check to avoid redundant imports"""
     if ctx.get('interrupt_fn') is not None:
@@ -394,7 +504,8 @@ def setup_generation_context(
             f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
             category="setup"
         )
-        debug.log(f"Unified compute dtype: torch.bfloat16 across entire pipeline for maximum compatibility", category="precision")
+        reason = "quality" if ctx["compute_dtype"] == torch.float32 else "compatibility"
+        debug.log(f"Unified compute dtype: {ctx["compute_dtype"]} across entire pipeline for maximum {reason}", category="precision")
     
     return ctx
 
@@ -416,6 +527,7 @@ def prepare_runner(
     decode_tiled: bool = False,
     decode_tile_size: Optional[Tuple[int, int]] = None,
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
+    tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
@@ -441,6 +553,7 @@ def prepare_runner(
         decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
         decode_tile_size: Tile size for decoding (height, width)
         decode_tile_overlap: Tile overlap for decoding (height, width)
+        tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa' or 'flash_attn')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
@@ -484,6 +597,7 @@ def prepare_runner(
         decode_tiled=decode_tiled,
         decode_tile_size=decode_tile_size,
         decode_tile_overlap=decode_tile_overlap,
+        tile_debug=tile_debug,
         attention_mode=attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
@@ -645,8 +759,14 @@ def encode_all_batches(
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
                           model_name="VAE", debug=debug, runner=runner)
         
-        debug.log_memory_state("After VAE loading", detailed_tensors=False)
+        debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
+
+        # Initialize tile_boundaries for encoding debug
+        if runner.tile_debug == "encode" and runner.encode_tiled:
+            debug.encode_tile_boundaries = []
+            debug.log("Tile debug enabled: collecting encode tile boundaries for visualization", category="vae")
         
+        # Process encoding
         for batch_idx in range(0, total_frames, step):
             check_interrupt(ctx)
             
@@ -851,7 +971,7 @@ def upscale_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cfg_scale: float = 7.5,
+    cfg_scale: float = 1,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
     cache_model: bool = False
@@ -961,7 +1081,7 @@ def upscale_all_batches(
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
                             model_name="DiT", debug=debug, runner=runner)
 
-        debug.log_memory_state("After DiT loading", detailed_tensors=False)
+        debug.log_memory_state("After DiT loading for upscaling", detailed_tensors=False)
 
         for batch_idx, latent in enumerate(ctx['all_latents']):
             if latent is None:
@@ -1011,10 +1131,24 @@ def upscale_all_batches(
             )
             conditions = [condition]
             
-            # Run inference
+            # Detect DiT model dtype (handle FP8CompatibleDiT wrapper)
+            dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
+            try:
+                dit_dtype = next(dit_model.parameters()).dtype
+            except StopIteration:
+                dit_dtype = ctx['compute_dtype']  # Fallback for meta device or empty model
+            
+            # Use autocast if DiT dtype differs from compute dtype
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
-                with torch.autocast(str(ctx['dit_device']), ctx['compute_dtype'], enabled=True):
+                if dit_dtype != ctx['compute_dtype']:
+                    with torch.autocast(str(ctx['dit_device']), ctx['compute_dtype'], enabled=True):
+                        upscaled_latents = runner.inference(
+                            noises=noises,
+                            conditions=conditions,
+                            **ctx['text_embeds'],
+                        )
+                else:
                     upscaled_latents = runner.inference(
                         noises=noises,
                         conditions=conditions,
@@ -1162,8 +1296,14 @@ def decode_all_batches(
         manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
                           model_name="VAE", debug=debug, runner=runner)
         
-        debug.log_memory_state("After VAE loading", detailed_tensors=False)
+        debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
+
+        # Initialize tile_boundaries for decoding debug
+        if runner.tile_debug == "decode" and runner.decode_tiled:
+            debug.decode_tile_boundaries = []
+            debug.log("Tile debug enabled: collecting decode tile boundaries for visualization", category="vae")
         
+        # Process decoding
         for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
             if upscaled_latent is None:
                 continue
@@ -1499,6 +1639,14 @@ def postprocess_all_batches(
                 else:
                     # RGB only: apply normalization as usual
                     sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
+                
+                # Draw tile boundaries for debugging (if tile info available)
+                for phase, attr in [('encode', 'encode_tile_boundaries'), ('decode', 'decode_tile_boundaries')]:
+                    tiles = getattr(debug, attr, None)
+                    if tiles:
+                        sample = _draw_tile_boundaries(sample, debug, tiles, phase)
+                        setattr(debug, attr, [])
+                        break
                 
                 # Move to tensor_offload_device if specified
                 if ctx['tensor_offload_device'] is not None:

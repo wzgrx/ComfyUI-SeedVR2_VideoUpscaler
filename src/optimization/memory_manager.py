@@ -1052,7 +1052,11 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         if hasattr(runner, '_dit_attention_mode'):
             delattr(runner, '_dit_attention_mode')
     
-    # 5. Clear DiT-related components and temporary attributes
+    # 5. Clear DiT temporary attributes (should be already cleared in materialize_model)
+    runner._dit_checkpoint = None
+    runner._dit_dtype_override = None
+    
+    # 6. Clear DiT-related components and temporary attributes
     runner.sampler = None
     runner.sampling_timesteps = None
     runner.schedule = None
@@ -1107,10 +1111,13 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         if debug:
             debug.log("VAE model deleted", category="cleanup")
         
-        # Clear VAE-related temporary attributes that are not needed when caching is disabled
-        runner._vae_compile_args = None
+        # Clear VAE config attributes - not needed when model is not cached (will be recreated)
+        if hasattr(runner, '_vae_compile_args'):
+            delattr(runner, '_vae_compile_args')
+        if hasattr(runner, '_vae_tiling_config'):
+            delattr(runner, '_vae_tiling_config')
     
-    # 3. Clear VAE temporary attributes
+    # 3. Clear VAE temporary attributes (should be already cleared in materialize_model)
     runner._vae_checkpoint = None
     runner._vae_dtype_override = None
 

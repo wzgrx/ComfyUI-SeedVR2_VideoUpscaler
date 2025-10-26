@@ -990,8 +990,6 @@ class Decoder3D(nn.Module):
 
         sample = self.conv_in(sample, memory_state=memory_state)
 
-        #upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
-        upscale_dtype = sample.dtype
         if self.training and self.gradient_checkpointing:
 
             def create_custom_forward(module):
@@ -1002,7 +1000,6 @@ class Decoder3D(nn.Module):
 
             if is_torch_version(">=", "1.11.0"):
                 sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
-                sample = sample.to(upscale_dtype)
 
                 # up
                 for up_block in self.up_blocks:
@@ -1016,7 +1013,6 @@ class Decoder3D(nn.Module):
             else:
                 # middle
                 sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
-                sample = sample.to(upscale_dtype)
 
                 # up
                 for up_block in self.up_blocks:
@@ -1026,7 +1022,6 @@ class Decoder3D(nn.Module):
         else:
             # middle
             sample = self.mid_block(sample, latent_embeds, memory_state=memory_state)
-            sample = sample.to(upscale_dtype)
 
             # up
             for up_block in self.up_blocks:
@@ -1373,6 +1368,17 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 x_out_end = min(x_lat_end * scale_factor, W)
 
                 tile_id += 1
+
+                # Store tile boundary info for debug visualization
+                if self.debug and hasattr(self.debug, 'encode_tile_boundaries'):
+                    self.debug.encode_tile_boundaries.append({
+                        'id': tile_id,
+                        'y': y_out,
+                        'x': x_out,
+                        'h': y_out_end - y_out,
+                        'w': x_out_end - x_out
+                    })
+
                 tile_sample = x[:, :, :, y_out:y_out_end, x_out:x_out_end]
 
                 # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
@@ -1380,10 +1386,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     if tile_id == num_tiles:
                         # Only log final tile if not covered by previous range
                         if (tile_id - 1) % 5 == 0:
-                            self.debug.log(f"Encoding tile {tile_id} / {num_tiles}", category="vae")
+                            self.debug.log(f"Encoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
                     else:
                         end_tile = min(tile_id + 4, num_tiles)
-                        self.debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae")
+                        self.debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
                 encoded_tile = self.slicing_encode(tile_sample)
 
@@ -1502,6 +1508,22 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     continue
 
                 tile_id += 1
+                
+                # Store tile boundary info for debug visualization
+                if self.debug and hasattr(self.debug, 'decode_tile_boundaries'):
+                    # Map to output space
+                    y_out = y_lat * scale_factor
+                    x_out = x_lat * scale_factor
+                    y_out_end = y_lat_end * scale_factor
+                    x_out_end = x_lat_end * scale_factor
+                    self.debug.decode_tile_boundaries.append({
+                        'id': tile_id,
+                        'y': y_out,
+                        'x': x_out,
+                        'h': y_out_end - y_out,
+                        'w': x_out_end - x_out
+                    })
+                
                 tile_latent = z[:, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
 
                 # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
@@ -1509,10 +1531,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     if tile_id == num_tiles:
                         # Only log final tile if not covered by previous range
                         if (tile_id - 1) % 5 == 0:
-                            self.debug.log(f"Decoding tile {tile_id} / {num_tiles}", category="vae")
+                            self.debug.log(f"Decoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
                     else:
                         end_tile = min(tile_id + 4, num_tiles)
-                        self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae")
+                        self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
                 decoded_tile = self.slicing_decode(tile_latent)
 
@@ -1621,7 +1643,8 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
             x = x.unsqueeze(2)
         p = super().encode(x, return_dict=return_dict, tiled=tiled, tile_size=tile_size,
                           tile_overlap=tile_overlap).latent_dist
-        z = p.sample().squeeze(2)
+        # Use deterministic mode for tiled encoding to avoid artifacts
+        z = p.mode().squeeze(2)
         return CausalEncoderOutput(z, p)
 
     def decode(self, z: torch.Tensor, return_dict: bool = True, 

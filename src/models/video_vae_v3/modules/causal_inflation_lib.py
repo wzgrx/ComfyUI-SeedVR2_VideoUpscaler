@@ -344,21 +344,20 @@ def init_causal_conv3d(
 
 
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    input_dtype = x.dtype
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
             x = rearrange(x, "b c h w -> b h w c")
             x = norm_layer(x)
             x = rearrange(x, "b h w c -> b c h w")
-            return x.to(input_dtype)
+            return x
         if x.ndim == 5:
             x = rearrange(x, "b c t h w -> b t h w c")
             x = norm_layer(x)
             x = rearrange(x, "b t h w c -> b c t h w")
-            return x.to(input_dtype)
+            return x
     if isinstance(norm_layer, (nn.GroupNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
         if x.ndim <= 4:
-            return norm_layer(x).to(input_dtype)
+            return norm_layer(x)
         if x.ndim == 5:
             t = x.size(2)
             x = rearrange(x, "b c t h w -> (b t) c h w")
@@ -381,7 +380,7 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                         debug=getattr(norm_layer, 'debug', None),
                         operation_name=f"GroupNorm.chunk_{i}"
                     )
-                    x[i] = x[i].to(input_dtype)
+                    x[i] = x[i]
                 
                 x = retry_on_oom(
                     torch.cat,
@@ -398,7 +397,7 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
                     operation_name="GroupNorm.direct"
                 )
             x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
-            return x.to(input_dtype)
+            return x
     raise NotImplementedError
 
 
