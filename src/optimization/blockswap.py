@@ -798,7 +798,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
         debug.log(f"Restored {len(model._rope_patches)} RoPE methods", category="success")
         delattr(model, '_rope_patches')
 
-    # 3. Restore I/O component forward methods
+    # 3. Restore I/O component forward methods and move to offload device
     if hasattr(model, '_io_swappers'):
         for module, module_name in model._io_swappers:
             if hasattr(module, '_original_forward'):
@@ -810,6 +810,17 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
                         delattr(module, attr)
         debug.log(f"Restored {len(model._io_swappers)} I/O components", category="success")
         delattr(model, '_io_swappers')
+    
+    # Move all IO components to offload device during full cleanup
+    if hasattr(model, 'offload_device'):
+        offload_device = model.offload_device
+        moved_count = 0
+        for name, module in model.named_children():
+            if name != "blocks":
+                module.to(offload_device)
+                moved_count += 1
+        if moved_count > 0:
+            debug.log(f"Moved {moved_count} IO components to offload device", category="success")
 
     # 4. Restore original .to() method
     if hasattr(model, '_original_to'):

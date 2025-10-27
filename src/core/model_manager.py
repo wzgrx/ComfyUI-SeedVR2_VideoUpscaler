@@ -1012,10 +1012,10 @@ def _setup_dit_model(
     elif not hasattr(runner, 'dit') or runner.dit is None:
         # Create new DiT model
         # Set DiT dtype from runner's compute_dtype
-        compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
-        dit_dtype_str = str(compute_dtype).split('.')[-1]
-        runner.config.dit.dtype = dit_dtype_str
-        runner._dit_dtype_override = compute_dtype
+        # compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+        # dit_dtype_str = str(compute_dtype).split('.')[-1]
+        # runner.config.dit.dtype = dit_dtype_str
+        # runner._dit_dtype_override = compute_dtype
         
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
@@ -1091,7 +1091,7 @@ def _setup_vae_model(
 
         runner.config.vae.model = OmegaConf.merge(runner.config.vae.model, vae_config)
         
-        # Set VAE dtype & tile_debug from runner's compute_dtype
+        # Set VAE dtype from runner's compute_dtype
         compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
         vae_dtype_str = str(compute_dtype).split('.')[-1]
         runner.config.vae.dtype = vae_dtype_str
@@ -1506,28 +1506,18 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
         return
     
     # Determine target device for materialization
-    # For DiT with BlockSwap, materialize to offload device (blocks distributed later)
-    # For VAE or DiT without BlockSwap, materialize to inference device
-    offload_reason = ""
-    if is_dit:        
-        # Check if BlockSwap config exists and is enabled
-        blockswap_enabled = (
-            hasattr(runner, '_dit_block_swap_config') and 
-            is_blockswap_enabled(runner._dit_block_swap_config)
-        )
-        
-        if blockswap_enabled:
-            # BlockSwap: materialize to offload device, blocks will be distributed later
-            target_device = runner._dit_block_swap_config.get("offload_device")
-            if target_device is None:
-                target_device = torch.device("cpu")
-            offload_reason = f" (BlockSwap offload device)"
-        else:
-            # No BlockSwap: materialize directly to inference device
-            target_device = device
+    offload_device_str = None
+    if hasattr(runner, f'_{model_type}_offload_device'):
+        offload_device_str = getattr(runner, f'_{model_type}_offload_device')
+
+    # If offload_device is set and not "none", materialize to offload device
+    if offload_device_str and offload_device_str != "none":
+        target_device = torch.device(offload_device_str)
+        offload_reason = " (offload device)"
     else:
-        # VAE: always materialize to inference device
+        # Otherwise materialize to inference device
         target_device = device
+        offload_reason = ""
     
     # Start materialization
     debug.start_timer(f"{model_type}_materialize")
