@@ -971,7 +971,6 @@ def upscale_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cfg_scale: float = 1,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
     cache_model: bool = False
@@ -987,7 +986,6 @@ def upscale_all_batches(
         ctx: Context from encode_all_batches containing latents (required)
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
-        cfg_scale: Classifier-free guidance scale (default: 1.0)
         seed: Random seed for reproducible generation
         latent_noise_scale: Noise scale for latent space augmentation (0.0-1.0).
                            Adds noise during diffusion conditioning. Can soften details
@@ -1024,7 +1022,8 @@ def upscale_all_batches(
         debug.log("Loaded text embeddings for DiT", category="dit")
     
     # Configure diffusion parameters
-    runner.config.diffusion.cfg.scale = cfg_scale
+    # Force cfg_scale = 1.0 for one-step distilled models (CFG is incompatible with distillation)
+    runner.config.diffusion.cfg.scale = 1.0
     runner.config.diffusion.cfg.rescale = 0.0
     runner.config.diffusion.timesteps.sampling.steps = 1
     runner.configure_diffusion(device=ctx['dit_device'], dtype=ctx['compute_dtype'])
@@ -1075,7 +1074,7 @@ def upscale_all_batches(
         # Set base seed for DiT noise generation
         # Ensures deterministic noise across all batches in this upscaling phase
         set_seed(seed)
-        debug.log(f"Using seed: {seed}, CFG scale: {cfg_scale}", category="dit")
+        debug.log(f"Using seed: {seed}", category="dit")
         
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 

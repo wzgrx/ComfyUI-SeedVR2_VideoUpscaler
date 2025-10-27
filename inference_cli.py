@@ -386,7 +386,6 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         ctx=ctx,
         debug=worker_debug,
         progress_callback=None,
-        cfg_scale=shared_args["cfg_scale"],
         seed=shared_args["seed"],
         latent_noise_scale=shared_args["latent_noise_scale"],
         cache_model=False # No caching in CLI
@@ -456,7 +455,6 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "input_noise_scale": args.input_noise_scale,
         "latent_noise_scale": args.latent_noise_scale,
         "debug": args.debug,
-        "cfg_scale": args.cfg_scale,
         "seed": args.seed,
         "res_w": args.resolution,
         "batch_size": args.batch_size,
@@ -587,8 +585,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--color_correction", type=str, default="lab", 
                     choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
                     help="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)")
-    parser.add_argument("--cfg_scale", type=float, default=1.0,
-                        help="Classifier-free guidance scale. 1.0 = default upscaling strength. <1.0 = reduced upscaling effect. >1.0 = increased upscaling effect. (default: 1.0)")
     parser.add_argument("--input_noise_scale", type=float, default=0.0,
                         help="Input noise scale (0.0-1.0) to reduce artifacts at high resolutions. (default: 0.0)")
     parser.add_argument("--latent_noise_scale", type=float, default=0.0,
