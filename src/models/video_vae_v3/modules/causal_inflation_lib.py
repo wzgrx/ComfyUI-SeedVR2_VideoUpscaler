@@ -26,7 +26,7 @@ from .context_parallel_lib import cache_send_recv, get_cache_size
 from .global_config import get_norm_limit
 from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
-from ....optimization.memory_manager import clear_memory, retry_on_oom
+from ....optimization.memory_manager import retry_on_oom
 from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
 
 # Single GPU inference - no distributed processing needed

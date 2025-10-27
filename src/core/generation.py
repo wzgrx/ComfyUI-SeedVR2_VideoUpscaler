@@ -39,7 +39,6 @@ from ..optimization.memory_manager import (
     cleanup_dit,
     cleanup_vae,
     cleanup_text_embeddings,
-    clear_memory,
     manage_tensor,
     manage_model_device,
     release_tensor_memory,
@@ -1282,8 +1281,6 @@ def upscale_all_batches(
         
         # Cleanup text embeddings as they're no longer needed after upscaling
         cleanup_text_embeddings(ctx, debug)
-        
-        clear_memory(debug=debug, deep=True, force=True, timer_name="upscale_all_batches_finally")
     
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
@@ -1818,9 +1815,6 @@ def postprocess_all_batches(
             del ctx['all_ori_lengths']
         if 'true_target_dims' in ctx:
             del ctx['true_target_dims']
-        
-        # 5. Final deep memory clear
-        clear_memory(debug=debug, deep=True, force=True, timer_name="final_memory_clear")
         
     debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
     debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)

@@ -18,7 +18,6 @@ import torch
 import weakref
 
 from typing import Dict, Any, List, Optional
-from .memory_manager import clear_memory
 from .compatibility import call_rope_with_stability
 from ..common.distributed import get_device
 
@@ -443,9 +442,6 @@ def _wrap_block_forward(
             
             # Use dynamo-disabled helper to log timing (avoids compilation warnings)
             _log_swap_timing(debug, t_start, self._block_idx, "block")
-
-            # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=True, force=False, timer_name=f"blockswap_block_{self._block_idx}")
         else:
             output = original_forward(*args, **kwargs)
 
@@ -522,9 +518,6 @@ def _wrap_io_forward(
         
         # Use dynamo-disabled helper to log timing (avoids compilation warnings)
         _log_swap_timing(debug, t_start, self._module_name, "I/O")
-
-        # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=True, force=False, timer_name=f"blockswap_io_{self._module_name}")
 
         return output
     

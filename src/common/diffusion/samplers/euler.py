@@ -21,7 +21,6 @@ from typing import Callable
 import torch
 from einops import rearrange
 from torch.nn import functional as F
-from ....optimization.memory_manager import clear_memory
 
 from ..types import PredictionType
 from ..utils import expand_dims

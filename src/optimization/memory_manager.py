@@ -1012,23 +1012,25 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             if hasattr(actual_obj, attr):
                 delattr(actual_obj, attr)
     
-    # 2. Handle model movement/cleanup based on caching preference
-    if cache_model:
-        # Check if model is on meta device
-        try:
-            param_device = next(runner.dit.parameters()).device
-            if param_device.type != 'meta':
-                # Only move if not on meta device
-                offload_target = getattr(runner, '_dit_offload_device', None)
-                if offload_target is not None:
-                    manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
-                                       debug=debug, reason="model caching", runner=runner)
-                elif debug:
-                    debug.log("No DiT offload device configured - skipping offload", category="cleanup")
-            elif debug:
-                debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
-        except StopIteration:
-            pass
+    # 2. Handle model offloading (for caching or before deletion)
+    try:
+        param_device = next(runner.dit.parameters()).device
+        
+        # Move model off GPU if needed
+        if param_device.type not in ['meta', 'cpu']:
+            # Get offload target - default to 'cpu' if not configured or set to 'none'
+            offload_target = getattr(runner, '_dit_offload_device', None)
+            if offload_target is None or offload_target == 'none':
+                offload_target = 'cpu'
+            
+            # Move model off GPU (either for caching or before deletion)
+            reason = "model caching" if cache_model else "releasing GPU memory"
+            manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
+                               debug=debug, reason=reason, runner=runner)
+        elif param_device.type == 'meta' and debug:
+            debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
+    except StopIteration:
+        pass
     
     # 3. Clean BlockSwap after model movement
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
@@ -1038,7 +1040,6 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
     
     # 4. Complete cleanup if not caching
     if not cache_model:
-        # Full cleanup - release memory and delete
         release_model_memory(model=runner.dit, debug=debug)
         runner.dit = None
         if debug:
@@ -1087,25 +1088,28 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             if hasattr(runner.vae, attr):
                 delattr(runner.vae, attr)
     
-    # 2. Handle VAE model based on caching preference
-    if cache_model:
-        # Check if model is on meta device
-        try:
-            param_device = next(runner.vae.parameters()).device
-            if param_device.type != 'meta':
-                # Only move if not on meta device
-                offload_target = getattr(runner, '_vae_offload_device', None)
-                if offload_target is not None:
-                    manage_model_device(model=runner.vae, target_device=offload_target, model_name="VAE", 
-                                   debug=debug, reason="model caching", runner=runner)
-                elif debug:
-                    debug.log("No VAE offload device configured - skipping offload", category="cleanup")
-            elif debug:
-                debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
-        except StopIteration:
-            pass
-    else:
-        # Full cleanup - release memory and delete
+    # 2. Handle model offloading (for caching or before deletion)
+    try:
+        param_device = next(runner.vae.parameters()).device
+        
+        # Move model off GPU if needed
+        if param_device.type not in ['meta', 'cpu']:
+            # Get offload target - default to 'cpu' if not configured or set to 'none'
+            offload_target = getattr(runner, '_vae_offload_device', None)
+            if offload_target is None or offload_target == 'none':
+                offload_target = 'cpu'
+            
+            # Move model off GPU (either for caching or before deletion)
+            reason = "model caching" if cache_model else "releasing GPU memory"
+            manage_model_device(model=runner.vae, target_device=offload_target, model_name="VAE", 
+                               debug=debug, reason=reason, runner=runner)
+        elif param_device.type == 'meta' and debug:
+            debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
+    except StopIteration:
+        pass
+    
+    # 3. Complete cleanup if not caching
+    if not cache_model:
         release_model_memory(model=runner.vae, debug=debug)
         runner.vae = None
         if debug:
