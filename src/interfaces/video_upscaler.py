@@ -74,10 +74,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     tooltip="Random seed for generation. Same seed = same output."
                 ),
                 io.Int.Input("new_resolution",
-                    default=1072,
+                    default=1080,
                     min=16,
                     max=16384,
-                    step=16,
+                    step=2,
                     tooltip="Target resolution for the shortest edge. Maintains aspect ratio."
                 ),
                 io.Int.Input("batch_size",
@@ -363,15 +363,22 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
             ctx['total_frames'] = total_frames
             
-            # Create transform pipeline early and apply to first frame to get exact output dimensions
-            setup_video_transform(ctx, new_resolution, debug)
+            # Setup transform and compute dimensions
             sample_frame = pixels[0].permute(2, 0, 1).unsqueeze(0)
-            transformed_sample = ctx['video_transform'](sample_frame)
-            output_h, output_w = transformed_sample.shape[-2:]
+            true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, debug, sample_frame)
             
-            debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {output_w}x{output_h}px, Channels: {channels_info}", category="generation", force=True, indent_level=1)
+            # Log dimension flow with full context
+            if true_h > 0:
+                if true_h == padded_h and true_w == padded_w:
+                    debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {true_w}x{true_h}px, Channels: {channels_info}", 
+                             category="generation", force=True, indent_level=1)
+                else:
+                    debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Final: {true_w}x{true_h}px, Channels: {channels_info}", 
+                             category="generation", force=True, indent_level=1)
+            
             debug.log(f"Batch size: {batch_size}, Seed: {seed}", category="generation", force=True, indent_level=1)
-
+            del sample_frame
+            
             # Phase 1: Encode
             ctx = encode_all_batches(
                 runner,

@@ -565,8 +565,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Path to input video file")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for generation (default: 42)")
-    parser.add_argument("--resolution", type=int, default=1072,
-                        help="Target resolution of the short side (default: 1072)")
+    parser.add_argument("--resolution", type=int, default=1080,
+                        help="Target resolution of the short side (default: 1080)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
     parser.add_argument("--model", type=str, default=DEFAULT_DIT,

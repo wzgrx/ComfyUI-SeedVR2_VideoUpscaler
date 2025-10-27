@@ -33,7 +33,7 @@ from .infer import VideoDiffusionInfer
 from .model_manager import configure_runner, materialize_model, apply_model_specific_config
 from ..common.seed import set_seed
 from ..common.half_precision_fixes import ensure_float32_precision
-from ..data.image.transforms.divisible_crop import DivisibleCrop
+from ..data.image.transforms.divisible_crop import DivisiblePad
 from ..data.image.transforms.na_resize import NaResize
 from ..optimization.memory_manager import (
     cleanup_dit,
@@ -76,11 +76,13 @@ def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Com
         
     Features:
         - Resolution-aware upscaling (no downsampling)
+        - Padding to divisible by 16 (no data loss)
         - Proper normalization for model compatibility
         - Memory-efficient tensor operations
     """
     if debug:
-        debug.log(f"Initializing video transformation pipeline for {res_w}px", category="setup")
+        debug.log(f"Initializing video transformation pipeline for {res_w}px",
+                 category="setup", indent_level=1)
     
     return Compose([
         NaResize(
@@ -90,27 +92,80 @@ def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Com
             downsample_only=False,
         ),
         Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
-        DivisibleCrop((16, 16)),
+        DivisiblePad((16, 16)),
         Normalize(0.5, 0.5),
         Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w (faster than Rearrange)
     ])
 
 
-def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debug'] = None) -> None:
+def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debug'] = None, 
+                         sample_frame: Optional[torch.Tensor] = None) -> Tuple[int, int, int, int]:
     """
-    Setup video transformation pipeline in context with consistent timing and logging.
+    Setup video transformation pipeline and compute target dimensions.
     
     Args:
         ctx: Generation context dictionary
-        res_w: Target resolution width
-        debug: Debug instance
+        res_w: Target resolution for shortest edge
+        debug: Debug instance for logging
+        sample_frame: Optional sample frame tensor (C, H, W) to compute dimensions
+        
+    Returns:
+        (true_height, true_width, padded_height, padded_width) if dimensions computed,
+        (0, 0, 0, 0) otherwise
     """
-    if ctx.get('video_transform') is None:
-        debug.start_timer("video_transform")
-        ctx['video_transform'] = prepare_video_transforms(res_w, debug)
-        debug.end_timer("video_transform", "Video transform pipeline initialization")
-    else:
-        debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
+    # Check if transform exists AND is not None
+    existing_transform = ctx.get('video_transform')
+    
+    if existing_transform is not None:
+        # Transform exists - check if we need to compute dimensions
+        if 'true_target_dims' in ctx and sample_frame is not None:
+            # Return cached dimensions + recompute padded from sample
+            true_h, true_w = ctx['true_target_dims']
+            transformed = existing_transform(sample_frame)
+            padded_h, padded_w = transformed.shape[-2:]
+            if debug:
+                debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
+            return true_h, true_w, padded_h, padded_w
+        elif debug:
+            debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
+        return 0, 0, 0, 0
+    
+    # Create transformation pipeline (first time or after cleanup)
+    ctx['video_transform'] = prepare_video_transforms(res_w, debug)
+    
+    # Compute dimensions if sample frame provided
+    if sample_frame is not None:
+        # Get true target size (after resize, before padding)
+        temp_transform = Compose([
+            NaResize(resolution=res_w, mode="side", downsample_only=False),
+            Lambda(lambda x: torch.clamp(x, 0.0, 1.0))
+        ])
+        resized_sample = temp_transform(sample_frame)
+        true_h, true_w = resized_sample.shape[-2:]
+        
+        # Round to even numbers for video codec compatibility (libx264 requirement)
+        true_h = (true_h // 2) * 2
+        true_w = (true_w // 2) * 2
+        
+        # Cache for later use in trimming
+        ctx['true_target_dims'] = (true_h, true_w)
+        
+        # Get padded dimensions
+        transformed_sample = ctx['video_transform'](sample_frame)
+        padded_h, padded_w = transformed_sample.shape[-2:]
+        
+        if debug:
+            if true_h == padded_h and true_w == padded_w:
+                debug.log(f"Target dimensions: {true_w}x{true_h} (no padding needed)", 
+                         category="setup", indent_level=1)
+            else:
+                debug.log(f"Target dimensions: {true_w}x{true_h} (padded to {padded_w}x{padded_h} for processing)", 
+                         category="setup", indent_level=1)
+        
+        del temp_transform, resized_sample, transformed_sample
+        return true_h, true_w, padded_h, padded_w
+    
+    return 0, 0, 0, 0
 
 
 def load_text_embeddings(script_directory: str, device: torch.device, 
@@ -677,8 +732,13 @@ def encode_all_batches(
     if total_frames == 0:
         raise ValueError("No frames to process")
     
-    # Setup video transformation pipeline if not already done
-    setup_video_transform(ctx, res_w, debug)
+    # Setup video transformation pipeline and compute dimensions if not already done
+    if 'true_target_dims' not in ctx:
+        sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
+        setup_video_transform(ctx, res_w, debug, sample_frame)
+        del sample_frame
+    else:
+        setup_video_transform(ctx, res_w, debug)
     
     # Detect if input is RGBA (4 channels)
     ctx['is_rgba'] = images[0].shape[-1] == 4
@@ -1552,11 +1612,25 @@ def postprocess_all_batches(
                         # Convert transformed video from C T H W to T C H W format
                         input_video = optimized_single_video_rearrange(transformed_video)
                 
-                # Trim both sample and input_video to original length if necessary (handles padding)
+                # Trim both sample and input_video to original length if necessary (handles temporal padding)
                 if ori_length < sample.shape[0]:
                     sample = sample[:ori_length]
                     if input_video is not None:
                         input_video = input_video[:ori_length]
+                
+                # Trim spatial dimensions to true target size (removes divisible padding)
+                if 'true_target_dims' in ctx:
+                    true_h, true_w = ctx['true_target_dims']
+                    current_h, current_w = sample.shape[-2:]
+                    
+                    if current_h != true_h or current_w != true_w:
+                        debug.log(f"Trimming spatial padding: {current_w}x{current_h} → {true_w}x{true_h}", 
+                                category="video", indent_level=1)
+                        
+                        # Trim from bottom-right to match padding location
+                        sample = sample[:, :, :true_h, :true_w]
+                        if input_video is not None:
+                            input_video = input_video[:, :, :true_h, :true_w]
                 
                 # Apply color correction if enabled (RGB only)
                 if color_correction != "none" and input_video is not None:
@@ -1719,7 +1793,7 @@ def postprocess_all_batches(
             del ctx['batch_samples']
         
         # 2. Clean up video transform caches
-        if ctx.get('video_transform'):
+        if 'video_transform' in ctx and ctx['video_transform'] is not None:
             if hasattr(ctx['video_transform'], 'transforms'):
                 for transform in ctx['video_transform'].transforms:
                     # Clear cache attributes
@@ -1730,7 +1804,6 @@ def postprocess_all_batches(
                     if hasattr(transform, '__dict__'):
                         transform.__dict__.clear()
             del ctx['video_transform']
-            ctx['video_transform'] = None
         
         # 3. Clean up storage lists (all_latents, all_alpha_channels, etc.)
         tensor_storage_keys = ['all_latents', 'all_transformed_videos', 
@@ -1743,6 +1816,8 @@ def postprocess_all_batches(
         # 4. Clean up non-tensor storage
         if 'all_ori_lengths' in ctx:
             del ctx['all_ori_lengths']
+        if 'true_target_dims' in ctx:
+            del ctx['true_target_dims']
         
         # 5. Final deep memory clear
         clear_memory(debug=debug, deep=True, force=True, timer_name="final_memory_clear")
