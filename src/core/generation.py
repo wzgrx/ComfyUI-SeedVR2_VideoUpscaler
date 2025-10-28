@@ -167,6 +167,93 @@ def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debu
     return 0, 0, 0, 0
 
 
+def prepend_video_frames(frames: torch.Tensor, prepend_count: int, debug: Optional['Debug'] = None) -> torch.Tensor:
+    """
+    Prepend reversed frames to the video to help prevent artifacts at the start of the video.
+
+    Args:
+        frames: Input video tensor [T, H, W, C]
+        prepend_count: Number of frames to prepend
+        debug: Optional debug instance for logging
+        
+    Returns:
+        torch.Tensor: Video with prepended frames [T+prepend_count, H, W, C]
+    """
+    if prepend_count <= 0:
+        return frames
+    
+    if len(frames) == 0:
+        raise ValueError("Cannot prepend frames to empty video tensor")
+    
+    if debug:
+        debug.log(f"Prepending {prepend_count} reversed frames to help prevent artifacts at the start of the video", category="video", indent_level=1)
+    
+    # If prepend_count >= total frames, repeat last frame to fill gap
+    if prepend_count >= len(frames):
+        repeat_count = prepend_count - len(frames) + 1
+        repeated_frames = frames[-1:].repeat(repeat_count, 1, 1, 1)
+        # Reverse all frames except first (PyTorch-compatible)
+        reversed_frames = frames[1:].flip(0)
+        return torch.cat([repeated_frames, reversed_frames, frames], dim=0)
+    
+    # Normal case: reverse frames from index 1 to prepend_count (inclusive)
+    # frames[1:prepend_count+1] selects the range, then .flip(0) reverses it
+    reversed_frames = frames[1:prepend_count+1].flip(0)
+    return torch.cat([reversed_frames, frames], dim=0)
+
+
+def remove_prepended_frames(frames: torch.Tensor, prepend_count: int, debug: Optional['Debug'] = None) -> torch.Tensor:
+    """
+    Remove prepended frames from the start of a video.
+    
+    Args:
+        frames: Video tensor with prepended frames [T+prepend_count, H, W, C]
+        prepend_count: Number of prepended frames to remove
+        debug: Optional debug instance for logging
+        
+    Returns:
+        torch.Tensor: Video without prepended frames [T, H, W, C]
+    """
+    if prepend_count <= 0:
+        return frames
+    
+    if debug:
+        debug.log(f"Removing {prepend_count} prepended frames", category="video")
+    
+    return frames[prepend_count:]
+
+
+def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, overlap: int) -> torch.Tensor:
+    """
+    Blend two overlapping frame sequences in-place.
+    
+    Args:
+        prev_tail: Last `overlap` frames from previous batch [overlap, H, W, C]
+        cur_head: First `overlap` frames from current batch [overlap, H, W, C]
+        overlap: Number of overlapping frames
+        
+    Returns:
+        torch.Tensor: Blended frames [overlap, H, W, C]
+    """
+    device = prev_tail.device
+    dtype = prev_tail.dtype
+    
+    # Smooth crossfade with Hann window for overlap >= 3, linear for smaller overlaps
+    if overlap >= 3:
+        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
+        blend_start = 1.0 / 3.0
+        blend_end = 2.0 / 3.0
+        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
+        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
+    else:
+        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
+    
+    w_prev = w_prev_1d.view(overlap, 1, 1, 1)
+    w_cur = 1.0 - w_prev
+    
+    return prev_tail * w_prev + cur_head * w_cur
+
+
 def load_text_embeddings(script_directory: str, device: torch.device, 
                         dtype: torch.dtype, debug: Optional['Debug'] = None) -> Dict[str, List[torch.Tensor]]:
     """
@@ -1451,25 +1538,32 @@ def postprocess_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    color_correction: str = "wavelet"
+    color_correction: str = "wavelet",
+    prepend_frames: int = 0,
+    temporal_overlap: int = 0,
+    batch_size: int = 5
 ) -> Dict[str, Any]:
     """
-    Phase 4: Post-processing and Final Video Assembly.
+    Phase 4: Post-processing and Final Assembly.
     
     Applies color correction and assembles the final video from decoded batches.
     Uses stream-based direct writing to minimize memory usage - processes each
     batch and writes directly to pre-allocated output tensor without accumulating
-    intermediate results.
+    intermediate results. Automatically applies temporal overlap blending and 
+    removes prepended frames if specified.
     
     Args:
         ctx: Context from decode_all_batches containing batch_samples (required)
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
+        prepend_frames: Number of prepended frames to remove from final output (default: 0)
+        temporal_overlap: Number of overlapping frames between batches for blending (default: 0)
+        batch_size: Frames per batch used during encoding for overlap calculation (default: 5)
         
     Returns:
         dict: Updated context containing:
-            - final_video: Assembled video tensor [T, H, W, C] range [0,1]
+            - final_video: Assembled video tensor [T, H, W, C] range [0,1] with overlap blended and prepended frames removed
             - All intermediate storage cleared for memory efficiency
             
     Raises:
@@ -1519,6 +1613,9 @@ def postprocess_all_batches(
     # Pre-allocation will happen after processing first sample to get exact dimensions
     ctx['final_video'] = None
     current_frame_idx = 0
+    
+    # Initialize padding tracking for final log message
+    total_padding_removed = 0
     
     # Alpha processing - handle RGBA inputs with edge-guided upscaling
     if ctx.get('is_rgba', False) and 'all_alpha_channels' in ctx and 'all_input_rgb' in ctx:
@@ -1611,9 +1708,15 @@ def postprocess_all_batches(
                 
                 # Trim both sample and input_video to original length if necessary (handles temporal padding)
                 if ori_length < sample.shape[0]:
+                    padding_removed = sample.shape[0] - ori_length
+                    debug.log(f"Removing padding: {padding_removed} frame{'s' if padding_removed != 1 else ''} trimmed ({sample.shape[0]} -> {ori_length})", 
+                            category="video", force=True, indent_level=1)
                     sample = sample[:ori_length]
                     if input_video is not None:
                         input_video = input_video[:ori_length]
+                    
+                    # Accumulate padding removed across all batches
+                    total_padding_removed += padding_removed
                 
                 # Trim spatial dimensions to true target size (removes divisible padding)
                 if 'true_target_dims' in ctx:
@@ -1744,9 +1847,37 @@ def postprocess_all_batches(
                     target_device = ctx['tensor_offload_device'] if ctx['tensor_offload_device'] is not None else ctx['vae_device']
                     ctx['final_video'] = torch.empty((total_frames, H, W, C), dtype=ctx['compute_dtype'], device=target_device)
 
-                # Direct write - if dimensions don't match, let it fail with clear error
-                ctx['final_video'][current_frame_idx:current_frame_idx + batch_frames] = sample
-                current_frame_idx += batch_frames
+                # Write with temporal overlap blending if enabled
+                if batch_idx == 0 or temporal_overlap == 0:
+                    # First batch or no overlap: write all frames normally
+                    ctx['final_video'][current_frame_idx:current_frame_idx + batch_frames] = sample
+                    current_frame_idx += batch_frames
+                else:
+                    # Subsequent batches with overlap: blend overlapping region in-place
+                    if temporal_overlap < batch_frames and current_frame_idx >= temporal_overlap:
+                        # Get overlapping regions
+                        prev_tail = ctx['final_video'][current_frame_idx - temporal_overlap:current_frame_idx]
+                        cur_head = sample[:temporal_overlap]
+                        
+                        # Log blending operation
+                        blend_range_start = current_frame_idx - temporal_overlap
+                        blend_range_end = current_frame_idx
+                        debug.log(f"Blending {temporal_overlap} overlapping frames (positions {blend_range_start}-{blend_range_end})", 
+                                 category="video", indent_level=1)
+                        
+                        # Blend and replace in-place
+                        blended = blend_overlapping_frames(prev_tail, cur_head, temporal_overlap)
+                        ctx['final_video'][current_frame_idx - temporal_overlap:current_frame_idx] = blended
+                        
+                        # Write non-overlapping part
+                        non_overlapping = sample[temporal_overlap:]
+                        non_overlapping_count = non_overlapping.shape[0]
+                        ctx['final_video'][current_frame_idx:current_frame_idx + non_overlapping_count] = non_overlapping
+                        current_frame_idx += non_overlapping_count
+                    else:
+                        # Edge case: write normally if overlap >= batch_frames
+                        ctx['final_video'][current_frame_idx:current_frame_idx + batch_frames] = sample
+                        current_frame_idx += batch_frames
                 
                 # Immediately release sample memory
                 del sample
@@ -1765,16 +1896,49 @@ def postprocess_all_batches(
 
         # Verify final assembly
         if ctx['final_video'] is not None:
+            # Remove prepended frames if any were added at the start
+            frames_before_removal = ctx['final_video'].shape[0]
+            
+            if prepend_frames > 0:
+                if prepend_frames < ctx['final_video'].shape[0]:
+                    debug.log(f"Removing {prepend_frames} prepended frames from output", category="video", force=True)
+                    ctx['final_video'] = ctx['final_video'][prepend_frames:]
+                else:
+                    debug.log(f"Warning: prepend_frames ({prepend_frames}) >= total frames ({ctx['final_video'].shape[0]}), skipping removal", 
+                            level="WARNING", category="video", force=True)
+
             final_shape = ctx['final_video'].shape
-            Hf, Wf, Cf = final_shape[1], final_shape[2], final_shape[3]
+            Tf, Hf, Wf, Cf = final_shape[0], final_shape[1], final_shape[2], final_shape[3]
             channels_str = "RGBA" if Cf == 4 else "RGB" if Cf == 3 else f"{Cf}-channel"
             
-            debug.log(f"Final video assembled: {current_frame_idx} frames written, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", 
-                     category="generation", force=True)
+            # Build message showing prepend and/or padding removal if applicable
+            frame_info = f"{Tf} frames"
+            adjustments = []
+
+            if prepend_frames > 0 and prepend_frames < frames_before_removal:
+                adjustments.append(f"{prepend_frames} prepend")
+
+            if total_padding_removed > 0:
+                adjustments.append(f"{total_padding_removed} padding")
+            
+            # Calculate and include temporal overlap blending info
+            if temporal_overlap > 0:
+                frames_blended = (num_valid_samples - 1) * temporal_overlap
+                adjustments.append(f"{frames_blended} overlap")
+
+            if adjustments:
+                # Add back all removed/blended frames to get true computed count
+                total_computed = frames_before_removal + total_padding_removed
+                if temporal_overlap > 0:
+                    total_computed += (num_valid_samples - 1) * temporal_overlap
+                frame_info += f" ({total_computed} computed with {' + '.join(adjustments)} removed)"
+            
+            debug.log(f"Final video assembled: {frame_info}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", 
+                    category="generation", force=True)
             
             if current_frame_idx != total_frames:
                 debug.log(f"WARNING: Frame count mismatch - expected {total_frames}, wrote {current_frame_idx}", 
-                         level="WARNING", category="generation", force=True)
+                        level="WARNING", category="generation", force=True)
         else:
             ctx['final_video'] = torch.empty((0, 0, 0, 0), dtype=ctx['compute_dtype'])
             debug.log("No frames were processed", level="WARNING", category="generation", force=True)
@@ -1815,7 +1979,7 @@ def postprocess_all_batches(
             del ctx['all_ori_lengths']
         if 'true_target_dims' in ctx:
             del ctx['true_target_dims']
-        
+
     debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
     debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)
     

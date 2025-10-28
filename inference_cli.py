@@ -131,15 +131,13 @@ def extract_frames_from_video(video_path: str, skip_first_frames: int = 0,
     
     debug.log(f"Extracted {len(frames)} frames", category="success")
 
-    # preprend frames if requested (reverse of the first few frames)
-    if prepend_frames > 0:
-        start_frames = []
-        if prepend_frames >= len(frames):  # repeat first (=last) frame
-            start_frames = [frames[-1]] * (prepend_frames - len(frames) + 1)
-        frames = start_frames + frames[prepend_frames:0:-1] + frames
-
-    # Convert to tensor [T, H, W, C] and cast to Float16 for ComfyUI compatibility
+    # Convert to tensor first
     frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float16)
+    
+    # Apply prepend frames using shared function
+    if prepend_frames > 0:
+        from src.core.generation import prepend_video_frames
+        frames_tensor = prepend_video_frames(frames_tensor, prepend_frames, debug)
     
     debug.log(f"Frames tensor shape: {frames_tensor.shape}, dtype: {frames_tensor.dtype}", category="memory")
 
@@ -217,65 +215,6 @@ def save_frames_to_png(frames_tensor: torch.Tensor, output_dir: str, base_name: 
             debug.log(f"Saved {idx + 1}/{total} PNGs", category="file")
 
     debug.log(f"PNG saving completed: {total} files in '{output_dir}'", category="success")
-
-
-def apply_temporal_overlap_blending(frames_tensor: torch.Tensor, batch_size: int, overlap: int) -> torch.Tensor:
-    """
-    Blend frames with temporal overlap in pixel space and remove duplicates.
-    Args:
-        frames_tensor (torch.Tensor): [T, H, W, C], Float16 in [0,1]
-        batch_size (int): Frames per batch used during generation
-        overlap (int): Overlapping frames between consecutive batches
-    Returns:
-        torch.Tensor: Blended frames [T, H, W, C] with duplicates removed
-    """
-    T = frames_tensor.shape[0]
-    if overlap <= 0 or batch_size <= overlap or T <= batch_size:
-        return frames_tensor
-    
-    device = frames_tensor.device
-    dtype = frames_tensor.dtype
-    
-    output = frames_tensor[:batch_size]
-    input_pos = batch_size
-    
-    while input_pos < T:
-        remaining_frames = T - input_pos
-        current_batch_size = min(batch_size, remaining_frames)
-        
-        if current_batch_size <= overlap:
-            break
-            
-        current_batch = frames_tensor[input_pos:input_pos + current_batch_size]
-        
-        prev_tail = output[-overlap:]  # overlap frames from previous output
-        cur_head = current_batch[:overlap]  # overlap frames from current batch
-        
-        # Smooth crossfade while avoiding the first and last frames (which often have more artifacts)
-        if overlap >= 3:
-            t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
-            blend_start = 1.0 / 3.0
-            blend_end = 2.0 / 3.0
-            u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-            w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
-        else: # Linear fallback for small overlaps:
-            w_prev_1d = torch.linspace(1.0, 0, steps=overlap, device=device, dtype=dtype)
-
-        w_prev = w_prev_1d.view(overlap, 1, 1, 1)
-        w_cur = 1.0 - w_prev
-        blended = prev_tail * w_prev + cur_head * w_cur
-        
-        # Replace the last overlap frames in output with blended result
-        output = torch.cat([output[:-overlap], blended], dim=0)
-        
-        # Append the non-overlapping part of current batch (if any)
-        if overlap < current_batch_size:
-            non_overlapping = current_batch[overlap:]
-            output = torch.cat([output, non_overlapping], dim=0)
-        
-        input_pos += current_batch_size
-    
-    return output
 
 
 def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray, 
@@ -377,7 +316,7 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         temporal_overlap=shared_args["temporal_overlap"],
         res_w=shared_args["res_w"],
         input_noise_scale=shared_args["input_noise_scale"],
-        color_correction=shared_args.get("color_correction", "wavelet")
+        color_correction=shared_args.get("color_correction", "lab")
     )
 
     # Phase 2: Upscale all batches  
@@ -405,7 +344,10 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         ctx=ctx,
         debug=worker_debug,
         progress_callback=None,
-        color_correction=shared_args.get("color_correction", "wavelet")
+        color_correction=shared_args.get("color_correction", "lab"),
+        prepend_frames=0,  # Never remove prepend_frames in workers (multi-GPU safe)
+        temporal_overlap=shared_args["temporal_overlap"],
+        batch_size=shared_args["batch_size"]
     )
 
     # Get final result
@@ -501,37 +443,54 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
     for p in workers:
         p.join()
 
-    # Concatenate results with overlap handling
+    # Concatenate results with overlap blending using shared function
     if args.temporal_overlap > 0 and num_devices > 1:
-        # Reconstruct results considering overlap
-        result_list = []
+        from src.core.generation import blend_overlapping_frames
+        
         overlap = args.temporal_overlap
+        result_tensor = None
         
         for idx, res_np in enumerate(results_np):
+            chunk_tensor = torch.from_numpy(res_np).to(torch.float16)
+            
             if idx == 0:
                 # First chunk: keep all frames
-                result_list.append(torch.from_numpy(res_np).to(torch.float16))
-            elif idx == num_devices - 1:
-                # Last chunk: skip overlap frames at the beginning
-                chunk_tensor = torch.from_numpy(res_np).to(torch.float16)
-                if chunk_tensor.shape[0] > overlap:
-                    result_list.append(chunk_tensor[overlap:])
-                else:
-                    # If chunk is smaller than overlap, skip it entirely
-                    pass
+                result_tensor = chunk_tensor
             else:
-                # Middle chunks: skip overlap at beginning, keep overlap at end
-                chunk_tensor = torch.from_numpy(res_np).to(torch.float16)
-                if chunk_tensor.shape[0] > overlap:
-                    result_list.append(chunk_tensor[overlap:])
+                # Subsequent chunks: blend overlapping region with accumulated result
+                if chunk_tensor.shape[0] > overlap and result_tensor.shape[0] >= overlap:
+                    # Get overlapping regions
+                    prev_tail = result_tensor[-overlap:]  # Last N frames from accumulated result
+                    cur_head = chunk_tensor[:overlap]      # First N frames from current chunk
+                    
+                    # Blend using shared function
+                    blended = blend_overlapping_frames(prev_tail, cur_head, overlap)
+                    
+                    # Replace tail of result with blended frames, then append rest of chunk
+                    result_tensor = torch.cat([
+                        result_tensor[:-overlap],           # Everything except the tail
+                        blended,                            # Blended overlapping frames
+                        chunk_tensor[overlap:]              # Non-overlapping part of current chunk
+                    ], dim=0)
+                else:
+                    # Edge case: chunk too small, just append non-overlapping part
+                    if chunk_tensor.shape[0] > overlap:
+                        result_tensor = torch.cat([result_tensor, chunk_tensor[overlap:]], dim=0)
         
-        if result_list:
-            result_tensor = torch.cat(result_list, dim=0)
-        else:
+        if result_tensor is None:
             result_tensor = torch.from_numpy(results_np[0]).to(torch.float16)
     else:
-        # Original concatenation without overlap handling
+        # Single GPU or no overlap: simple concatenation
         result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float16)
+    
+    # Remove prepended frames from final concatenated result (multi-GPU safe)
+    if args.prepend_frames > 0:
+        if args.prepend_frames < result_tensor.shape[0]:
+            debug.log(f"Removing {args.prepend_frames} prepended frames from output", category="generation")
+            result_tensor = result_tensor[args.prepend_frames:]
+        else:
+            debug.log(f"Warning: prepend_frames ({args.prepend_frames}) >= total frames ({result_tensor.shape[0]}), skipping removal", 
+                     level="WARNING", category="generation")
     
     return result_tensor
 
@@ -601,7 +560,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--temporal_overlap", type=int, default=0,
                         help="Temporal overlap for processing (default: 0, no temporal overlap)")
     parser.add_argument("--prepend_frames", type=int, default=0,
-                        help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are removed after processing")
+                        help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are automatically removed after processing")
     parser.add_argument("--swap_io_components", action="store_true",
                         help="Swap IO components to CPU for VRAM optimization")
     parser.add_argument("--vae_offload_device", type=str, default="none",
@@ -721,15 +680,7 @@ def main() -> None:
         if platform.system() != "Darwin":
             debug.log(f"Peak VRAM usage: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB", category="memory")
 
-        if args.temporal_overlap > 0:
-            debug.log(f"Applying temporal overlap with blending", category="generation")
-            result = apply_temporal_overlap_blending(result, args.batch_size, args.temporal_overlap)
         debug.log(f"Result shape: {result.shape}, dtype: {result.dtype}", category="memory")
-
-        if args.prepend_frames > 0:
-            debug.log(f"Removing prepended ({args.prepend_frames}) frames from the results)", category="generation")
-            result = result[args.prepend_frames:]
-            debug.log(f"Result shape after removing prepended frames: {result.shape}", category="info")
 
         # After generation_time calculation, choose saving method
         if args.output_format == "png":

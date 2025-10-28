@@ -17,7 +17,8 @@ from ..core.generation import (
     upscale_all_batches, 
     decode_all_batches,
     postprocess_all_batches,
-    prepare_video_transforms
+    prepare_video_transforms,
+    prepend_video_frames
 )
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
@@ -45,9 +46,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     """
 
     @classmethod
-    def define_schema(cls) -> io.Schema:
-        from ..optimization.memory_manager import get_device_list
-        
+    def define_schema(cls) -> io.Schema:        
         return io.Schema(
             node_id="SeedVR2VideoUpscaler",
             display_name="SeedVR2 Video Upscaler",
@@ -86,6 +85,22 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     max=16384,
                     step=4,
                     tooltip="Frames processed per batch. Minimum 5 for temporal consistency. Higher = better quality but more VRAM."
+                ),
+                io.Int.Input("temporal_overlap",
+                    default=0,
+                    min=0,
+                    max=16,
+                    step=1,
+                    optional=True,
+                    tooltip="Overlapping frames between batches for smoother transitions. 0 = disabled. Values 1-4 work well for temporal consistency."
+                ),
+                io.Int.Input("prepend_frames",
+                    default=0,
+                    min=0,
+                    max=32,
+                    step=1,
+                    optional=True,
+                    tooltip="Number of frames to prepend to the video (reversed from start). This can help with artifacts at the start of the video and are automatically removed after processing."
                 ),
                 io.Combo.Input("color_correction",
                     options=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
@@ -128,6 +143,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, pixels: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
+                temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
                 enable_debug: bool = False) -> io.NodeOutput:
@@ -145,6 +161,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             seed: Random seed for reproducible generation
             new_resolution: Target resolution for shortest edge (maintains aspect ratio)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
+            temporal_overlap: Overlapping frames between batches (0-16)
+            prepend_frames: Frames to prepend (0-32) to reduce initial artifacts.
             color_correction: Color correction method
             input_noise_scale: Input noise injection scale [0.0-1.0]
             latent_noise_scale: Latent noise injection scale [0.0-1.0]
@@ -275,9 +293,6 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
-
-        # Constants
-        temporal_overlap = 0
         
         # Intro logo
         debug.log("", category="none", force=True)
@@ -357,26 +372,41 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             debug.log("Starting video upscaling generation...", category="generation", force=True)
             debug.start_timer("generation")
            
-            # Track total frames and resolutions
-            total_frames = len(pixels)
+            # Track input frames before any modifications
+            input_frames = len(pixels)
             input_h, input_w = pixels.shape[1], pixels.shape[2]
             channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
+            
+            # Handle prepend_frames if requested
+            if prepend_frames > 0:
+                pixels = prepend_video_frames(pixels, prepend_frames, debug)
+            
+            # Track total frames after prepending
+            total_frames = len(pixels)
             ctx['total_frames'] = total_frames
             
             # Setup transform and compute dimensions
             sample_frame = pixels[0].permute(2, 0, 1).unsqueeze(0)
             true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, debug, sample_frame)
             
+            # Build concise parameter info
+            params_info = f"Batch size: {batch_size}"
+            if prepend_frames > 0:
+                params_info += f", Prepend frames: {prepend_frames}"
+            if temporal_overlap > 0:
+                params_info += f", Temporal overlap: {temporal_overlap}"
+            params_info += f", Seed: {seed}, Channels: {channels_info}"
+            
             # Log dimension flow with full context
             if true_h > 0:
                 if true_h == padded_h and true_w == padded_w:
-                    debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Output: {true_w}x{true_h}px, Channels: {channels_info}", 
+                    debug.log(f"Input: {input_frames} frames, {input_w}x{input_h}px → Output: {true_w}x{true_h}px", 
                              category="generation", force=True, indent_level=1)
                 else:
-                    debug.log(f"Total frames: {total_frames}, Input: {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Final: {true_w}x{true_h}px, Channels: {channels_info}", 
+                    debug.log(f"Input: {input_frames} frames, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px", 
                              category="generation", force=True, indent_level=1)
             
-            debug.log(f"Batch size: {batch_size}, Seed: {seed}", category="generation", force=True, indent_level=1)
+            debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
             del sample_frame
             
             # Phase 1: Encode
@@ -419,7 +449,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 ctx=ctx,
                 debug=debug,
                 progress_callback=progress_callback,
-                color_correction=color_correction
+                color_correction=color_correction,
+                prepend_frames=prepend_frames,
+                temporal_overlap=temporal_overlap,
+                batch_size=batch_size
             )
 
             sample = ctx['final_video']
