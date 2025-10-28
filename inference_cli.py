@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
 """
-Standalone SeedVR2 Video Upscaler CLI Script
+SeedVR2 Video Upscaler - Standalone CLI Interface
+
+Multi-GPU capable command-line interface for high-quality video upscaling using
+SeedVR2 diffusion models. Supports both single and multi-GPU processing with
+temporal overlap blending.
+
+Features:
+    - Multi-GPU parallel processing with automatic workload distribution
+    - Temporal overlap blending for smooth transitions between chunks
+    - BlockSwap memory optimization for limited VRAM scenarios
+    - VAE tiling for large resolution processing
+    - Comprehensive dtype management (BFloat16 compute pipeline)
+    - Torch.compile integration for 20-40% speedup
+    - Multiple output formats (video/PNG sequences)
+    - Advanced color correction methods
+
+Usage:
+    python inference_cli.py --video_path input.mp4 --resolution 1080 --model <model_name>
+
+Requirements:
+    - Python 3.12+
+    - PyTorch 2.0+
+    - CUDA 12.0+ (for NVIDIA GPUs)
 """
 
 import sys
@@ -23,11 +45,11 @@ os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
 # -------------------------------------------------------------
-# 1) Gestion VRAM (cudaMallocAsync) déjà en place
+# 1) Configure VRAM management (cudaMallocAsync) before heavy imports
 if platform.system() != "Darwin":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
-    # 2) Pré-parse de la ligne de commande pour récupérer --cuda_device
+    # 2) Pre-parse command line to configure CUDA_VISIBLE_DEVICES early
     _pre_parser = argparse.ArgumentParser(add_help=False)
     _pre_parser.add_argument("--cuda_device", type=str, default=None)
     _pre_args, _ = _pre_parser.parse_known_args()
@@ -38,7 +60,7 @@ if platform.system() != "Darwin":
             os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # -------------------------------------------------------------
-# 3) Imports lourds (torch, etc.) après la configuration env
+# Import heavy dependencies (torch, etc.) after environment configuration
 import torch
 import cv2
 import numpy as np
@@ -50,19 +72,37 @@ from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFA
 
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
+# =============================================================================
+# Video I/O Functions
+# =============================================================================
 
-def extract_frames_from_video(video_path: str, skip_first_frames: int = 0, 
-                            load_cap: Optional[int] = None, prepend_frames: int = 0) -> Tuple[torch.Tensor, float]:
+def extract_frames_from_video(
+    video_path: str, 
+    skip_first_frames: int = 0, 
+    load_cap: Optional[int] = None, 
+    prepend_frames: int = 0
+) -> Tuple[torch.Tensor, float]:
     """
-    Extract frames from video and convert to tensor format
+    Extract frames from video file and convert to tensor format.
+    
+    Reads video using OpenCV, converts BGR to RGB, normalizes to [0,1] range,
+    and optionally prepends reversed frames to reduce initial artifacts.
     
     Args:
-        video_path (str): Path to input video
-        skip_first_frame (bool): Skip the first frame during extraction
-        load_cap (int): Maximum number of frames to load (None for all)
+        video_path: Path to input video file
+        skip_first_frames: Number of initial frames to skip (default: 0)
+        load_cap: Maximum number of frames to load, None loads all (default: None)
+        prepend_frames: Number of frames to prepend (reversed from start) to reduce
+                       initial artifacts (default: 0)
         
     Returns:
-        torch.Tensor: Frames tensor in format [T, H, W, C] (Float16, normalized 0-1)
+        Tuple containing:
+            - frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
+            - fps: Original video frames per second
+    
+    Raises:
+        FileNotFoundError: If video file doesn't exist
+        ValueError: If video cannot be opened or no frames extracted
     """
     debug.log(f"Extracting frames from video: {video_path}", category="file")
     
@@ -131,8 +171,8 @@ def extract_frames_from_video(video_path: str, skip_first_frames: int = 0,
     
     debug.log(f"Extracted {len(frames)} frames", category="success")
 
-    # Convert to tensor first
-    frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float16)
+    # Convert to tensor (will be cast to compute_dtype in worker process)
+    frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float32)
     
     # Apply prepend frames using shared function
     if prepend_frames > 0:
@@ -144,14 +184,24 @@ def extract_frames_from_video(video_path: str, skip_first_frames: int = 0,
     return frames_tensor, fps
 
 
-def save_frames_to_video(frames_tensor: torch.Tensor, output_path: str, fps: float = 30.0) -> None:
+def save_frames_to_video(
+    frames_tensor: torch.Tensor, 
+    output_path: str, 
+    fps: float = 30.0
+) -> None:
     """
-    Save frames tensor to video file
+    Save frames tensor to MP4 video file.
+    
+    Converts tensor from Float32 [0,1] to uint8 [0,255], RGB to BGR for OpenCV,
+    and writes to video file using mp4v codec.
     
     Args:
-        frames_tensor (torch.Tensor): Frames in format [T, H, W, C] (Float16, 0-1)
-        output_path (str): Output video path
-        fps (float): Output video FPS
+        frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
+        output_path: Output video file path (will be created if doesn't exist)
+        fps: Frames per second for output video (default: 30.0)
+    
+    Raises:
+        ValueError: If video writer cannot be initialized
     """
     debug.log(f"Saving {frames_tensor.shape[0]} frames to video: {output_path}", category="file")
 
@@ -186,14 +236,21 @@ def save_frames_to_video(frames_tensor: torch.Tensor, output_path: str, fps: flo
     debug.log(f"Video saved successfully: {output_path}", category="success")
 
 
-def save_frames_to_png(frames_tensor: torch.Tensor, output_dir: str, base_name: str) -> None:
+def save_frames_to_png(
+    frames_tensor: torch.Tensor, 
+    output_dir: str, 
+    base_name: str
+) -> None:
     """
-    Save frames tensor as sequential PNG images.
-
+    Save frames tensor as sequential PNG image files.
+    
+    Each frame saved as {base_name}_{index:05d}.png with zero-padded indices.
+    Converts Float32 [0,1] to uint8 [0,255] and RGB to BGR for OpenCV.
+    
     Args:
-        frames_tensor (torch.Tensor): Frames in format [T, H, W, C] (Float16, 0-1)
-        output_dir (str): Directory to save PNGs
-        base_name (str): Base name for output files (without extension)
+        frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
+        output_dir: Directory to save PNG files (created if doesn't exist)
+        base_name: Base name for output files (e.g., "frame" → "frame_00000.png")
     """
     debug.log(f"Saving {frames_tensor.shape[0]} frames as PNGs to directory: {output_dir}", category="file")
 
@@ -216,12 +273,43 @@ def save_frames_to_png(frames_tensor: torch.Tensor, output_dir: str, base_name: 
 
     debug.log(f"PNG saving completed: {total} files in '{output_dir}'", category="success")
 
+# =============================================================================
+# Multi-GPU Processing Functions
+# =============================================================================
 
-def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray, 
-                   shared_args: Dict[str, Any], return_queue: mp.Queue) -> None:
-    """Worker process that performs upscaling on a slice of frames using a dedicated GPU."""
+def _worker_process(
+    proc_idx: int, 
+    device_id: int, 
+    frames_np: np.ndarray, 
+    shared_args: Dict[str, Any], 
+    return_queue: mp.Queue
+) -> None:
+    """
+    Worker process for multi-GPU upscaling of video frame chunks.
+    
+    Each worker runs in its own process with dedicated GPU, executing the full
+    4-phase upscaling pipeline (encode → upscale → decode → postprocess).
+    Results are returned via multiprocessing queue as numpy arrays.
+    
+    This function is spawned as a separate process and performs local imports
+    to avoid CUDA initialization conflicts in the main process.
+    
+    Args:
+        proc_idx: Worker process index for result tracking
+        device_id: CUDA device ID to use for this worker
+        frames_np: Numpy array of frames [T, H, W, C], Float32, range [0,1]
+        shared_args: Dictionary containing all configuration parameters including
+                    model paths, processing settings, and optimization flags
+        return_queue: Multiprocessing queue for returning results to main process
+    
+    Note:
+        - Sets CUDA_VISIBLE_DEVICES to isolate GPU access per worker
+        - Prepend frame removal handled in main process (multi-GPU safe)
+        - No model caching in CLI mode (single-run workflow)
+        - BlockSwap offloading handled via dit_offload_device (blocks/IO → CPU during inference)
+    """
     if platform.system() != "Darwin":
-        # 1. Limit CUDA visibility to the chosen GPU BEFORE importing torch-heavy deps
+        # Limit CUDA visibility to the chosen GPU BEFORE importing torch-heavy deps
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
         # Keep same cudaMallocAsync setting
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
@@ -231,14 +319,14 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         setup_generation_context, prepare_runner
     )
     from src.core.generation_phases import (
-        encode_all_batches, upscale_all_batches, decode_all_batches
+        encode_all_batches, upscale_all_batches, decode_all_batches, postprocess_all_batches
     )
     
     # Create debug instance for this worker process
     worker_debug = Debug(enabled=shared_args["debug"])
     
     # Prepare offload device arguments
-    # DiT offload is disabled in CLI (no caching, single-run workflow)
+    dit_offload = None if shared_args["dit_offload_device"] == "none" else shared_args["dit_offload_device"]
     vae_offload = None if shared_args["vae_offload_device"] == "none" else shared_args["vae_offload_device"]
     tensor_offload = None if shared_args["tensor_offload_device"] == "none" else shared_args["tensor_offload_device"]
     
@@ -246,14 +334,14 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     ctx = setup_generation_context(
         dit_device=f"cuda:{device_id}",
         vae_device=f"cuda:{device_id}",
-        dit_offload_device=None,
+        dit_offload_device=dit_offload,
         vae_offload_device=vae_offload,
         tensor_offload_device=tensor_offload,
         debug=worker_debug
     )
 
-    # Reconstruct frames tensor
-    frames_tensor = torch.from_numpy(frames_np).to(torch.float16)
+    # Reconstruct frames tensor using compute dtype from context
+    frames_tensor = torch.from_numpy(frames_np).to(ctx['compute_dtype'])
 
     # Create torch compile args if enabled
     torch_compile_args_dit = None
@@ -363,9 +451,40 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
     return_queue.put((proc_idx, result_tensor.numpy()))
 
 
-def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str], 
-                   args: argparse.Namespace) -> torch.Tensor:
-    """Split frames and process them in parallel on multiple GPUs."""
+def _gpu_processing(
+    frames_tensor: torch.Tensor, 
+    device_list: List[str], 
+    args: argparse.Namespace
+) -> torch.Tensor:
+    """
+    Orchestrate multi-GPU parallel video upscaling with temporal overlap blending.
+    
+    Splits input frames across multiple GPUs with optional temporal overlap,
+    spawns worker processes for parallel processing, and reassembles results
+    with smooth blending of overlapping regions.
+    
+    Processing flow:
+        1. Split frames into chunks (with overlap if enabled)
+        2. Spawn worker processes on each GPU
+        3. Wait for all workers to complete
+        4. Blend overlapping regions using Hann window crossfade
+        5. Remove prepended frames from final result
+    
+    Args:
+        frames_tensor: Input frames [T, H, W, C], Float32, range [0,1]
+        device_list: List of CUDA device IDs as strings (e.g., ["0", "1"])
+        args: Parsed command-line arguments containing all processing settings
+    
+    Returns:
+        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
+        where T' may be less than T if prepend_frames were removed
+    
+    Note:
+        - Single GPU: Simple sequential processing without overlap
+        - Multi-GPU with overlap: Chunks sized to multiples of batch_size for
+          proper temporal blending
+        - Prepended frames removed after all GPU workers complete (multi-GPU safe)
+    """
     num_devices = len(device_list)
     total_frames = frames_tensor.shape[0]
     
@@ -406,6 +525,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "block_swap_config": {
             'blocks_to_swap': args.blocks_to_swap,
             'swap_io_components': args.swap_io_components,
+            'offload_device': args.dit_offload_device if args.dit_offload_device != "none" else None,
         },
         "vae_encode_tiling_enabled": args.vae_encode_tiling_enabled,
         "vae_encode_tile_size": args.vae_encode_tile_size,
@@ -414,6 +534,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         "vae_decode_tile_size": args.vae_decode_tile_size,
         "vae_decode_tile_overlap": args.vae_decode_tile_overlap,
         "tile_debug": args.tile_debug.lower() if args.tile_debug else "false",
+        "dit_offload_device": args.dit_offload_device,
         "vae_offload_device": args.vae_offload_device,
         "tensor_offload_device": args.tensor_offload_device,
         "attention_mode": args.attention_mode,
@@ -453,7 +574,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
         result_tensor = None
         
         for idx, res_np in enumerate(results_np):
-            chunk_tensor = torch.from_numpy(res_np).to(torch.float16)
+            chunk_tensor = torch.from_numpy(res_np).to(torch.float32)
             
             if idx == 0:
                 # First chunk: keep all frames
@@ -480,10 +601,10 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
                         result_tensor = torch.cat([result_tensor, chunk_tensor[overlap:]], dim=0)
         
         if result_tensor is None:
-            result_tensor = torch.from_numpy(results_np[0]).to(torch.float16)
+            result_tensor = torch.from_numpy(results_np[0]).to(torch.float32)
     else:
         # Single GPU or no overlap: simple concatenation
-        result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float16)
+        result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float32)
     
     # Remove prepended frames from final concatenated result (multi-GPU safe)
     if args.prepend_frames > 0:
@@ -496,9 +617,31 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
     
     return result_tensor
 
+# =============================================================================
+# Argument Parsing
+# =============================================================================
 
 class OneOrTwoValues(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
+    """
+    Custom argparse action for tile size arguments accepting 1 or 2 integers.
+    
+    Allows flexible input formats:
+        - Single integer: --tile_size 1024 → (1024, 1024)
+        - Two integers: --tile_size 1024 768 → (1024, 768)
+        - Comma-separated: --tile_size 1024,768 → (1024, 768)
+    
+    Used for VAE tiling parameters where height and width can be specified
+    separately or as a single value applied to both dimensions.
+    """
+    
+    def __call__(
+        self, 
+        parser: argparse.ArgumentParser, 
+        namespace: argparse.Namespace, 
+        values: List[str], 
+        option_string: Optional[str] = None
+    ) -> None:
+        """Parse and validate tile size arguments."""
         if len(values) not in [1, 2]:
             parser.error(f"{option_string} requires 1 or 2 arguments")
 
@@ -519,7 +662,21 @@ class OneOrTwoValues(argparse.Action):
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments"""
+    """
+    Parse and validate command-line arguments for SeedVR2 CLI.
+    
+    Configures all available options including model selection, processing parameters,
+    memory optimization settings, and output configuration. Uses custom action classes
+    for complex argument types (e.g., OneOrTwoValues for tile sizes).
+    
+    Returns:
+        Parsed arguments namespace with all CLI parameters
+    
+    Note:
+        - cuda_device argument only available on non-macOS systems
+        - Default model directory resolves to "seedvr2_models" if not specified
+        - Tile size/overlap arguments use OneOrTwoValues for flexible input
+    """
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
     
     parser.add_argument("--video_path", type=str, required=True,
@@ -556,15 +713,21 @@ def parse_arguments() -> argparse.Namespace:
         parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
     parser.add_argument("--blocks_to_swap", type=int, default=0,
-                        help="Number of blocks to swap for VRAM optimization (default: 0, disabled), up to 32 for 3B model, 36 for 7B")
-    parser.add_argument("--use_none_blocking", action="store_true",
-                        help="Use non-blocking memory transfers for VRAM optimization")
+                        help="Number of transformer blocks to swap for VRAM optimization (default: 0, disabled). "
+                             "Up to 32 for 3B model, 36 for 7B model. Requires --dit_offload_device to be set.")
     parser.add_argument("--temporal_overlap", type=int, default=0,
                         help="Temporal overlap for processing (default: 0, no temporal overlap)")
     parser.add_argument("--prepend_frames", type=int, default=0,
                         help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are automatically removed after processing")
     parser.add_argument("--swap_io_components", action="store_true",
-                        help="Swap IO components to CPU for VRAM optimization")
+                        help="Offload DiT input/output embeddings and normalization layers for additional VRAM savings. "
+                             "Requires --dit_offload_device to be set. Can be used alone or with --blocks_to_swap.")
+    parser.add_argument("--dit_offload_device", type=str, default="cpu",
+                        help="Device to offload DiT components for BlockSwap (default: cpu). "
+                             "Options: 'cpu', 'none'. Required when BlockSwap is enabled "
+                             "(blocks_to_swap > 0 or swap_io_components = True). "
+                             "Use 'cpu' to offload swapped blocks/IO components to RAM, "
+                             "'none' disables BlockSwap offloading.")
     parser.add_argument("--vae_offload_device", type=str, default="none",
                         help="Device to offload VAE when not in use (default: none). "
                              "Options: 'cpu', 'none'. Use 'cpu' to free VRAM between encode/decode phases (slower but saves VRAM), "
@@ -609,9 +772,30 @@ def parse_arguments() -> argparse.Namespace:
                         help="Max recompilation attempts before falling back to uncompiled. Safety limit to prevent infinite loops. Default: 128")
     return parser.parse_args()
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 def main() -> None:
-    """Main CLI function"""
+    """
+    Main entry point for SeedVR2 Video Upscaler CLI.
+    
+    Orchestrates the complete upscaling workflow:
+        1. Parse and validate command-line arguments
+        2. Extract frames from input video
+        3. Download required models if not cached
+        4. Process frames on single or multiple GPUs
+        5. Save results as video or PNG sequence
+        6. Report timing and performance metrics
+    
+    Error handling:
+        - Validates tile configuration before processing
+        - Provides detailed error messages with traceback
+        - Ensures proper cleanup on exit (VRAM automatically freed)
+    
+    Raises:
+        SystemExit: On argument validation failure or processing error
+    """
     debug.log(f"SeedVR2 Video Upscaler CLI started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", category="dit", force=True)
     
     # Parse arguments
@@ -628,6 +812,24 @@ def main() -> None:
     
     if args.vae_decode_tiling_enabled and (args.vae_decode_tile_overlap[0] >= args.vae_decode_tile_size[0] or args.vae_decode_tile_overlap[1] >= args.vae_decode_tile_size[1]):
         debug.log(f"VAE decode tile overlap {args.vae_decode_tile_overlap} must be smaller than tile size {args.vae_decode_tile_size}", level="ERROR", category="vae", force=True)
+        sys.exit(1)
+    
+    # Validate BlockSwap configuration - either blocks_to_swap or swap_io_components requires dit_offload_device
+    blockswap_enabled = args.blocks_to_swap > 0 or args.swap_io_components
+    if blockswap_enabled and args.dit_offload_device == "none":
+        config_details = []
+        if args.blocks_to_swap > 0:
+            config_details.append(f"blocks_to_swap={args.blocks_to_swap}")
+        if args.swap_io_components:
+            config_details.append("swap_io_components=True")
+        
+        debug.log(
+            f"BlockSwap enabled ({', '.join(config_details)}) but dit_offload_device='none'. "
+            "BlockSwap requires dit_offload_device to be set (typically 'cpu'). "
+            "Either set --dit_offload_device cpu or disable BlockSwap "
+            "(--blocks_to_swap 0 and do not use --swap_io_components)",
+            level="ERROR", category="blockswap", force=True
+        )
         sys.exit(1)
     
     if args.debug:

@@ -198,7 +198,6 @@ def apply_block_swap_to_dit(
         "total_blocks": total_blocks,
         "offload_device": offload_device,
         "main_device": device,
-        "enable_debug": block_swap_config.get("enable_debug", False),
         "offload_memory": memory_stats['offload_memory'],
         "main_memory": memory_stats['main_memory']
     }
