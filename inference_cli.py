@@ -136,7 +136,7 @@ def extract_frames_from_video(video_path: str, skip_first_frames: int = 0,
     
     # Apply prepend frames using shared function
     if prepend_frames > 0:
-        from src.core.generation import prepend_video_frames
+        from src.core.generation_utils import prepend_video_frames
         frames_tensor = prepend_video_frames(frames_tensor, prepend_frames, debug)
     
     debug.log(f"Frames tensor shape: {frames_tensor.shape}, dtype: {frames_tensor.dtype}", category="memory")
@@ -227,8 +227,10 @@ def _worker_process(proc_idx: int, device_id: int, frames_np: np.ndarray,
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     import torch  # local import inside subprocess
-    from src.core.generation import (
-        setup_generation_context, prepare_runner,
+    from src.core.generation_utils import (
+        setup_generation_context, prepare_runner
+    )
+    from src.core.generation_phases import (
         encode_all_batches, upscale_all_batches, decode_all_batches
     )
     
@@ -445,7 +447,7 @@ def _gpu_processing(frames_tensor: torch.Tensor, device_list: List[str],
 
     # Concatenate results with overlap blending using shared function
     if args.temporal_overlap > 0 and num_devices > 1:
-        from src.core.generation import blend_overlapping_frames
+        from src.core.generation_utils import blend_overlapping_frames
         
         overlap = args.temporal_overlap
         result_tensor = None

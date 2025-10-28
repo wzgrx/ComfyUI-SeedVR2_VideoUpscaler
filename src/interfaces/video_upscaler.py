@@ -9,14 +9,16 @@ from typing import Tuple, Dict, Any, Optional
 from ..utils.constants import get_base_cache_dir
 from ..utils.downloads import download_weight
 from ..utils.debug import Debug
-from ..core.generation import (
-    setup_video_transform,
-    setup_generation_context, 
-    prepare_runner,
+from ..core.generation_phases import (
     encode_all_batches, 
     upscale_all_batches, 
     decode_all_batches,
-    postprocess_all_batches,
+    postprocess_all_batches
+)
+from ..core.generation_utils import (
+    setup_video_transform,
+    setup_generation_context, 
+    prepare_runner,
     prepare_video_transforms,
     prepend_video_frames
 )

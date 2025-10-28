@@ -114,7 +114,7 @@ class FlashAttentionVarlen(nn.Module):
     """
     Variable-length attention with configurable backend (Flash Attention or PyTorch SDPA).
     
-    Backend selection is validated during model configuration (see model_manager.py).
+    Backend selection is validated during model configuration.
     Compilation behavior:
     - SDPA: Fully compilable, optimal performance
     - Flash Attention: Uses @torch._dynamo.disable wrapper (C++ extension)
