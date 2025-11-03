@@ -58,7 +58,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 "Supports RGB and RGBA formats, temporal consistency, and adaptive VRAM management."
             ),
             inputs=[
-                io.Image.Input("pixels",
+                io.Image.Input("image",
                     tooltip="Input video frames. Accepts both RGB (3-channel) and RGBA (4-channel) images. Output will match input format."
                 ),
                 io.Custom("SEEDVR2_DIT").Input("dit",
@@ -143,7 +143,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         )
     
     @classmethod
-    def execute(cls, pixels: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
+    def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, new_resolution: int = 1072, batch_size: int = 5,
                 temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
@@ -157,7 +157,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         configuration unpacking, and delegates to upscaling pipeline.
         
         Args:
-            pixels: Input video frames as tensor (N, H, W, C) in [0, 1] range
+            image: Input video frames as tensor (N, H, W, C) in [0, 1] range
             dit: DiT model configuration from SeedVR2LoadDiTModel node
             vae: VAE model configuration from SeedVR2LoadVAEModel node
             seed: Random seed for reproducible generation
@@ -374,20 +374,20 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             debug.start_timer("generation")
            
             # Track input frames before any modifications
-            input_frames = len(pixels)
-            input_h, input_w = pixels.shape[1], pixels.shape[2]
-            channels_info = "RGBA" if pixels.shape[-1] == 4 else "RGB"
+            input_frames = len(image)
+            input_h, input_w = image.shape[1], image.shape[2]
+            channels_info = "RGBA" if image.shape[-1] == 4 else "RGB"
             
             # Handle prepend_frames if requested
             if prepend_frames > 0:
-                pixels = prepend_video_frames(pixels, prepend_frames, debug)
+                image = prepend_video_frames(image, prepend_frames, debug)
             
             # Track total frames after prepending
-            total_frames = len(pixels)
+            total_frames = len(image)
             ctx['total_frames'] = total_frames
             
             # Setup transform and compute dimensions
-            sample_frame = pixels[0].permute(2, 0, 1).unsqueeze(0)
+            sample_frame = image[0].permute(2, 0, 1).unsqueeze(0)
             true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, debug, sample_frame)
             
             # Build concise parameter info
@@ -400,11 +400,12 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Log dimension flow with full context
             if true_h > 0:
+                frame_text = "frame" if input_frames <= 1 else "frames"
                 if true_h == padded_h and true_w == padded_w:
-                    debug.log(f"Input: {input_frames} frames, {input_w}x{input_h}px → Output: {true_w}x{true_h}px", 
+                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Output: {true_w}x{true_h}px", 
                              category="generation", force=True, indent_level=1)
                 else:
-                    debug.log(f"Input: {input_frames} frames, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px", 
+                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px", 
                              category="generation", force=True, indent_level=1)
             
             debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
@@ -414,7 +415,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             ctx = encode_all_batches(
                 runner,
                 ctx=ctx,
-                images=pixels,
+                images=image,
                 debug=debug,
                 batch_size=batch_size,
                 seed=seed,

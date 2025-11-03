@@ -1396,12 +1396,18 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 # Initialize output size using first encoded tile
                 if result is None:
                     b_out, c_out, f_lat, _, _ = encoded_tile.shape
+                    
+                    # Accumulate on offload device if specified and different, else on inference device
+                    device = getattr(self, 'tensor_offload_device', None)
+                    if device is None or device == encoded_tile.device:
+                        device = encoded_tile.device
+                    
                     result = torch.zeros(
                         (b_out, c_out, f_lat, H_lat_total, W_lat_total),
-                        device=encoded_tile.device,
+                        device=device,
                         dtype=encoded_tile.dtype,
                     )
-                    count = torch.zeros((1, 1, 1, H_lat_total, W_lat_total), device=encoded_tile.device, dtype=encoded_tile.dtype)
+                    count = torch.zeros((1, 1, 1, H_lat_total, W_lat_total), device=device, dtype=encoded_tile.dtype)
 
                 eff_h_lat = min(y_lat_end - y_lat, encoded_tile.shape[3], result.shape[3] - y_lat)
                 eff_w_lat = min(x_lat_end - x_lat, encoded_tile.shape[4], result.shape[4] - x_lat)
@@ -1432,10 +1438,20 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 weight_w_5d = weight_w.view(1, 1, 1, 1, eff_w_lat)
                 encoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
 
+                # Accumulate (move to result device if different)
+                if result.device != encoded_tile.device:
+                    encoded_tile = encoded_tile.to(result.device)
+                    weight_h_5d = weight_h_5d.to(result.device)
+                    weight_w_5d = weight_w_5d.to(result.device)
+                
                 result[:, :, : encoded_tile.shape[2], y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat] += encoded_tile
                 count[:, :, :, y_lat : y_lat + eff_h_lat, x_lat : x_lat + eff_w_lat].addcmul_(weight_h_5d, weight_w_5d)
 
-        result.div_(count.clamp(min=1e-6)) # In-place normalize
+        # Move result back to inference device if needed and normalize
+        if result.device != x.device:
+            result = result.to(x.device)
+            count = count.to(x.device)
+        result.div_(count.clamp(min=1e-6))
 
         if x.shape[2] == 1:  # single frame
             result = result.squeeze(2)
@@ -1543,8 +1559,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     b_out, c_out, out_f_tile, _, _ = decoded_tile.shape
                     output_h = H * scale_factor
                     output_w = W * scale_factor
-                    result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=decoded_tile.device, dtype=decoded_tile.dtype)
-                    count = torch.zeros((1, 1, 1, output_h, output_w), device=decoded_tile.device, dtype=decoded_tile.dtype)
+                    
+                    # Accumulate on offload device if specified and different, else on inference device
+                    device = getattr(self, 'tensor_offload_device', None)
+                    if device is None or device == decoded_tile.device:
+                        device = decoded_tile.device
+                    
+                    result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=device, dtype=decoded_tile.dtype)
+                    count = torch.zeros((1, 1, 1, output_h, output_w), device=device, dtype=decoded_tile.dtype)
 
                 # Corresponding output-space placement
                 y_out, y_out_end = y_lat * scale_factor, y_lat_end * scale_factor
@@ -1577,10 +1599,19 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
                 decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
 
-                # Accumulate into result/count
+                # Accumulate (move to result device if different)
+                if result.device != decoded_tile.device:
+                    decoded_tile = decoded_tile.to(result.device)
+                    weight_h_5d = weight_h_5d.to(result.device)
+                    weight_w_5d = weight_w_5d.to(result.device)
+                
                 result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
                 count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
 
+        # Move result back to inference device if needed and normalize
+        if result.device != z.device:
+            result = result.to(z.device)
+            count = count.to(z.device)
         result.div_(count.clamp(min=1e-6)) # In-place normalize
 
         if z.shape[2] == 1:  # single frame

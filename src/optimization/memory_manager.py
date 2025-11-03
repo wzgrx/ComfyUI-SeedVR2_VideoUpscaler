@@ -1021,7 +1021,7 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             # Get offload target - default to 'cpu' if not configured or set to 'none'
             offload_target = getattr(runner, '_dit_offload_device', None)
             if offload_target is None or offload_target == 'none':
-                offload_target = 'cpu'
+                offload_target = torch.device('cpu')
             
             # Move model off GPU (either for caching or before deletion)
             reason = "model caching" if cache_model else "releasing GPU memory"
@@ -1097,7 +1097,7 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             # Get offload target - default to 'cpu' if not configured or set to 'none'
             offload_target = getattr(runner, '_vae_offload_device', None)
             if offload_target is None or offload_target == 'none':
-                offload_target = 'cpu'
+                offload_target = torch.device('cpu')
             
             # Move model off GPU (either for caching or before deletion)
             reason = "model caching" if cache_model else "releasing GPU memory"

@@ -892,6 +892,7 @@ def _configure_runner_settings(
     runner._vae_device = ctx['vae_device']
     runner._dit_offload_device = ctx['dit_offload_device']
     runner._vae_offload_device = ctx['vae_offload_device']
+    runner._tensor_offload_device = ctx['tensor_offload_device']
     runner._compute_dtype = ctx['compute_dtype']
 
     runner.debug = debug
@@ -1257,8 +1258,9 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             else:
                 debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")
         
-        # Propagate debug instance to submodules
+        # Propagate debug and tensor_offload_device to submodules
         model.debug = debug
+        model.tensor_offload_device = runner._tensor_offload_device
         _propagate_debug_to_modules(model, debug)
         runner.vae = model
         
