@@ -444,7 +444,7 @@ def _wrap_block_forward(
             _log_swap_timing(debug, t_start, self._block_idx, "block")
 
             # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_block_forward")
+            clear_memory(debug=debug, deep=False, force=False, timer_name="wrap_block_forward")
         else:
             output = original_forward(*args, **kwargs)
 
@@ -523,7 +523,7 @@ def _wrap_io_forward(
         _log_swap_timing(debug, t_start, self._module_name, "I/O")
 
         # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=True, force=False, timer_name="wrap_block_forward")
+        clear_memory(debug=debug, deep=False, force=False, timer_name="wrap_block_forward")
 
         return output
     

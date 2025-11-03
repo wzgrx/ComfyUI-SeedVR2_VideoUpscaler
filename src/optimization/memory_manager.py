@@ -191,7 +191,7 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
     
     Args:
         debug: Debug instance for logging (optional)
-        force: If True, always clear. If False, only clear when <15% free
+        force: If True, always clear. If False, only clear when <5% free
         deep: If True, perform deep cleanup including GC and OS operations.
               If False (default), only perform minimal GPU cache clearing.
         timer_name: Optional suffix for timer names to make them unique per invocation
@@ -230,9 +230,9 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
         mem_info = get_basic_vram_info(device=None)
         
         if "error" not in mem_info:
-            # Check VRAM/MPS memory pressure (15% free threshold)
+            # Check VRAM/MPS memory pressure (5% free threshold)
             free_ratio = mem_info["free_gb"] / mem_info["total_gb"]
-            if free_ratio < 0.15:
+            if free_ratio < 0.05:
                 should_clear = True
                 if debug:
                     backend = "MPS" if torch.mps.is_available() else "VRAM"
@@ -241,7 +241,7 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
         # For non-MPS systems, also check system RAM separately
         if not should_clear and not torch.mps.is_available():
             mem = psutil.virtual_memory()
-            if mem.available < mem.total * 0.15:
+            if mem.available < mem.total * 0.05:
                 should_clear = True
                 if debug:
                     debug.log(f"RAM pressure: {mem.available/(1024**3):.2f}GB free of {mem.total/(1024**3):.2f}GB", category="memory")
