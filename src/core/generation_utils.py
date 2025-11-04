@@ -156,6 +156,125 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
     return 0, 0, 0, 0
 
 
+def compute_generation_info(
+    ctx: Dict[str, Any],
+    images: torch.Tensor,
+    resolution: int,
+    max_resolution: int,
+    batch_size: int,
+    seed: int,
+    prepend_frames: int,
+    temporal_overlap: int,
+    debug: Optional['Debug'] = None
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Compute all generation parameters and dimensions for logging.
+    
+    Args:
+        ctx: Generation context dictionary
+        images: Input frames tensor [T, H, W, C]
+        resolution: Target resolution for shortest edge
+        max_resolution: Maximum resolution for any edge (0 = no limit)
+        batch_size: Frames per batch
+        seed: Random seed
+        prepend_frames: Number of frames to prepend
+        temporal_overlap: Overlapping frames between batches
+        debug: Debug instance for logging
+    
+    Returns:
+        Tuple of (processed_images, info_dict)
+        - processed_images: Input images with prepending applied if needed
+        - info_dict: Information dictionary for logging
+    """
+    # Track input frames before any modifications
+    input_frames = len(images)
+    input_h, input_w = images.shape[1], images.shape[2]
+    channels_info = "RGBA" if images.shape[-1] == 4 else "RGB"
+    
+    # Apply prepending if requested
+    if prepend_frames > 0:
+        images = prepend_video_frames(images, prepend_frames, debug)
+    
+    # Track total frames after prepending
+    total_frames = len(images)
+    ctx['total_frames'] = total_frames
+    
+    # Setup transform and compute dimensions on final frame count
+    sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
+    true_h, true_w, padded_h, padded_w = setup_video_transform(
+        ctx, resolution, max_resolution, debug, sample_frame
+    )
+    del sample_frame
+    
+    info = {
+        'input_frames': input_frames,
+        'input_h': input_h,
+        'input_w': input_w,
+        'total_frames': total_frames,
+        'true_h': true_h,
+        'true_w': true_w,
+        'padded_h': padded_h,
+        'padded_w': padded_w,
+        'channels_info': channels_info,
+        'batch_size': batch_size,
+        'seed': seed,
+        'prepend_frames': prepend_frames,
+        'temporal_overlap': temporal_overlap,
+        'resolution': resolution,
+        'max_resolution': max_resolution
+    }
+    
+    return images, info
+
+
+def log_generation_start(info: Dict[str, Any], debug: Optional['Debug'] = None) -> None:
+    """
+    Log generation start information in a consistent format.
+    
+    Args:
+        info: Information dictionary from compute_generation_info()
+        debug: Debug instance for logging
+    """
+    if debug is None:
+        return
+    
+    debug.log("", category="none", force=True)
+    debug.log("Starting upscaling generation...", category="generation", force=True)
+    
+    # Build concise parameter info
+    params_info = f"Batch size: {info['batch_size']}"
+    if info['prepend_frames'] > 0:
+        params_info += f", Prepend frames: {info['prepend_frames']}"
+    if info['temporal_overlap'] > 0:
+        params_info += f", Temporal overlap: {info['temporal_overlap']}"
+    params_info += f", Seed: {info['seed']}, Channels: {info['channels_info']}"
+    
+    # Build resolution constraint info
+    res_constraint = f"shortest edge: {info['resolution']}px"
+    if info['max_resolution'] > 0:
+        res_constraint += f", max edge: {info['max_resolution']}px"
+    
+    # Log dimension flow with full context
+    if info['true_h'] > 0:
+        frame_text = "frame" if info['input_frames'] <= 1 else "frames"
+        if info['true_h'] == info['padded_h'] and info['true_w'] == info['padded_w']:
+            debug.log(
+                f"Input: {info['input_frames']} {frame_text}, "
+                f"{info['input_w']}x{info['input_h']}px → Output: {info['true_w']}x{info['true_h']}px "
+                f"({res_constraint})",
+                category="generation", force=True, indent_level=1
+            )
+        else:
+            debug.log(
+                f"Input: {info['input_frames']} {frame_text}, "
+                f"{info['input_w']}x{info['input_h']}px → Padded: {info['padded_w']}x{info['padded_h']}px → "
+                f"Output: {info['true_w']}x{info['true_h']}px ({res_constraint})",
+                category="generation", force=True, indent_level=1
+            )
+    
+    debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
+
+
 def prepend_video_frames(frames: torch.Tensor, prepend_count: int, debug: Optional['Debug'] = None) -> torch.Tensor:
     """
     Prepend reversed frames to the video to help prevent artifacts at the start of the video.

@@ -16,11 +16,10 @@ from ..core.generation_phases import (
     postprocess_all_batches
 )
 from ..core.generation_utils import (
-    setup_video_transform,
     setup_generation_context, 
     prepare_runner,
-    prepare_video_transforms,
-    prepend_video_frames
+    compute_generation_info,
+    log_generation_start
 )
 from ..optimization.memory_manager import (
     cleanup_text_embeddings,
@@ -367,53 +366,24 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
 
             debug.log_memory_state("After model preparation", show_tensors=False, detailed_tensors=False)
             debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
-
-            debug.log("", category="none", force=True)
-            debug.log("Starting upscaling generation...", category="generation", force=True)
+            
+            # Compute generation info and log start (handles prepending internally)
+            image, gen_info = compute_generation_info(
+                ctx=ctx,
+                images=image,
+                resolution=new_resolution,
+                max_resolution=max_resolution,
+                batch_size=batch_size,
+                seed=seed,
+                prepend_frames=prepend_frames,
+                temporal_overlap=temporal_overlap,
+                debug=debug
+            )
+            
+            # Log generation start in consistent format
+            log_generation_start(gen_info, debug)
+            
             debug.start_timer("generation")
-           
-            # Track input frames before any modifications
-            input_frames = len(image)
-            input_h, input_w = image.shape[1], image.shape[2]
-            channels_info = "RGBA" if image.shape[-1] == 4 else "RGB"
-            
-            # Handle prepend_frames if requested
-            if prepend_frames > 0:
-                image = prepend_video_frames(image, prepend_frames, debug)
-            
-            # Track total frames after prepending
-            total_frames = len(image)
-            ctx['total_frames'] = total_frames
-            
-            # Setup transform and compute dimensions
-            sample_frame = image[0].permute(2, 0, 1).unsqueeze(0)
-            true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, max_resolution, debug, sample_frame)
-            
-            # Build concise parameter info
-            params_info = f"Batch size: {batch_size}"
-            if prepend_frames > 0:
-                params_info += f", Prepend frames: {prepend_frames}"
-            if temporal_overlap > 0:
-                params_info += f", Temporal overlap: {temporal_overlap}"
-            params_info += f", Seed: {seed}, Channels: {channels_info}"
-            
-            # Build resolution constraint info
-            res_constraint = f"shortest edge: {new_resolution}px"
-            if max_resolution > 0:
-                res_constraint += f", max edge: {max_resolution}px"
-            
-            # Log dimension flow with full context
-            if true_h > 0:
-                frame_text = "frame" if input_frames <= 1 else "frames"
-                if true_h == padded_h and true_w == padded_w:
-                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Output: {true_w}x{true_h}px ({res_constraint})", 
-                             category="generation", force=True, indent_level=1)
-                else:
-                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px ({res_constraint})", 
-                             category="generation", force=True, indent_level=1)
-            
-            debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
-            del sample_frame
             
             # Phase 1: Encode
             ctx = encode_all_batches(
@@ -502,7 +472,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             total_execution_time = debug.end_timer("total_execution", "Total execution", show_breakdown=True, custom_children=child_times)
             
             if total_execution_time > 0:
-                fps = total_frames / total_execution_time
+                fps = gen_info['total_frames'] / total_execution_time
                 debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
 
             # Print footer

@@ -338,8 +338,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
 def extract_frames_from_video(
     video_path: str, 
     skip_first_frames: int = 0, 
-    load_cap: Optional[int] = None, 
-    prepend_frames: int = 0
+    load_cap: Optional[int] = None
 ) -> Tuple[torch.Tensor, float]:
     """
     Extract frames from video file and convert to tensor format.
@@ -351,8 +350,6 @@ def extract_frames_from_video(
         video_path: Path to input video file
         skip_first_frames: Number of initial frames to skip (default: 0)
         load_cap: Maximum number of frames to load, None loads all (default: None)
-        prepend_frames: Number of frames to prepend (reversed from start) to reduce
-                       initial artifacts (default: 0)
         
     Returns:
         Tuple containing:
@@ -384,8 +381,6 @@ def extract_frames_from_video(
         debug.log(f"Will skip first {skip_first_frames} frames", category="info")
     if load_cap:
         debug.log(f"Will load maximum {load_cap} frames", category="info")
-    if prepend_frames:
-        debug.log(f"Will prepend {prepend_frames} frames to the video", category="info")
     
     frames = []
     frame_idx = 0
@@ -432,11 +427,6 @@ def extract_frames_from_video(
 
     # Convert to tensor (will be cast to compute_dtype in worker process)
     frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float32)
-    
-    # Apply prepend frames using shared function
-    if prepend_frames > 0:
-        from src.core.generation_utils import prepend_video_frames
-        frames_tensor = prepend_video_frames(frames_tensor, prepend_frames, debug)
     
     debug.log(f"Frames tensor shape: {frames_tensor.shape}, dtype: {frames_tensor.dtype}", category="memory")
 
@@ -657,6 +647,21 @@ def _process_frames_core(
     ctx['cache_context'] = cache_context
     if runner_cache is not None:
         runner_cache['runner'] = runner
+    
+    # Compute generation info and log start (handles prepending internally)
+    from src.core.generation_utils import compute_generation_info, log_generation_start
+    frames_tensor, gen_info = compute_generation_info(
+        ctx=ctx,
+        images=frames_tensor,
+        resolution=args.resolution,
+        max_resolution=args.max_resolution,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        prepend_frames=args.prepend_frames,
+        temporal_overlap=args.temporal_overlap,
+        debug=debug
+    )
+    log_generation_start(gen_info, debug)
     
     # Phase 1: Encode
     ctx = encode_all_batches(
@@ -963,7 +968,10 @@ def parse_arguments() -> argparse.Namespace:
         - Default model directory resolves to "models/SEEDVR2" if not specified
         - Tile size/overlap arguments use OneOrTwoValues for flexible input
     """
-    parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
+    parser = argparse.ArgumentParser(
+        description="SeedVR2 Video Upscaler CLI",
+        allow_abbrev=False  # Require full argument names for safety
+    )
     
     parser.add_argument("--input", type=str, required=True,
                         help="Path to input video file, image file, or directory containing videos/images")
