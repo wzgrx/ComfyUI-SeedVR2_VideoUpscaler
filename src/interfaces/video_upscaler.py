@@ -151,7 +151,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
-                seed: int, new_resolution: int = 1072, max_resolution: int = 0, batch_size: int = 5,
+                seed: int, new_resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
                 temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
@@ -425,8 +425,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 seed=seed,
                 progress_callback=progress_callback,
                 temporal_overlap=temporal_overlap,
-                res_w=new_resolution,
-                max_res_w=max_resolution,
+                resolution=new_resolution,
+                max_resolution=max_resolution,
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
             )

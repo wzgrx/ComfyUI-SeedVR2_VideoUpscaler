@@ -269,7 +269,7 @@ options:
   -h, --help                              show this help message and exit
   --video_path VIDEO_PATH                 Path to input video file
   --seed SEED                             Random seed for generation (default: 100)
-  --resolution RESOLUTION                 Target resolution width (default: 1072)
+  --resolution RESOLUTION                 Target resolution width (default: 1080)
   --batch_size BATCH_SIZE                 Number of frames per batch (default: 5)
   --model                                 Model to use (default: 3B FP8) in list:
                                              seedvr2_ema_3b_fp16.safetensors,
@@ -291,7 +291,7 @@ Examples :
 
 ```
 # Upscale 18 frames as png
-python inference_cli.py --video_path "MAIN.mp4" --resolution 1072 --batch_size 9 --model seedvr2_ema_3b_fp8_e4m3fn.safetensors --model_dir ./models\SEEDVR2 --load_cap 18 --output "C:\Users\Emmanuel\Downloads\test_upscale" --output_format png --preserve_vram
+python inference_cli.py --video_path "MAIN.mp4" --resolution 1080 --batch_size 9 --model seedvr2_ema_3b_fp8_e4m3fn.safetensors --model_dir ./models\SEEDVR2 --load_cap 18 --output "C:\Users\Emmanuel\Downloads\test_upscale" --output_format png --preserve_vram
 
 # Upscale 1000 frames on 4 GPU, each GPU will receive 250 frames and will process them 50 by 50
 python inference_cli.py --video_path "MAIN.mp4" --batch_size 50 --load_cap 1000 --output ".\outputs\test_upscale.mp4" --cuda_device 0,1,2,3

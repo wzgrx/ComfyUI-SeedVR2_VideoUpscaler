@@ -75,8 +75,8 @@ def encode_all_batches(
     seed: int = 42,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     temporal_overlap: int = 0,
-    res_w: int = 1072,
-    max_res_w: int = 0,
+    resolution: int = 1080,
+    max_resolution: int = 0,
     input_noise_scale: float = 0.0,
     color_correction: str = "wavelet"
 ) -> Dict[str, Any]:
@@ -95,8 +95,8 @@ def encode_all_batches(
         seed: Random seed for deterministic VAE sampling (default: 42)
         progress_callback: Optional callback(current, total, frames, phase_name)
         temporal_overlap: Overlapping frames between batches for continuity
-        res_w: Target resolution for shortest edge
-        max_res_w: Maximum resolution for any edge (0 = no limit)
+        resolution: Target resolution for shortest edge
+        max_resolution: Maximum resolution for any edge (0 = no limit)
         input_noise_scale: Scale for input noise (0.0-1.0). Adds noise to input images
                           before VAE encoding to reduce artifacts at high resolutions.
         color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
@@ -142,10 +142,10 @@ def encode_all_batches(
     # Setup video transformation pipeline and compute dimensions if not already done
     if 'true_target_dims' not in ctx:
         sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
-        setup_video_transform(ctx, res_w, max_res_w, debug, sample_frame)
+        setup_video_transform(ctx, resolution, max_resolution, debug, sample_frame)
         del sample_frame
     else:
-        setup_video_transform(ctx, res_w, max_res_w, debug)
+        setup_video_transform(ctx, resolution, max_resolution, debug)
     
     # Detect if input is RGBA (4 channels)
     ctx['is_rgba'] = images[0].shape[-1] == 4
