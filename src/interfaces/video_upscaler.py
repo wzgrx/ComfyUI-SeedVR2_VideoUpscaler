@@ -303,17 +303,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
         
-        # Intro logo
-        debug.log("", category="none", force=True)
-        debug.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
-        debug.log(" ║ ███████ ███████ ███████ ██████  ██    ██ ██████  ███████ ║", category="none", force=True)
-        debug.log(" ║ ██      ██      ██      ██   ██ ██    ██ ██   ██      ██ ║", category="none", force=True)
-        debug.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
-        debug.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
-        debug.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
-        debug.log(" ║                         © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
-        debug.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
-        debug.log("", category="none", force=True)
+        # Print header
+        debug.print_header()
 
         debug.start_timer("total_execution", force=True)
 
@@ -378,7 +369,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             debug.end_timer("model_preparation", "Model preparation", force=True, show_breakdown=True)
 
             debug.log("", category="none", force=True)
-            debug.log("Starting video upscaling generation...", category="generation", force=True)
+            debug.log("Starting upscaling generation...", category="generation", force=True)
             debug.start_timer("generation")
            
             # Track input frames before any modifications
@@ -481,7 +472,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     sample = sample.to(torch.float32)
 
             debug.log("", category="none", force=True)
-            debug.log("Video upscaling completed successfully!", category="success", force=True)
+            debug.log("Upscaling completed successfully!", category="success", force=True)
             debug.end_timer("generation", "Video generation")
 
             # Final cleanup
@@ -513,12 +504,9 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             if total_execution_time > 0:
                 fps = total_frames / total_execution_time
                 debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
-            
-            debug.log("", category="none", force=True)
-            debug.log("────────────────────────", category="none", force=True)
-            debug.log("Questions? Updates? Watch the videos, star the repo & join us!", category="dialogue", force=True)
-            debug.log("https://www.youtube.com/@AInVFX", category="generation", force=True)
-            debug.log("https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler", category="star", force=True)
+
+            # Print footer
+            debug.print_footer()
 
             debug.clear_history()
             pbar = None

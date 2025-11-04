@@ -124,11 +124,11 @@ def get_input_type(input_path: str) -> str:
     
     ext = path.suffix.lower()
     if ext in VIDEO_EXTENSIONS:
-        return 'video'
+        return "video"
     elif ext in IMAGE_EXTENSIONS:
-        return 'image'
+        return "image"
     else:
-        return 'unknown'
+        return "unknown"
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
                         input_type: Optional[str] = None) -> str:
@@ -137,7 +137,7 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     
     Args:
         input_path: Source file path
-        output_format: "video" or "png"
+        output_format: "mp4" or "png"
         output_dir: Optional output directory
         input_type: Optional input type ("image", "video", "directory")
     
@@ -148,7 +148,7 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     
     if output_format == "png":
         # Single image → single PNG file
-        if input_type == 'image':
+        if input_type == "image":
             if output_dir:
                 return str(Path(output_dir) / f"{input_name}_upscaled.png")
             return f"output/{input_name}_upscaled.png"
@@ -164,18 +164,30 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
         return f"output/{input_name}_upscaled.mp4"
 
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
-                       output_path: Optional[str] = None) -> None:
-    """Process a single video or image file."""
+                       output_path: Optional[str] = None, format_auto_detected: bool = False) -> int:
+    """
+    Process a single video or image file.
+    
+    Args:
+        input_path: Path to input file
+        args: Command-line arguments
+        device_list: List of GPU device IDs
+        output_path: Optional explicit output path
+        format_auto_detected: Whether output format was auto-detected
+    
+    Returns:
+        Number of frames processed
+    """
     input_type = get_input_type(input_path)
     
-    if input_type == 'unknown':
+    if input_type == "unknown":
         debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
-        return
+        return 0
     
     debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
     
     # Extract frames
-    if input_type == 'video':
+    if input_type == "video":
         start_time = time.time()
         frames_tensor, original_fps = extract_frames_from_video(
             input_path, args.skip_first_frames, args.load_cap, args.prepend_frames
@@ -184,10 +196,15 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     else:
         frames_tensor, original_fps = extract_frames_from_image(input_path)
     
+    # Track frames before processing (for FPS calculation)
+    input_frame_count = len(frames_tensor)
+    
     # Generate output path if not provided
     output_path = output_path or generate_output_path(input_path, args.output_format, input_type=input_type)
     
-    debug.log(f"Output will be saved to: {output_path}", category="file")
+    # Show format with auto-detection indicator
+    format_prefix = "Auto-detected" if format_auto_detected else "Output"
+    debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
     
     # Process frames
     processing_start = time.time()
@@ -196,7 +213,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
 
     # Save results
     is_png_format = args.output_format == "png"
-    is_single_image = input_type == 'image'
+    is_single_image = input_type == "image"
     
     if is_png_format and is_single_image:
         # Single PNG file
@@ -204,18 +221,23 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
         cv2.imwrite(output_path, frame_bgr)
-        debug.log(f"Output saved to: {output_path}", category="file", force=True)
     
     elif is_png_format:
         # PNG sequence (save_frames_to_png creates directory internally)
         save_frames_to_png(result, output_path, base_name=Path(input_path).stem)
-        debug.log(f"PNG frames saved in directory: {output_path}", category="file", force=True)
     
     else:
         # Video file
         os.makedirs(Path(output_path).parent, exist_ok=True)
         save_frames_to_video(result, output_path, original_fps)
-        debug.log(f"Output saved to video: {output_path}", category="file", force=True)
+    
+    # Log appropriate save message based on format
+    if is_png_format and not is_single_image:
+        debug.log(f"PNG frames saved in directory: {output_path}", category="file", force=True)
+    else:
+        debug.log(f"Output saved to: {output_path}", category="file", force=True)
+    
+    return input_frame_count
 
 def extract_frames_from_video(
     video_path: str, 
@@ -854,8 +876,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
     parser.add_argument("--output_format", type=str, default=None, 
-                        choices=["video", "png", None],
-                        help="Output format: 'video' (mp4) or 'png' images (default: auto-detect from input)")
+                        choices=["mp4", "png", None],
+                        help="Output format: 'mp4' video or 'png' images (default: auto-detect from input)")
     parser.add_argument("--color_correction", type=str, default="lab", 
                     choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
                     help="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)")
@@ -878,20 +900,23 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--swap_io_components", action="store_true",
                         help="Offload DiT input/output embeddings and normalization layers for additional VRAM savings. "
                              "Requires --dit_offload_device to be set. Can be used alone or with --blocks_to_swap.")
-    parser.add_argument("--dit_offload_device", type=str, default="cpu",
-                        help="Device to offload DiT components for BlockSwap (default: cpu). "
-                             "Options: 'cpu', 'none'. Required when BlockSwap is enabled "
-                             "(blocks_to_swap > 0 or swap_io_components = True). "
-                             "Use 'cpu' to offload swapped blocks/IO components to RAM, "
-                             "'none' disables BlockSwap offloading.")
+    parser.add_argument("--dit_offload_device", type=str, default="none",
+                        help="Device to offload DiT model when not in use (default: none). "
+                             "Options: 'none' (keep on inference device), 'cpu' (offload to RAM), "
+                             "or any GPU device like 'cuda:1' (offload to another GPU). "
+                             "Required when BlockSwap is enabled (blocks_to_swap > 0 or swap_io_components = True). "
+                             "Multi-GPU example: inference on cuda:0, offload to cuda:1 for memory distribution.")
     parser.add_argument("--vae_offload_device", type=str, default="none",
                         help="Device to offload VAE when not in use (default: none). "
-                             "Options: 'cpu', 'none'. Use 'cpu' to free VRAM between encode/decode phases (slower but saves VRAM), "
-                             "'none' to keep VAE on GPU throughout (faster but uses more VRAM)")
+                             "Options: 'none' (keep on inference device), 'cpu' (offload to RAM), "
+                             "or any GPU device like 'cuda:1' (offload to another GPU). "
+                             "Use 'cpu' or another GPU to free VRAM between encode/decode phases (slower but saves VRAM on inference device).")
     parser.add_argument("--tensor_offload_device", type=str, default="cpu",
                         help="Device to offload intermediate tensors between phases (default: cpu). "
-                             "Options: 'cpu', 'none'. Use 'cpu' to prevent VRAM accumulation for long videos (recommended), "
-                             "'none' to keep all tensors on GPU (faster but uses more VRAM)")
+                             "Options: 'cpu' (offload to RAM - recommended), 'none' (keep on inference device), "
+                             "or any GPU device like 'cuda:1' (offload to another GPU). "
+                             "Use 'cpu' to prevent VRAM accumulation for long videos. "
+                             "Use another GPU for faster offloading while distributing memory load.")
     parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
                         help="Enable VAE encode tiling for VRAM reduction during encoding. Disabled by default.")
     parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
@@ -938,11 +963,11 @@ def main() -> None:
     
     Orchestrates the complete upscaling workflow:
         1. Parse and validate command-line arguments
-        2. Extract frames from input video
+        2. Extract frames from input video/image(s)
         3. Download required models if not cached
         4. Process frames on single or multiple GPUs
         5. Save results as video or PNG sequence
-        6. Report timing and performance metrics
+        6. Report timing and FPS (calculated from total wall-clock time)
     
     Error handling:
         - Validates tile configuration before processing
@@ -952,7 +977,8 @@ def main() -> None:
     Raises:
         SystemExit: On argument validation failure or processing error
     """
-    debug.log(f"SeedVR2 Video Upscaler CLI started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", category="dit", force=True)
+    # print header
+    debug.print_header(cli=True)
     
     # Parse arguments
     args = parse_arguments()
@@ -1020,15 +1046,11 @@ def main() -> None:
         # Determine input type and process accordingly
         input_type = get_input_type(args.input)
 
-        # Auto-detect output format if not specified
-        if args.output_format is None:
-            if input_type == 'video':
-                args.output_format = "video"
-            else:  # image or directory
-                args.output_format = "png"
-            
-            debug.log(f"Auto-detected output format: {args.output_format}", 
-                    category="info", force=True)
+        # Track total frames for FPS calculation (time tracked via start_time)
+        total_frames_processed = 0
+        
+        # Track if output format was user-specified or auto-detected
+        format_auto_detected = args.output_format is None
         
         if input_type == 'directory':
             media_files = get_media_files(args.input)
@@ -1040,24 +1062,60 @@ def main() -> None:
             debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
             
             for idx, file_path in enumerate(media_files, 1):
+                # Visual separation between files (except before first file)
+                if idx > 1:
+                    debug.log("", category="none", force=True)
+                    debug.log("━" * 60, category="none", force=True)
+                    debug.log("", category="none", force=True)
+                
                 debug.log(f"Processing file {idx}/{len(media_files)}", category="generation", force=True)
                 
+                # Auto-detect format per file if not user-specified
+                if format_auto_detected:
+                    file_type = get_input_type(file_path)
+                    file_output_format = "mp4" if file_type == "video" else "png"
+                else:
+                    file_output_format = args.output_format
+                
+                # Temporarily override args.output_format for this file
+                original_format = args.output_format
+                args.output_format = file_output_format
+                
                 # generate_output_path handles None gracefully with "outputs" default
-                output_path = generate_output_path(file_path, args.output_format, args.output, 
+                output_path = generate_output_path(file_path, file_output_format, args.output, 
                                    input_type=get_input_type(file_path))
                 
                 # Process with explicit output path
-                process_single_file(file_path, args, device_list, output_path)
+                frames = process_single_file(file_path, args, device_list, output_path, 
+                                            format_auto_detected=format_auto_detected)
+                total_frames_processed += frames
+                
+                # Restore original format
+                args.output_format = original_format
 
-        elif input_type in ('video', 'image'):
-            process_single_file(args.input, args, device_list, args.output)
+        elif input_type in ("video", "image"):
+            # Auto-detect output format for single file if not specified
+            if format_auto_detected:
+                args.output_format = "mp4" if input_type == "video" else "png"
+            
+            frames = process_single_file(args.input, args, device_list, args.output,
+                                        format_auto_detected=format_auto_detected)
+            total_frames_processed += frames
         
         else:
             debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)
             sys.exit(1)
         
+        # Calculate total execution time
         total_time = time.time() - start_time
-        debug.log(f"All processing completed successfully in {total_time:.2f}s", category="success", force=True)
+        
+        debug.log("", category="none", force=True)
+        debug.log(f"All upscaling processes completed successfully in {total_time:.2f}s", category="success", force=True)
+        
+        # Calculate and display FPS based on overall wall-clock time
+        if total_time > 0 and total_frames_processed > 0:
+            fps = total_frames_processed / total_time
+            debug.log(f"Average FPS: {fps:.2f} frames/sec", category="timing", force=True)
         
     except Exception as e:
         debug.log(f"Error during processing: {e}", level="ERROR", category="generation", force=True)
@@ -1068,6 +1126,8 @@ def main() -> None:
     finally:
         debug.log(f"Process {os.getpid()} terminating - VRAM will be automatically freed", category="cleanup", force=True)
 
+        # print footer
+        debug.print_footer()
 
 if __name__ == "__main__":
     main()

@@ -314,8 +314,8 @@ def setup_generation_context(
             f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
             category="setup"
         )
-        reason = "quality" if ctx["compute_dtype"] == torch.float32 else "compatibility"
-        debug.log(f"Unified compute dtype: {ctx["compute_dtype"]} across entire pipeline for maximum {reason}", category="precision")
+        reason = "quality" if ctx['compute_dtype'] == torch.float32 else "compatibility"
+        debug.log(f"Unified compute dtype: {ctx['compute_dtype']} across entire pipeline for maximum {reason}", category="precision")
     
     return ctx
 

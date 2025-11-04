@@ -57,7 +57,6 @@ class Debug:
         "none" : "",
     }
     
-    
     def __init__(self, enabled: bool = False, show_timestamps: bool = True):
         self.enabled = enabled
         self.show_timestamps = show_timestamps
@@ -72,7 +71,6 @@ class Debug:
         self.active_timer_stack: List[str] = [] 
         self.timer_namespace: str = ""
         
-
     @torch._dynamo.disable  # Skip tracing to avoid datetime.now() warnings
     def log(self, message: str, level: str = "INFO", category: str = "general", force: bool = False, indent_level: int = 0) -> None:
         """
@@ -113,7 +111,31 @@ class Debug:
         
         print(f"{prefix} {indent}{message}")
 
+    def print_header(self, cli: bool = False) -> None:
+        """Print the header with banner - always displayed"""
+        # Intro logo
+        self.log("", category="none", force=True)
+        self.log(" ╔══════════════════════════════════════════════════════════╗", category="none", force=True)
+        self.log(" ║ ███████ ███████ ███████ ██████  ██    ██ ██████  ███████ ║", category="none", force=True)
+        self.log(" ║ ██      ██      ██      ██   ██ ██    ██ ██   ██      ██ ║", category="none", force=True)
+        self.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
+        self.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
+        self.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
+        if cli:
+            self.log(" ║ 💻 CLI mode             © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
+        else:
+            self.log(" ║                         © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
+        self.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
+        self.log("", category="none", force=True)
 
+    def print_footer(self) -> None:
+        """Print the footer with links - always displayed"""
+        self.log("", category="none", force=True)
+        self.log("────────────────────────", category="none", force=True)
+        self.log("Questions? Updates? Watch the videos, star the repo & join us!", category="dialogue", force=True)
+        self.log("https://www.youtube.com/@AInVFX", category="generation", force=True)
+        self.log("https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler", category="star", force=True)
+    
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def start_timer(self, name: str, force: bool = False) -> None:
         """
@@ -142,7 +164,6 @@ class Debug:
             # Push to stack
             self.active_timer_stack.append(name)
     
-
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def end_timer(self, name: str, message: Optional[str] = None, 
               force: bool = False, show_breakdown: bool = False,
@@ -232,7 +253,6 @@ class Debug:
         
         return duration
 
-
     def log_memory_state(self, label: str, show_diff: bool = True, show_tensors: bool = False, 
                         detailed_tensors: bool = False, force: bool = False) -> None:
         """
@@ -281,7 +301,6 @@ class Debug:
         # Reset PyTorch's peak memory stats for next interval
         reset_vram_peak(device=None, debug=self)
     
-
     def _collect_memory_metrics(self) -> Dict[str, Any]:
         """Collect current memory metrics efficiently."""
         metrics = {
@@ -340,7 +359,6 @@ class Debug:
         
         return metrics
     
-
     def _collect_tensor_stats(self, detailed: bool = False) -> Dict[str, Any]:
         """Collect tensor statistics with minimal overhead."""
         stats = {
@@ -404,7 +422,6 @@ class Debug:
         
         return stats
     
-
     def _log_detailed_tensor_analysis(self, details: Dict[str, Any], force: bool = False) -> None:
         """Log detailed tensor analysis when requested."""
         
@@ -447,7 +464,6 @@ class Debug:
                 for mtype, count in sorted(multi_instance, key=lambda x: x[1], reverse=True)[:5]:
                     self.log(f"{mtype}: {count} instances", category="memory", force=force, indent_level=1)
     
-
     def _log_memory_diff(self, current_metrics: Dict[str, Any], force: bool = False) -> None:
         """Log memory changes from last checkpoint."""
         last = self.memory_checkpoints[-1]
@@ -466,7 +482,6 @@ class Debug:
         if diffs:
             self.log(f"Memory changes: {', '.join(diffs)}", category="memory", force=force, indent_level=1)
     
-
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def _store_checkpoint(self, label: str, metrics: Dict[str, Any]) -> None:
         """Store checkpoint with memory limit to prevent leaks."""
@@ -490,7 +505,6 @@ class Debug:
             self.memory_checkpoints = (self.memory_checkpoints[:mid] + 
                                       self.memory_checkpoints[-mid:])
     
-
     def log_swap_time(self, component_id: Union[int, str], duration: float, 
                  component_type: str = "block", force: bool = False) -> None:
         """
@@ -517,7 +531,6 @@ class Debug:
                 message = f"{component_type} {component_id} swap: {duration*1000:.2f}ms"
             
             self.log(message, category="blockswap", force=force)
-    
     
     def get_swap_summary(self) -> Dict[str, Any]:
         """Get summary of swap operations for analysis"""
@@ -566,7 +579,6 @@ class Debug:
             summary['vram_variation_gb'] = max(self.vram_history) - min(self.vram_history)
         
         return summary
-    
     
     def clear_history(self) -> None:
         """Clear all history tracking"""
