@@ -231,7 +231,8 @@ def encode_all_batches(
         # Initialize tile_boundaries for encoding debug
         if runner.tile_debug == "encode" and runner.encode_tiled:
             debug.encode_tile_boundaries = []
-            debug.log("Tile debug enabled: collecting encode tile boundaries for visualization", category="vae")
+            debug.log("Tile debug enabled: encode tile boundaries will be visualized", category="vae", force=True)
+            debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
         
         # Process encoding
         for batch_idx in range(0, total_frames, step):
@@ -765,7 +766,8 @@ def decode_all_batches(
         # Initialize tile_boundaries for decoding debug
         if runner.tile_debug == "decode" and runner.decode_tiled:
             debug.decode_tile_boundaries = []
-            debug.log("Tile debug enabled: collecting decode tile boundaries for visualization", category="vae")
+            debug.log("Tile debug enabled: decode tile boundaries will be visualized", category="vae", force=True)
+            debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
         
         # Process decoding
         for batch_idx, upscaled_latent in enumerate(ctx['all_upscaled_latents']):
@@ -1139,7 +1141,6 @@ def postprocess_all_batches(
                     tiles = getattr(debug, attr, None)
                     if tiles:
                         sample = _draw_tile_boundaries(sample, debug, tiles, phase)
-                        setattr(debug, attr, [])
                         break
                 
                 # Move to tensor_offload_device if specified
