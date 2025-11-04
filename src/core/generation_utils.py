@@ -30,7 +30,7 @@ These utilities support the 4-phase pipeline implemented in generation_phases.py
 
 import os
 import torch
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Union
 from torchvision.transforms import Compose, Lambda, Normalize
 
 from .model_configuration import configure_runner
@@ -223,11 +223,11 @@ def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, ov
 
 
 def setup_generation_context(
-    dit_device: Optional[torch.device] = None,
-    vae_device: Optional[torch.device] = None,
-    dit_offload_device: Optional[torch.device] = None,
-    vae_offload_device: Optional[torch.device] = None,
-    tensor_offload_device: Optional[torch.device] = None,
+    dit_device: Optional[Union[str, torch.device]] = None,
+    vae_device: Optional[Union[str, torch.device]] = None,
+    dit_offload_device: Optional[Union[str, torch.device]] = None,
+    vae_offload_device: Optional[Union[str, torch.device]] = None,
+    tensor_offload_device: Optional[Union[str, torch.device]] = None,
     debug: Optional['Debug'] = None
 ) -> Dict[str, Any]:
     """
@@ -237,27 +237,30 @@ def setup_generation_context(
     generation context dictionary with all necessary state.
     
     Args:
-        dit_device: Device for DiT model (torch.device object, defaults to cpu)
-        vae_device: Device for VAE model (torch.device object, defaults to cpu)
-        dit_offload_device: Device to offload DiT to when not in use (optional torch.device)
-        vae_offload_device: Device to offload VAE to when not in use (optional torch.device)
-        tensor_offload_device: Device to offload intermediate tensors to (optional torch.device)
+        dit_device: Device for DiT model (str or torch.device, defaults to 'cpu')
+        vae_device: Device for VAE model (str or torch.device, defaults to 'cpu')
+        dit_offload_device: Device to offload DiT to when not in use (optional)
+        vae_offload_device: Device to offload VAE to when not in use (optional)
+        tensor_offload_device: Device to offload intermediate tensors to (optional)
         debug: Debug instance for logging
         
     Returns:
-        Dict[str, Any]: Generation context dictionary containing:
-            - dit_device: torch.device for DiT inference
-            - vae_device: torch.device for VAE inference
-            - offload device configurations
-            - state containers (latents, samples, etc.)
-            - ComfyUI integration hooks
+        Dict[str, Any]: Generation context dictionary with torch.device objects
     """
-    # Apply default devices if not specified
-    default_device = "cpu"
-    if dit_device is None:
-        dit_device = default_device
-    if vae_device is None:
-        vae_device = default_device
+    # Normalize devices to torch.device objects (follows PyTorch convention)
+    def _normalize_device(device_spec: Optional[Union[str, torch.device]]) -> torch.device:
+        """Convert device specification to torch.device object."""
+        if device_spec is None:
+            return torch.device("cpu")
+        if isinstance(device_spec, torch.device):
+            return device_spec
+        return torch.device(device_spec)
+    
+    dit_device = _normalize_device(dit_device)
+    vae_device = _normalize_device(vae_device)
+    dit_offload_device = _normalize_device(dit_offload_device) if dit_offload_device is not None else None
+    vae_offload_device = _normalize_device(vae_offload_device) if vae_offload_device is not None else None
+    tensor_offload_device = _normalize_device(tensor_offload_device) if tensor_offload_device is not None else None
     
     # Set LOCAL_RANK to 0 for single-GPU inference mode
     # CLI multi-GPU uses CUDA_VISIBLE_DEVICES to restrict visibility per worker
@@ -338,7 +341,7 @@ def prepare_runner(
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
-) -> Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]:
+) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
     """
     Prepare runner with model state management and global cache integration.
     Handles model changes and caching logic with independent DiT/VAE caching support.
@@ -366,7 +369,7 @@ def prepare_runner(
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
     Returns:
-        Tuple['VideoDiffusionInfer', bool, Dict[str, Any]]: Tuple containing:
+        Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
             - VideoDiffusionInfer: Configured runner instance with models loaded and settings applied
             - Dict[str, Any]: Cache context dictionary containing cache state and metadata with keys:
                 - 'global_cache': GlobalModelCache instance

@@ -39,7 +39,7 @@ def get_base_cache_dir() -> str:
         cache_dir = os.path.join(folder_paths.models_dir, SEEDVR2_FOLDER_NAME)
         folder_paths.add_model_folder_path(SEEDVR2_MODEL_TYPE, cache_dir)
     except:
-        cache_dir = f"./{SEEDVR2_MODEL_TYPE}_models"
+        cache_dir = f"./models/{SEEDVR2_FOLDER_NAME}"
     
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir

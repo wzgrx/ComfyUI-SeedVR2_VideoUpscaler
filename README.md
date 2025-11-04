@@ -142,7 +142,7 @@ check here from https://github.com/loscrossos/lib_flashattention/releases and ht
 
 3. Models
 
-   Will be automtically download into :
+   Will be automatically downloaded into:
    `models/SEEDVR2`
 
    or can be found here ([MODELS](https://huggingface.co/numz/SeedVR2_comfyUI/tree/main))
@@ -276,7 +276,7 @@ options:
                                              seedvr2_ema_3b_fp8_e4m3fn.safetensors,
                                              seedvr2_ema_7b_fp16.safetensors,
                                              seedvr2_ema_7b_fp8_e4m3fn.safetensors
-  --model_dir MODEL_DIR                   Directory containing the model files (default: seedvr2_models)
+  --model_dir MODEL_DIR                   Directory containing the model files (default: models/SEEDVR2)
   --skip_first_frames SKIP_FIRST_FRAMES   Skip the first frames during processing
   --load_cap LOAD_CAP                     Maximum number of frames to load from video (default: load all)
   --output OUTPUT                         Output video path (default: auto-generated)

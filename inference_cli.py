@@ -17,7 +17,7 @@ Features:
     - Advanced color correction methods
 
 Usage:
-    python inference_cli.py --video_path input.mp4 --resolution 1080 --model <model_name>
+    python inference_cli.py --input input.mp4|image.png|directory --resolution 1080 --model <model_name>
 
 Requirements:
     - Python 3.12+
@@ -69,12 +69,153 @@ from pathlib import Path
 from src.utils.downloads import download_weight
 from src.utils.debug import Debug
 from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
-
+from src.utils.constants import SEEDVR2_FOLDER_NAME
 debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
 # =============================================================================
 # Video I/O Functions
 # =============================================================================
+# Supported file extensions
+VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v'}
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
+
+def get_media_files(directory: str) -> List[str]:
+    """Get all video and image files from directory, sorted."""
+    files = []
+    for ext in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
+        files.extend(Path(directory).glob(f'*{ext}'))
+        files.extend(Path(directory).glob(f'*{ext.upper()}'))
+    return sorted([str(f) for f in files])
+
+def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
+    """Extract single frame from image file."""
+    debug.log(f"Loading image: {image_path}", category="file")
+    
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    
+    # Read image
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise ValueError(f"Cannot open image file: {image_path}")
+    
+    # Convert BGR to RGB
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Convert to float32 and normalize
+    frame = frame.astype(np.float32) / 255.0
+    
+    # Convert to tensor [1, H, W, C]
+    frames_tensor = torch.from_numpy(frame[None, ...]).to(torch.float16)
+    
+    debug.log(f"Image tensor shape: {frames_tensor.shape}, dtype: {frames_tensor.dtype}", category="memory")
+    
+    return frames_tensor, 30.0  # Default FPS for images
+
+def get_input_type(input_path: str) -> str:
+    """Determine input type: 'video', 'image', 'directory', or 'unknown'."""
+    path = Path(input_path)
+    
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+    
+    if path.is_dir():
+        return 'directory'
+    
+    ext = path.suffix.lower()
+    if ext in VIDEO_EXTENSIONS:
+        return 'video'
+    elif ext in IMAGE_EXTENSIONS:
+        return 'image'
+    else:
+        return 'unknown'
+
+def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
+                        input_type: Optional[str] = None) -> str:
+    """
+    Generate output path based on input path and format.
+    
+    Args:
+        input_path: Source file path
+        output_format: "video" or "png"
+        output_dir: Optional output directory
+        input_type: Optional input type ("image", "video", "directory")
+    
+    Returns:
+        Output path (file for single image/video, directory for sequences)
+    """
+    input_name = Path(input_path).stem
+    
+    if output_format == "png":
+        # Single image → single PNG file
+        if input_type == 'image':
+            if output_dir:
+                return str(Path(output_dir) / f"{input_name}_upscaled.png")
+            return f"output/{input_name}_upscaled.png"
+        # Video/sequence → directory of numbered PNGs
+        else:
+            if output_dir:
+                return str(Path(output_dir) / f"{input_name}_upscaled")
+            return f"output/{input_name}_upscaled"
+    else:
+        # Video format always returns file path
+        if output_dir:
+            return str(Path(output_dir) / f"{input_name}_upscaled.mp4")
+        return f"output/{input_name}_upscaled.mp4"
+
+def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
+                       output_path: Optional[str] = None) -> None:
+    """Process a single video or image file."""
+    input_type = get_input_type(input_path)
+    
+    if input_type == 'unknown':
+        debug.log(f"Skipping unsupported file: {input_path}", level="WARNING", category="file", force=True)
+        return
+    
+    debug.log(f"Processing {input_type}: {Path(input_path).name}", category="generation", force=True)
+    
+    # Extract frames
+    if input_type == 'video':
+        start_time = time.time()
+        frames_tensor, original_fps = extract_frames_from_video(
+            input_path, args.skip_first_frames, args.load_cap, args.prepend_frames
+        )
+        debug.log(f"Frame extraction time: {time.time() - start_time:.2f}s", category="timing")
+    else:
+        frames_tensor, original_fps = extract_frames_from_image(input_path)
+    
+    # Generate output path if not provided
+    output_path = output_path or generate_output_path(input_path, args.output_format, input_type=input_type)
+    
+    debug.log(f"Output will be saved to: {output_path}", category="file")
+    
+    # Process frames
+    processing_start = time.time()
+    result = _gpu_processing(frames_tensor, device_list, args)
+    debug.log(f"Processing time: {time.time() - processing_start:.2f}s", category="timing")
+
+    # Save results
+    is_png_format = args.output_format == "png"
+    is_single_image = input_type == 'image'
+    
+    if is_png_format and is_single_image:
+        # Single PNG file
+        os.makedirs(Path(output_path).parent, exist_ok=True)
+        frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_path, frame_bgr)
+        debug.log(f"Output saved to: {output_path}", category="file", force=True)
+    
+    elif is_png_format:
+        # PNG sequence (save_frames_to_png creates directory internally)
+        save_frames_to_png(result, output_path, base_name=Path(input_path).stem)
+        debug.log(f"PNG frames saved in directory: {output_path}", category="file", force=True)
+    
+    else:
+        # Video file
+        os.makedirs(Path(output_path).parent, exist_ok=True)
+        save_frames_to_video(result, output_path, original_fps)
+        debug.log(f"Output saved to video: {output_path}", category="file", force=True)
 
 def extract_frames_from_video(
     video_path: str, 
@@ -371,7 +512,7 @@ def _worker_process(
     model_dir = shared_args["model_dir"]
     model_name = shared_args["model"]
 
-    runner, _, _ = prepare_runner(
+    runner, cache_context = prepare_runner(
         dit_model=model_name,
         vae_model=DEFAULT_VAE,
         model_dir=model_dir,
@@ -393,6 +534,9 @@ def _worker_process(
         torch_compile_args_dit=torch_compile_args_dit,
         torch_compile_args_vae=torch_compile_args_vae
     )
+
+    # Store cache context in ctx for use in generation phases
+    ctx['cache_context'] = cache_context
 
     # Phase 1: Encode all batches
     ctx = encode_all_batches(
@@ -444,11 +588,15 @@ def _worker_process(
     # Get final result
     result_tensor = ctx['final_video']
 
-    # Ensure result is on CPU before converting to numpy
+    # Ensure result is on CPU
     if result_tensor.is_cuda or result_tensor.is_mps:
         result_tensor = result_tensor.cpu()
-    
-    # Send back result as numpy array to avoid CUDA transfers
+
+    # Convert ML-specific dtypes that NumPy doesn't support to float32
+    if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        result_tensor = result_tensor.to(torch.float32)
+
+    # Send back result as numpy array
     return_queue.put((proc_idx, result_tensor.numpy()))
 
 
@@ -508,13 +656,13 @@ def _gpu_processing(
     else:
         chunks = torch.chunk(frames_tensor, num_devices, dim=0)
 
-    manager = mp.Manager()
-    return_queue = manager.Queue()
+    # Use direct Queue with explicit unlimited size for large video chunks
+    return_queue = mp.Queue(maxsize=0)  # 0 = unlimited (explicit)
     workers = []
 
     shared_args = {
         "model": args.model,
-        "model_dir": args.model_dir if args.model_dir is not None else "./models/SEEDVR2",
+        "model_dir": args.model_dir if args.model_dir is not None else f"./models/{SEEDVR2_FOLDER_NAME}",
         "color_correction": args.color_correction,
         "input_noise_scale": args.input_noise_scale,
         "latent_noise_scale": args.latent_noise_scale,
@@ -550,6 +698,7 @@ def _gpu_processing(
         "compile_dynamo_recompile_limit": args.compile_dynamo_recompile_limit,
     }
 
+    # Start all workers
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
         p = mp.Process(
             target=_worker_process,
@@ -558,13 +707,15 @@ def _gpu_processing(
         p.start()
         workers.append(p)
 
+    # Collect results before joining to prevent deadlock
     results_np = [None] * num_devices
     collected = 0
     while collected < num_devices:
         proc_idx, res_np = return_queue.get()
         results_np[proc_idx] = res_np
         collected += 1
-
+    
+    # Now safe to join
     for p in workers:
         p.join()
 
@@ -676,13 +827,13 @@ def parse_arguments() -> argparse.Namespace:
     
     Note:
         - cuda_device argument only available on non-macOS systems
-        - Default model directory resolves to "seedvr2_models" if not specified
+        - Default model directory resolves to "models/SEEDVR2" if not specified
         - Tile size/overlap arguments use OneOrTwoValues for flexible input
     """
     parser = argparse.ArgumentParser(description="SeedVR2 Video Upscaler CLI")
     
-    parser.add_argument("--video_path", type=str, required=True,
-                        help="Path to input video file")
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to input video file, image file, or directory containing videos/images")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for generation (default: 42)")
     parser.add_argument("--resolution", type=int, default=1080,
@@ -694,16 +845,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default=DEFAULT_DIT,
                         choices=get_available_dit_models(),
                         help="Model to use (default: 3B FP8)")
-    parser.add_argument("--model_dir", type=str, default="seedvr2_models",
-                            help="Directory containing the model files (default: use cache directory)")
+    parser.add_argument("--model_dir", type=str, default=None,
+                        help=f"Directory containing the model files (default: models/{SEEDVR2_FOLDER_NAME})")
     parser.add_argument("--skip_first_frames", type=int, default=0,
                         help="Skip the first frames during processing")
     parser.add_argument("--load_cap", type=int, default=0,
                         help="Maximum number of frames to load from video (default: load all)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
-    parser.add_argument("--output_format", type=str, default="video", choices=["video", "png"],
-                        help="Output format: 'video' (mp4) or 'png' images (default: video)")
+    parser.add_argument("--output_format", type=str, default=None, 
+                        choices=["video", "png", None],
+                        help="Output format: 'video' (mp4) or 'png' images (default: auto-detect from input)")
     parser.add_argument("--color_correction", type=str, default="lab", 
                     choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
                     help="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)")
@@ -847,76 +999,65 @@ def main() -> None:
                 debug.log(f"Using device index 0 inside script (mapped to selected GPU)", category="device")
     
     try:
-        # Ensure --output is a directory when using PNG format
-        if args.output_format == "png":
-            output_path_obj = Path(args.output)
-            if output_path_obj.suffix:  # an extension is present, strip it
-                args.output = str(output_path_obj.with_suffix(''))
-        
-        debug.log(f"Output will be saved to: {args.output}", category="file")
-        
-        # Extract frames from video
-        debug.log(f"Extracting frames from video...", category="generation")
         start_time = time.time()
-        frames_tensor, original_fps = extract_frames_from_video(
-            args.video_path, 
-            args.skip_first_frames, 
-            args.load_cap,
-            args.prepend_frames
-        )
         
-        debug.log(f"Frame extraction time: {time.time() - start_time:.2f}s", category="timing")
-        # debug.log(f"Initial VRAM: {torch.cuda.memory_allocated() / 1024**3:.2f}GB", category="memory")
-
         # Parse GPU list
         if platform.system() == "Darwin":
             device_list = ["0"]
         else:
-            device_list = [d.strip() for d in str(args.cuda_device).split(',') if d.strip()] if args.cuda_device else ["0"]
-        
+            if args.cuda_device:
+                device_list = [d.strip() for d in str(args.cuda_device).split(',') if d.strip()]
+            else:
+                device_list = ["0"]
         if args.debug:
             debug.log(f"Using devices: {device_list}", category="device")
-        processing_start = time.time()
-        # Download both DiT and VAE models
+        
+        # Download models once before processing
         if not download_weight(dit_model=args.model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
             debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
             sys.exit(1)
-        result = _gpu_processing(frames_tensor, device_list, args)
-        generation_time = time.time() - processing_start
         
-        debug.log(f"Generation time: {generation_time:.2f}s", category="timing")
-        if platform.system() != "Darwin":
-            debug.log(f"Peak VRAM usage: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB", category="memory")
+        # Determine input type and process accordingly
+        input_type = get_input_type(args.input)
 
-        debug.log(f"Result shape: {result.shape}, dtype: {result.dtype}", category="memory")
-
-        # After generation_time calculation, choose saving method
-        if args.output_format == "png":
-            # Ensure output treated as directory
-            output_dir = args.output
-            base_name = Path(args.video_path).stem + "_upscaled"
-            debug.log(f"Saving PNG frames to directory: {output_dir}", category="file")
+        # Auto-detect output format if not specified
+        if args.output_format is None:
+            if input_type == 'video':
+                args.output_format = "video"
+            else:  # image or directory
+                args.output_format = "png"
             
-            save_start = time.time()
-            save_frames_to_png(result, output_dir, base_name)
+            debug.log(f"Auto-detected output format: {args.output_format}", 
+                    category="info", force=True)
+        
+        if input_type == 'directory':
+            media_files = get_media_files(args.input)
+            if not media_files:
+                debug.log(f"No video or image files found in directory: {args.input}", 
+                        level="ERROR", category="file", force=True)
+                sys.exit(1)
+            
+            debug.log(f"Found {len(media_files)} media files to process", category="file", force=True)
+            
+            for idx, file_path in enumerate(media_files, 1):
+                debug.log(f"Processing file {idx}/{len(media_files)}", category="generation", force=True)
+                
+                # generate_output_path handles None gracefully with "outputs" default
+                output_path = generate_output_path(file_path, args.output_format, args.output, 
+                                   input_type=get_input_type(file_path))
+                
+                # Process with explicit output path
+                process_single_file(file_path, args, device_list, output_path)
 
-            debug.log(f"Save time: {time.time() - save_start:.2f}s", category="timing")
-
+        elif input_type in ('video', 'image'):
+            process_single_file(args.input, args, device_list, args.output)
+        
         else:
-            # Save video
-            debug.log(f"Saving upscaled video to: {args.output}", category="file")
-            save_start = time.time()
-            save_frames_to_video(result, args.output, original_fps)
-            debug.log(f"Save time: {time.time() - save_start:.2f}s", category="timing")
+            debug.log(f"Unsupported input type: {args.input}", level="ERROR", category="file", force=True)
+            sys.exit(1)
         
         total_time = time.time() - start_time
-        debug.log(f"Upscaling completed successfully!", category="success", force=True)
-        if args.output_format == "png":
-            debug.log(f"PNG frames saved in directory: {args.output}", category="file", force=True)
-        else:
-            debug.log(f"Output saved to video: {args.output}", category="file", force=True)
-        debug.log(f"Total processing time: {total_time:.2f}s", category="timing", force=True)
-        debug.log(f"Average FPS: {len(frames_tensor) / generation_time:.2f} frames/sec", category="timing", force=True)
+        debug.log(f"All processing completed successfully in {total_time:.2f}s", category="success", force=True)
         
     except Exception as e:
         debug.log(f"Error during processing: {e}", level="ERROR", category="generation", force=True)

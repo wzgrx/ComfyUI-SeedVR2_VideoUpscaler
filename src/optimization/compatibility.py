@@ -7,6 +7,7 @@ Extracted from: seedvr2.py (lines 1045-1630)
 
 import torch
 import types
+import os
 
 # Flash Attention & Triton Compatibility Layer
 # 1. Flash Attention - speedup for attention operations
@@ -129,9 +130,10 @@ def _check_conv3d_memory_bug():
 NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = _check_conv3d_memory_bug()
 
 
-# Log all optimization status once on module import
-_optimization_status_logged = False
-if not _optimization_status_logged:
+# Log all optimization status once globally (cross-process) using environment variable
+if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
+    os.environ["SEEDVR2_OPTIMIZATIONS_LOGGED"] = "1"
+    
     # Flash Attention & Triton status
     has_both = FLASH_ATTN_AVAILABLE and TRITON_AVAILABLE
     has_neither = not FLASH_ATTN_AVAILABLE and not TRITON_AVAILABLE
@@ -153,8 +155,6 @@ if not _optimization_status_logged:
         torch_ver = torch.__version__.split('+')[0]
         cudnn_ver = torch.backends.cudnn.version()
         print(f"🔧 Conv3d workaround active: PyTorch {torch_ver}, cuDNN {cudnn_ver} (fixing VAE 3x memory bug)")
-    
-    _optimization_status_logged = True
 
 
 def call_rope_with_stability(method, *args, **kwargs):
