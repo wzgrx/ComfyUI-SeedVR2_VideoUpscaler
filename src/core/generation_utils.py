@@ -44,12 +44,13 @@ from ..utils.constants import get_script_directory
 script_directory = get_script_directory()
 
 
-def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Compose:
+def prepare_video_transforms(res_w: int, max_res_w: int = 0, debug: Optional['Debug'] = None) -> Compose:
     """
     Prepare optimized video transformation pipeline
     
     Args:
-        res_w (int): Target resolution width
+        res_w (int): Target resolution for shortest edge
+        max_res_w (int): Maximum resolution for any edge (0 = no limit)
         debug (Debug, optional): Debug instance for logging
         
     Returns:
@@ -57,20 +58,24 @@ def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Com
         
     Features:
         - Resolution-aware upscaling (no downsampling)
+        - Optional max resolution constraint on longest edge
         - Padding to divisible by 16 (no data loss)
         - Proper normalization for model compatibility
         - Memory-efficient tensor operations
     """
     if debug:
-        debug.log(f"Initializing video transformation pipeline for {res_w}px",
-                 category="setup", indent_level=1)
+        msg = f"Initializing video transformation pipeline for {res_w}px (shortest edge)"
+        if max_res_w > 0:
+            msg += f", max {max_res_w}px (any edge)"
+        debug.log(msg, category="setup", indent_level=1)
     
     return Compose([
         NaResize(
-            resolution=(res_w),
+            resolution=res_w,
             mode="side",
             # Upsample image, model only trained for high res
             downsample_only=False,
+            max_resolution=max_res_w,
         ),
         Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
         DivisiblePad((16, 16)),
@@ -79,7 +84,8 @@ def prepare_video_transforms(res_w: int, debug: Optional['Debug'] = None) -> Com
     ])
 
 
-def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debug'] = None, 
+def setup_video_transform(ctx: Dict[str, Any], res_w: int, max_res_w: int = 0, 
+                         debug: Optional['Debug'] = None, 
                          sample_frame: Optional[torch.Tensor] = None) -> Tuple[int, int, int, int]:
     """
     Setup video transformation pipeline and compute target dimensions.
@@ -87,6 +93,7 @@ def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debu
     Args:
         ctx: Generation context dictionary
         res_w: Target resolution for shortest edge
+        max_res_w: Maximum resolution for any edge (0 = no limit)
         debug: Debug instance for logging
         sample_frame: Optional sample frame tensor (C, H, W) to compute dimensions
         
@@ -112,13 +119,13 @@ def setup_video_transform(ctx: Dict[str, Any], res_w: int, debug: Optional['Debu
         return 0, 0, 0, 0
     
     # Create transformation pipeline (first time or after cleanup)
-    ctx['video_transform'] = prepare_video_transforms(res_w, debug)
+    ctx['video_transform'] = prepare_video_transforms(res_w, max_res_w, debug)
     
     # Compute dimensions if sample frame provided
     if sample_frame is not None:
         # Get true target size (after resize, before padding)
         temp_transform = Compose([
-            NaResize(resolution=res_w, mode="side", downsample_only=False),
+            NaResize(resolution=res_w, mode="side", downsample_only=False, max_resolution=max_res_w),
             Lambda(lambda x: torch.clamp(x, 0.0, 1.0))
         ])
         resized_sample = temp_transform(sample_frame)

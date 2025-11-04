@@ -81,6 +81,13 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     step=2,
                     tooltip="Target resolution for the shortest edge. Maintains aspect ratio."
                 ),
+                io.Int.Input("max_resolution",
+                    default=0,
+                    min=0,
+                    max=16384,
+                    step=2,
+                    tooltip="Maximum resolution for any edge. If any dimension exceeds this after new_resolution is applied, both dimensions are scaled down proportionally. 0 = no limit (default)."
+                ),
                 io.Int.Input("batch_size",
                     default=5,
                     min=1,
@@ -144,7 +151,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
-                seed: int, new_resolution: int = 1072, batch_size: int = 5,
+                seed: int, new_resolution: int = 1072, max_resolution: int = 0, batch_size: int = 5,
                 temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
@@ -162,6 +169,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             vae: VAE model configuration from SeedVR2LoadVAEModel node
             seed: Random seed for reproducible generation
             new_resolution: Target resolution for shortest edge (maintains aspect ratio)
+            max_resolution: Maximum resolution for any edge (0 = no limit)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
             temporal_overlap: Overlapping frames between batches (0-16)
             prepend_frames: Frames to prepend (0-32) to reduce initial artifacts.
@@ -388,7 +396,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Setup transform and compute dimensions
             sample_frame = image[0].permute(2, 0, 1).unsqueeze(0)
-            true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, debug, sample_frame)
+            true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, new_resolution, max_resolution, debug, sample_frame)
             
             # Build concise parameter info
             params_info = f"Batch size: {batch_size}"
@@ -398,14 +406,19 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 params_info += f", Temporal overlap: {temporal_overlap}"
             params_info += f", Seed: {seed}, Channels: {channels_info}"
             
+            # Build resolution constraint info
+            res_constraint = f"shortest edge: {new_resolution}px"
+            if max_resolution > 0:
+                res_constraint += f", max edge: {max_resolution}px"
+            
             # Log dimension flow with full context
             if true_h > 0:
                 frame_text = "frame" if input_frames <= 1 else "frames"
                 if true_h == padded_h and true_w == padded_w:
-                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Output: {true_w}x{true_h}px", 
+                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Output: {true_w}x{true_h}px ({res_constraint})", 
                              category="generation", force=True, indent_level=1)
                 else:
-                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px", 
+                    debug.log(f"Input: {input_frames} {frame_text}, {input_w}x{input_h}px → Padded: {padded_w}x{padded_h}px → Output: {true_w}x{true_h}px ({res_constraint})", 
                              category="generation", force=True, indent_level=1)
             
             debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
@@ -422,6 +435,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 progress_callback=progress_callback,
                 temporal_overlap=temporal_overlap,
                 res_w=new_resolution,
+                max_res_w=max_resolution,
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
             )

@@ -405,6 +405,7 @@ def _worker_process(
         progress_callback=None,
         temporal_overlap=shared_args["temporal_overlap"],
         res_w=shared_args["res_w"],
+        max_res_w=shared_args["max_resolution"],
         input_noise_scale=shared_args["input_noise_scale"],
         color_correction=shared_args.get("color_correction", "lab")
     )
@@ -520,6 +521,7 @@ def _gpu_processing(
         "debug": args.debug,
         "seed": args.seed,
         "res_w": args.resolution,
+        "max_resolution": args.max_resolution,
         "batch_size": args.batch_size,
         "temporal_overlap": args.temporal_overlap,
         "block_swap_config": {
@@ -685,6 +687,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Random seed for generation (default: 42)")
     parser.add_argument("--resolution", type=int, default=1080,
                         help="Target resolution of the short side (default: 1080)")
+    parser.add_argument("--max_resolution", type=int, default=0,
+                        help="Maximum resolution for any edge. Scales down proportionally if exceeded after --resolution is applied. 0 = no limit (default: 0)")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Number of frames per batch (default: 1)")
     parser.add_argument("--model", type=str, default=DEFAULT_DIT,
