@@ -41,6 +41,10 @@ if script_dir not in sys.path:
 # Set environment variable so all spawned processes can find modules
 os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 
+# Import Debug early for validation (single instance used throughout)
+from src.utils.debug import Debug
+debug = Debug(enabled=True)  # Enabled for validation errors, updated later by --debug flag
+
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
@@ -49,14 +53,35 @@ if mp.get_start_method(allow_none=True) != 'spawn':
 if platform.system() != "Darwin":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
-    # 2) Pre-parse command line to configure CUDA_VISIBLE_DEVICES early
+    # 2) Pre-parse and validate CUDA devices before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
     _pre_parser.add_argument("--cuda_device", type=str, default=None)
     _pre_args, _ = _pre_parser.parse_known_args()
+    
     if _pre_args.cuda_device is not None:
         device_list_env = [x.strip() for x in _pre_args.cuda_device.split(',') if x.strip()!='']
+        
+        # Validate device IDs before any torch operations
+        import torch as _torch_check
+        if _torch_check.cuda.is_available():
+            available_count = _torch_check.cuda.device_count()
+            invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
+            if invalid_devices:
+                debug.log(
+                    f"Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
+                    f"Available devices: 0-{available_count-1} (total: {available_count})",
+                    level="ERROR", category="device", force=True
+                )
+                sys.exit(1)
+        else:
+            debug.log(
+                "CUDA is not available on this system. Cannot use --cuda_device argument.",
+                level="ERROR", category="device", force=True
+            )
+            sys.exit(1)
+        
+        # After validation, set CUDA_VISIBLE_DEVICES for single GPU
         if len(device_list_env) == 1:
-            # Single GPU: restrict visibility now
             os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # -------------------------------------------------------------
@@ -67,10 +92,8 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from src.utils.downloads import download_weight
-from src.utils.debug import Debug
 from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
 from src.utils.constants import SEEDVR2_FOLDER_NAME
-debug = Debug(enabled=False)  # Default to disabled, can be enabled via CLI
 
 
 # =============================================================================
@@ -875,8 +898,8 @@ def _gpu_processing(
             debug.log(f"Removing {args.prepend_frames} prepended frames from output", category="generation")
             result_tensor = result_tensor[args.prepend_frames:]
         else:
-            debug.log(f"Warning: prepend_frames ({args.prepend_frames}) >= total frames ({result_tensor.shape[0]}), skipping removal", 
-                     level="WARNING", category="generation")
+            debug.log(f"prepend_frames ({args.prepend_frames}) >= total frames ({result_tensor.shape[0]}), skipping removal", 
+                     level="WARNING", category="generation", force=True)
     
     return result_tensor
 
@@ -1073,6 +1096,8 @@ def main() -> None:
     
     # Parse arguments
     args = parse_arguments()
+    
+    # Update debug instance with --debug flag
     debug.enabled = args.debug
     
     debug.log("Arguments:", category="setup")
