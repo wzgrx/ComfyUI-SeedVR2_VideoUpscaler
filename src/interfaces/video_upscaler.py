@@ -92,7 +92,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     min=1,
                     max=16384,
                     step=4,
-                    tooltip="Frames processed per batch. Minimum 5 for temporal consistency. Higher = better quality but more VRAM."
+                    tooltip="Frames per batch (4n+1: 1,5,9,13,17,21,...). Ideally match shot length. Higher = better temporal consistency + speed but more VRAM."
                 ),
                 io.Int.Input("temporal_overlap",
                     default=0,

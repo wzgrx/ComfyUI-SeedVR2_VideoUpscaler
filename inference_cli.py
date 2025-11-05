@@ -2,36 +2,55 @@
 """
 SeedVR2 Video Upscaler - Standalone CLI Interface
 
-Multi-GPU capable command-line interface for high-quality video upscaling using
-SeedVR2 diffusion models. Supports both single and multi-GPU processing with
-temporal overlap blending.
+Command-line interface for high-quality upscaling using SeedVR2 diffusion models.
+Supports single and multi-GPU processing with advanced memory optimization.
 
-Features:
-    - Multi-GPU parallel processing with automatic workload distribution
-    - Temporal overlap blending for smooth transitions between chunks
-    - BlockSwap memory optimization for limited VRAM scenarios
-    - VAE tiling for large resolution processing
-    - Comprehensive dtype management (BFloat16 compute pipeline)
-    - Torch.compile integration for 20-40% speedup
-    - Multiple output formats (video/PNG sequences)
-    - Advanced color correction methods
+Key Features:
+    • Multi-GPU Processing: Automatic workload distribution across multiple GPUs with
+      temporal overlap blending for seamless transitions
+    • Memory Optimization: BlockSwap for limited VRAM, VAE tiling for large resolutions,
+      intelligent tensor offloading between processing phases
+    • Performance: Torch.compile integration, BFloat16 compute pipeline,
+      efficient model caching for batch processing
+    • Flexibility: Multiple output formats (MP4/PNG), advanced color correction methods,
+      directory batch processing with auto-format detection
+    • Quality Control: Temporal overlap blending, frame prepending for artifact reduction,
+      configurable noise scales for detail preservation
+
+Architecture:
+    The CLI implements a 4-phase processing pipeline:
+    1. Encode: VAE encoding with optional input noise and tiling
+    2. Upscale: DiT transformer upscaling with latent space diffusion
+    3. Decode: VAE decoding with optional tiling
+    4. Postprocess: Color correction and temporal blending
 
 Usage:
-    python inference_cli.py --input input.mp4|image.png|directory --resolution 1080 --model <model_name>
+    python inference_cli.py --input video.mp4 --resolution 1080
+    For complete usage examples, run: python inference_cli.py --help
 
 Requirements:
-    - Python 3.12+
-    - PyTorch 2.0+
-    - CUDA 12.0+ (for NVIDIA GPUs)
+    • Python 3.10+
+    • PyTorch 2.4+ with CUDA 12.1+ (NVIDIA) or MPS (Apple Silicon)
+    • 16GB+ VRAM recommended (8GB minimum with BlockSwap)
+    • OpenCV, NumPy for video I/O
+
+Model Support:
+    • 3B models: seedvr2_ema_3b_fp16.safetensors (default), _fp8_e4m3fn/GGUF variants
+    • 7B models: seedvr2_ema_7b_fp16.safetensors, _fp8_e4m3fn/GGUF variants
+    • VAE: ema_vae_fp16.safetensors (shared across all models)
+    • Auto-downloads from HuggingFace on first run with SHA256 validation
 """
 
+# Standard library imports
 import sys
 import os
 import argparse
 import time
 import platform
 import multiprocessing as mp
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Literal
+from datetime import datetime
+from pathlib import Path
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,18 +61,19 @@ if script_dir not in sys.path:
 os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 
 # Import Debug early for validation (single instance used throughout)
+# NOTE: Must import after path setup but before CUDA validation
 from src.utils.debug import Debug
 debug = Debug(enabled=True)  # Enabled for validation errors, updated later by --debug flag
 
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
-# -------------------------------------------------------------
-# 1) Configure VRAM management (cudaMallocAsync) before heavy imports
+
+# Configure VRAM management and validate CUDA devices before heavy imports
 if platform.system() != "Darwin":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
-    # 2) Pre-parse and validate CUDA devices before torch import
+    # Pre-parse CUDA device argument for validation and environment setup
     _pre_parser = argparse.ArgumentParser(add_help=False)
     _pre_parser.add_argument("--cuda_device", type=str, default=None)
     _pre_args, _ = _pre_parser.parse_known_args()
@@ -61,7 +81,8 @@ if platform.system() != "Darwin":
     if _pre_args.cuda_device is not None:
         device_list_env = [x.strip() for x in _pre_args.cuda_device.split(',') if x.strip()!='']
         
-        # Validate device IDs before any torch operations
+        # Temporary torch import for CUDA device validation only
+        # Must happen before setting CUDA_VISIBLE_DEVICES and before main torch import
         import torch as _torch_check
         if _torch_check.cuda.is_available():
             available_count = _torch_check.cuda.device_count()
@@ -80,20 +101,32 @@ if platform.system() != "Darwin":
             )
             sys.exit(1)
         
-        # After validation, set CUDA_VISIBLE_DEVICES for single GPU
+        # Set CUDA_VISIBLE_DEVICES for single GPU after validation
         if len(device_list_env) == 1:
             os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
-# -------------------------------------------------------------
-# Import heavy dependencies (torch, etc.) after environment configuration
+# Heavy dependency imports after environment configuration
 import torch
 import cv2
 import numpy as np
-from datetime import datetime
-from pathlib import Path
+
+# Project imports
 from src.utils.downloads import download_weight
 from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
 from src.utils.constants import SEEDVR2_FOLDER_NAME
+from src.core.generation_utils import (
+    setup_generation_context, 
+    prepare_runner, 
+    compute_generation_info, 
+    log_generation_start,
+    blend_overlapping_frames
+)
+from src.core.generation_phases import (
+    encode_all_batches, 
+    upscale_all_batches, 
+    decode_all_batches, 
+    postprocess_all_batches
+)
 
 
 # =============================================================================
@@ -162,22 +195,54 @@ def _parse_offload_device(offload_arg: str, platform_type: str = None, cache_ena
 
 
 # =============================================================================
-# Video I/O Functions
+# Constants
 # =============================================================================
+
 # Supported file extensions
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
+
+# =============================================================================
+# Video I/O Functions
+# =============================================================================
+
 def get_media_files(directory: str) -> List[str]:
-    """Get all video and image files from directory, sorted."""
+    """
+    Get all video and image files from directory, sorted alphabetically.
+    
+    Args:
+        directory: Path to directory to scan
+        
+    Returns:
+        Sorted list of file paths (strings) matching video or image extensions
+    """
     files = []
     for ext in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
         files.extend(Path(directory).glob(f'*{ext}'))
         files.extend(Path(directory).glob(f'*{ext.upper()}'))
     return sorted([str(f) for f in files])
 
+
 def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
-    """Extract single frame from image file."""
+    """
+    Extract single frame from image file and convert to tensor format.
+    
+    Reads image using OpenCV, converts BGR to RGB, normalizes to [0,1] range,
+    and formats as single-frame video tensor for consistent processing.
+    
+    Args:
+        image_path: Path to input image file
+        
+    Returns:
+        Tuple containing:
+            - frames_tensor: Single frame as tensor [1, H, W, C], Float16, range [0,1]
+            - fps: Default FPS value (30.0) for image-to-video conversion
+    
+    Raises:
+        FileNotFoundError: If image file doesn't exist
+        ValueError: If image cannot be opened
+    """
     debug.log(f"Loading image: {image_path}", category="file")
     
     if not os.path.exists(image_path):
@@ -201,8 +266,20 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     
     return frames_tensor, 30.0  # Default FPS for images
 
-def get_input_type(input_path: str) -> str:
-    """Determine input type: 'video', 'image', 'directory', or 'unknown'."""
+
+def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'unknown']:
+    """
+    Determine input type from file path.
+    
+    Args:
+        input_path: Path to input file or directory
+        
+    Returns:
+        Input type: 'video', 'image', 'directory', or 'unknown'
+        
+    Raises:
+        FileNotFoundError: If input path doesn't exist
+    """
     path = Path(input_path)
     
     if not path.exists():
@@ -218,6 +295,7 @@ def get_input_type(input_path: str) -> str:
         return "image"
     else:
         return "unknown"
+
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
                         input_type: Optional[str] = None) -> str:
@@ -252,21 +330,23 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
             return str(Path(output_dir) / f"{input_name}_upscaled.mp4")
         return f"output/{input_name}_upscaled.mp4"
 
+
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
                        output_path: Optional[str] = None, format_auto_detected: bool = False,
                        runner_cache: Optional[Dict[str, Any]] = None) -> int:
     """
-    Process a single video or image file.
+    Process a single video or image file with optional model caching.
     
     Args:
         input_path: Path to input file
-        args: Command-line arguments
-        device_list: List of GPU device IDs
-        output_path: Optional explicit output path
+        args: Command-line arguments with all processing settings
+        device_list: List of GPU device IDs as strings
+        output_path: Optional explicit output path (auto-generated if None)
         format_auto_detected: Whether output format was auto-detected
+        runner_cache: Optional cache dict for model reuse across multiple files
     
     Returns:
-        Number of frames processed
+        Number of frames processed from the input
     """
     input_type = get_input_type(input_path)
     
@@ -280,7 +360,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     if input_type == "video":
         start_time = time.time()
         frames_tensor, original_fps = extract_frames_from_video(
-            input_path, args.skip_first_frames, args.load_cap, args.prepend_frames
+            input_path, args.skip_first_frames, args.load_cap
         )
         debug.log(f"Frame extraction time: {time.time() - start_time:.2f}s", category="timing")
     else:
@@ -289,11 +369,16 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     # Track frames before processing (for FPS calculation)
     input_frame_count = len(frames_tensor)
     
-    # Generate output path if not provided
-    output_path = output_path or generate_output_path(input_path, args.output_format, input_type=input_type)
+    # Generate or validate output path
+    if output_path is None:
+        output_path = generate_output_path(input_path, args.output_format, input_type=input_type)
+    elif not Path(output_path).suffix or (args.output_format == "png" and input_type != "image"):
+        # No extension or PNG sequence → treat as directory, generate filename
+        output_path = generate_output_path(input_path, args.output_format, 
+                                         output_dir=output_path, input_type=input_type)
     
     # Show format with auto-detection indicator
-    format_prefix = "Auto-detected" if format_auto_detected else "Output"
+    format_prefix = "Auto-detected" if format_auto_detected else "Requested"
     debug.log(f"{format_prefix} output format: {args.output_format}", category="info", force=True, indent_level=1)
     
     # Process frames
@@ -335,6 +420,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     
     return input_frame_count
 
+
 def extract_frames_from_video(
     video_path: str, 
     skip_first_frames: int = 0, 
@@ -343,8 +429,9 @@ def extract_frames_from_video(
     """
     Extract frames from video file and convert to tensor format.
     
-    Reads video using OpenCV, converts BGR to RGB, normalizes to [0,1] range,
-    and optionally prepends reversed frames to reduce initial artifacts.
+    Reads video using OpenCV, converts BGR to RGB, normalizes to [0,1] range.
+    Note: Frame prepending is handled later in the processing pipeline via
+    compute_generation_info(), not in this function.
     
     Args:
         video_path: Path to input video file
@@ -453,9 +540,6 @@ def save_frames_to_video(
         ValueError: If video writer cannot be initialized
     """
     debug.log(f"Saving {frames_tensor.shape[0]} frames to video: {output_path}", category="file")
-
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
     # Convert tensor to numpy and denormalize
     frames_np = frames_tensor.cpu().numpy()
@@ -531,7 +615,7 @@ def _process_frames_core(
     frames_tensor: torch.Tensor,
     args: argparse.Namespace,
     device_id: str,
-    debug: 'Debug',
+    debug: Debug,
     runner_cache: Optional[Dict[str, Any]] = None
 ) -> torch.Tensor:
     """
@@ -549,12 +633,7 @@ def _process_frames_core(
     
     Returns:
         Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
-    """
-    from src.core.generation_utils import setup_generation_context, prepare_runner
-    from src.core.generation_phases import (
-        encode_all_batches, upscale_all_batches, decode_all_batches, postprocess_all_batches
-    )
-    
+    """    
     # Determine platform and convert device IDs to full names
     platform_type = _get_platform_type()
     inference_device = _device_id_to_name(device_id, platform_type)
@@ -649,7 +728,6 @@ def _process_frames_core(
         runner_cache['runner'] = runner
     
     # Compute generation info and log start (handles prepending internally)
-    from src.core.generation_utils import compute_generation_info, log_generation_start
     frames_tensor, gen_info = compute_generation_info(
         ctx=ctx,
         images=frames_tensor,
@@ -713,7 +791,7 @@ def _process_frames_core(
 
 def _worker_process(
     proc_idx: int, 
-    device_id: int, 
+    device_id: str, 
     frames_np: np.ndarray, 
     shared_args: Dict[str, Any], 
     return_queue: mp.Queue
@@ -726,7 +804,7 @@ def _worker_process(
     """
     if platform.system() != "Darwin":
         # Limit CUDA visibility to the chosen GPU BEFORE importing torch
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        os.environ["CUDA_VISIBLE_DEVICES"] = device_id
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     import torch
@@ -858,9 +936,7 @@ def _gpu_processing(
         p.join()
 
     # Concatenate results with overlap blending using shared function
-    if args.temporal_overlap > 0 and num_devices > 1:
-        from src.core.generation_utils import blend_overlapping_frames
-        
+    if args.temporal_overlap > 0 and num_devices > 1:        
         overlap = args.temporal_overlap
         result_tensor = None
         
@@ -907,6 +983,7 @@ def _gpu_processing(
                      level="WARNING", category="generation", force=True)
     
     return result_tensor
+
 
 # =============================================================================
 # Argument Parsing
@@ -968,112 +1045,164 @@ def parse_arguments() -> argparse.Namespace:
         - Default model directory resolves to "models/SEEDVR2" if not specified
         - Tile size/overlap arguments use OneOrTwoValues for flexible input
     """
+    
+    # Multi-line usage examples for --help
+    usage_examples = """
+Examples:
+
+  Basic usage:
+    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input image.jpg --resolution 720 --model seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors
+    
+  Multi-GPU processing:
+    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input video.mp4 --cuda_device 0,1 --temporal_overlap 4 --resolution 1080 --batch_size 81 --prepend_frames 2 --temporal_overlap 4
+
+  Memory optimization (Low VRAM):
+    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input image.png --blocks_to_swap 36 --swap_io_components --dit_offload_device cpu --model seedvr2_ema_3b_fp8_e4m3fn.safetensors
+    
+  High resolution:
+    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input video.mp4 --resolution 1440 --max_resolution 3840 --batch_size 45 --vae_encode_tiling_enabled --vae_decode_tiling_enabled
+    
+  Batch directory processing:
+    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input media/ --output processed/ --output_format png --cuda_device 0 --cache_dit --cache_vae --dit_offload_device cpu --vae_offload_device cpu --resolution 1080 --max_resolution 1920   
+
+"""
+    
     parser = argparse.ArgumentParser(
-        description="SeedVR2 Video Upscaler CLI",
-        allow_abbrev=False  # Require full argument names for safety
+        description="SeedVR2 Video Upscaler - CLI for high-quality image/video upscaling and batch processing",
+        epilog=usage_examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False
     )
     
-    parser.add_argument("--input", type=str, required=True,
-                        help="Path to input video file, image file, or directory containing videos/images")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for generation (default: 42)")
-    parser.add_argument("--resolution", type=int, default=1080,
-                        help="Target resolution of the short side (default: 1080)")
-    parser.add_argument("--max_resolution", type=int, default=0,
-                        help="Maximum resolution for any edge. Scales down proportionally if exceeded after --resolution is applied. 0 = no limit (default: 0)")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Number of frames per batch (default: 1)")
-    parser.add_argument("--model", type=str, default=DEFAULT_DIT,
+    # Input/Output
+    io_group = parser.add_argument_group('Input/Output options')
+    io_group.add_argument("--input", type=str, required=True,
+                        help="Input: video file (.mp4, .avi, etc.), image file (.png, .jpg, etc.), or directory")
+    io_group.add_argument("--output", type=str, default=None,
+                        help="Output path (default: auto-generated in 'output/' directory)")
+    io_group.add_argument("--output_format", type=str, default=None, choices=["mp4", "png", None],
+                        help="Output format: 'mp4' (video) or 'png' (image sequence). Default: auto-detect from input type")
+    io_group.add_argument("--model_dir", type=str, default=None,
+                        help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
+    
+    # Model Selection
+    model_group = parser.add_argument_group('Model selection')
+    model_group.add_argument("--model", type=str, default=DEFAULT_DIT,
                         choices=get_available_dit_models(),
-                        help="Model to use (default: 3B FP8)")
-    parser.add_argument("--model_dir", type=str, default=None,
-                        help=f"Directory containing the model files (default: models/{SEEDVR2_FOLDER_NAME})")
-    parser.add_argument("--skip_first_frames", type=int, default=0,
-                        help="Skip the first frames during processing")
-    parser.add_argument("--load_cap", type=int, default=0,
-                        help="Maximum number of frames to load from video (default: load all)")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output path (default: auto-generated, if output_format is png, it will be a directory)")
-    parser.add_argument("--output_format", type=str, default=None, 
-                        choices=["mp4", "png", None],
-                        help="Output format: 'mp4' video or 'png' images (default: auto-detect from input)")
-    parser.add_argument("--color_correction", type=str, default="lab", 
+                        help="DiT model to use. Options: 3B (fp16/fp8/GGUF) or 7B (fp16/fp8/GGUF). Default: 3B FP8")
+    
+    # Processing Parameters
+    process_group = parser.add_argument_group('Processing parameters')
+    process_group.add_argument("--resolution", type=int, default=1080,
+                        help="Target short-side resolution in pixels (default: 1080)")
+    process_group.add_argument("--max_resolution", type=int, default=0,
+                        help="Maximum resolution for any edge. Scales down if exceeded. 0 = no limit (default: 0)")
+    process_group.add_argument("--batch_size", type=int, default=5,
+                        help="Frames per batch (must follow 4n+1: 1, 5, 9, 13, 17, 21,...). "
+                         "Ideally matches shot length for best temporal consistency. Higher values improve "
+                         "quality and speed but require more VRAM. Default: 5")
+    process_group.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
+    process_group.add_argument("--skip_first_frames", type=int, default=0,
+                        help="Skip N initial frames (default: 0)")
+    process_group.add_argument("--load_cap", type=int, default=0,
+                        help="Load maximum N frames from video. 0 = load all (default: 0)")
+    process_group.add_argument("--prepend_frames", type=int, default=0,
+                        help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
+    process_group.add_argument("--temporal_overlap", type=int, default=0,
+                        help="Frames to overlap between batches/GPUs for smooth blending (default: 0)")
+    
+    # Quality Control
+    quality_group = parser.add_argument_group('Quality control')
+    quality_group.add_argument("--color_correction", type=str, default="lab", 
                     choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
-                    help="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)")
-    parser.add_argument("--input_noise_scale", type=float, default=0.0,
-                        help="Input noise scale (0.0-1.0) to reduce artifacts at high resolutions. (default: 0.0)")
-    parser.add_argument("--latent_noise_scale", type=float, default=0.0,
-                        help="Latent space noise scale (0.0-1.0). Adds noise during diffusion, can soften details. Use if input_noise doesn't help (default: 0.0)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
+                    help="Color correction: 'lab' (best, perceptual matching), 'wavelet' (natural, preserves detail), "
+                         "'wavelet_adaptive' (adaptive saturation), 'hsv' (hue-conditional), 'adain' (style transfer), "
+                         "'none' (no correction). Default: lab")
+    quality_group.add_argument("--input_noise_scale", type=float, default=0.0,
+                        help="Input noise (0.0-1.0) to add variation to input (default: 0.0)")
+    quality_group.add_argument("--latent_noise_scale", type=float, default=0.0,
+                        help="Latent noise (0.0-1.0) during diffusion. Can soften details (default: 0.0)")
+    
+    # Device Management
+    device_group = parser.add_argument_group('Device management')
     if platform.system() != "Darwin":
-        parser.add_argument("--cuda_device", type=str, default=None,
-                        help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
-    parser.add_argument("--blocks_to_swap", type=int, default=0,
-                        help="Number of transformer blocks to swap for VRAM optimization (default: 0, disabled). "
-                             "Up to 32 for 3B model, 36 for 7B model. Requires --dit_offload_device to be set.")
-    parser.add_argument("--temporal_overlap", type=int, default=0,
-                        help="Temporal overlap for processing (default: 0, no temporal overlap)")
-    parser.add_argument("--prepend_frames", type=int, default=0,
-                        help="Number of frames to prepend to the video (default: 0). This can help with artifacts at the start of the video and are automatically removed after processing")
-    parser.add_argument("--swap_io_components", action="store_true",
-                        help="Offload DiT input/output embeddings and normalization layers for additional VRAM savings. "
-                             "Requires --dit_offload_device to be set. Can be used alone or with --blocks_to_swap.")
-    parser.add_argument("--dit_offload_device", type=str, default="none",
-                        help="Device to offload DiT model when not in use (default: none). "
-                             "Options: 'none' (keep on inference device), 'cpu' (offload to RAM/system memory), "
-                             "or GPU device ID like '1' (offload to another GPU). "
-                             "Required when BlockSwap is enabled (blocks_to_swap > 0 or swap_io_components = True). "
-                             "Multi-GPU example: --cuda_device 0 --dit_offload_device 1 distributes memory across GPUs.")
-    parser.add_argument("--vae_offload_device", type=str, default="none",
-                        help="Device to offload VAE when not in use (default: none). "
-                             "Options: 'none' (keep on inference device), 'cpu' (offload to RAM/system memory), "
-                             "or GPU device ID like '1' (offload to another GPU). "
-                             "Use 'cpu' or another GPU to free VRAM between encode/decode phases.")
-    parser.add_argument("--tensor_offload_device", type=str, default="cpu",
-                        help="Device to offload intermediate tensors between phases (default: cpu). "
-                             "Options: 'cpu' (offload to RAM/system memory - recommended), 'none' (keep on inference device), "
-                             "or GPU device ID like '1' (offload to another GPU). "
-                             "Use 'cpu' to prevent VRAM accumulation for long videos.")
-    parser.add_argument("--cache_dit", action="store_true",
-                        help="Cache DiT model between files for faster multi-file processing (single GPU only). Model cached on device specified by --dit_offload_device (default: cpu)")
-    parser.add_argument("--cache_vae", action="store_true",
-                        help="Cache VAE model between files for faster multi-file processing (single GPU only). Model cached on device specified by --vae_offload_device (default: cpu)")
-    parser.add_argument("--vae_encode_tiling_enabled", action="store_true",
-                        help="Enable VAE encode tiling for VRAM reduction during encoding. Disabled by default.")
-    parser.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
-                        help="VAE encode tile size in pixels (default: 1024). Only used when encode tiling is enabled. Adjust based on available VRAM. Use single integer or two integers 'h w'.")
-    parser.add_argument("--vae_encode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="VAE encode tile overlap in pixels (default: 128). Only used when encode tiling is enabled. Higher values improve blending at the cost of slower processing. Use single integer or two integers 'h w'.")
-    parser.add_argument("--vae_decode_tiling_enabled", action="store_true",
-                        help="Enable VAE decode tiling for VRAM reduction during decoding. Disabled by default.")
-    parser.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
-                        help="VAE decode tile size in pixels (default: 1024). Only used when decode tiling is enabled. Adjust based on available VRAM. Use single integer or two integers 'h w'.")
-    parser.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="VAE decode tile overlap in pixels (default: 128). Only used when decode tiling is enabled. Higher values improve blending at the cost of slower processing. Use single integer or two integers 'h w'.")
-    parser.add_argument("--tile_debug", type=str, default="false", 
-                        choices=["false", "encode", "decode"],
-                        help="Enable tile debug visualization: 'false' (default, no overlay), 'encode' (show encode tiles), 'decode' (show decode tiles). Only works when respective tiling is enabled.")
-    parser.add_argument("--attention_mode", type=str, default="sdpa",
+        device_group.add_argument("--cuda_device", type=str, default=None,
+                        help="CUDA device(s): single '0' or multi-GPU '0,1,2'. Default: device 0")
+    device_group.add_argument("--dit_offload_device", type=str, default="none",
+                        help="DiT offload device when idle: 'none' (keep on GPU), 'cpu' (offload to RAM), or GPU ID. "
+                             "Frees VRAM between phases. Required for BlockSwap. Default: none")
+    device_group.add_argument("--vae_offload_device", type=str, default="none",
+                        help="VAE offload device when idle: 'none', 'cpu', or GPU ID. Frees VRAM between phases. Default: none")
+    device_group.add_argument("--tensor_offload_device", type=str, default="cpu",
+                        help="Intermediate tensor storage: 'cpu' (recommended), 'none' (keep on GPU), or GPU ID. Default: cpu")
+    
+    # Memory Optimization (BlockSwap)
+    blockswap_group = parser.add_argument_group('Memory optimization (BlockSwap)')
+    blockswap_group.add_argument("--blocks_to_swap", type=int, default=0,
+                        help="Transformer blocks to swap for VRAM savings. 0-32 (3B) or 0-36 (7B). "
+                             "Requires --dit_offload_device. Default: 0 (disabled)")
+    blockswap_group.add_argument("--swap_io_components", action="store_true",
+                        help="Offload DiT I/O layers for extra VRAM savings. Requires --dit_offload_device")
+    
+    # VAE Tiling
+    vae_group = parser.add_argument_group('VAE tiling (for high resolution upscale)')
+    vae_group.add_argument("--vae_encode_tiling_enabled", action="store_true",
+                        help="Enable VAE encode tiling to reduce VRAM during encoding")
+    vae_group.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
+                        help="Encode tile size in pixels (height width or single value). Default: 1024")
+    vae_group.add_argument("--vae_encode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
+                        help="Encode tile overlap in pixels. Higher = better blending. Default: 128")
+    vae_group.add_argument("--vae_decode_tiling_enabled", action="store_true",
+                        help="Enable VAE decode tiling to reduce VRAM during decoding (recommended for 4K+)")
+    vae_group.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
+                        help="Decode tile size in pixels (height width or single value). Default: 1024")
+    vae_group.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
+                        help="Decode tile overlap in pixels. Higher = better blending. Default: 128")
+    vae_group.add_argument("--tile_debug", type=str, default="false", choices=["false", "encode", "decode"],
+                        help="Visualize tiles: 'false' (default), 'encode', or 'decode'")
+    
+    # Performance
+    perf_group = parser.add_argument_group('Performance optimization')
+    perf_group.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn"],
-                        help="Attention computation backend: 'sdpa' (default, always available) or 'flash_attn' (requires flash-attn package, faster)")
-    parser.add_argument("--compile_dit", action="store_true", 
-                        help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+)")
-    parser.add_argument("--compile_vae", action="store_true",
-                        help="Enable torch.compile for VAE model (15-25%% speedup, requires PyTorch 2.0+)")
-    parser.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
-                        help="Torch compile backend (default: inductor)")
-    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-                        help="Torch compile mode (default: default)")
-    parser.add_argument("--compile_fullgraph", action="store_true",
-                        help="Compile entire model as single graph. False allows graph breaks (more compatible), True enforces no breaks (maximum optimization but fragile). Default: False")
-    parser.add_argument("--compile_dynamic", action="store_true",
-                        help="Handle varying input shapes without recompilation. False specializes for exact shapes, True creates dynamic kernels. Default: False")
-    parser.add_argument("--compile_dynamo_cache_size_limit", type=int, default=64,
-                        help="Max cached compiled versions per function. Higher = more memory, lower = more recompilation. Default: 64")
-    parser.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
-                        help="Max recompilation attempts before falling back to uncompiled. Safety limit to prevent infinite loops. Default: 128")
+                        help="Attention backend: 'sdpa' (default, always available) or 'flash_attn' (faster, requires package)")
+    perf_group.add_argument("--compile_dit", action="store_true",
+                        help="Enable torch.compile for DiT (20-40%% speedup, slower first run)")
+    perf_group.add_argument("--compile_vae", action="store_true",
+                        help="Enable torch.compile for VAE (15-25%% speedup, slower first run)")
+    perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
+                        help="Compile backend (default: inductor)")
+    perf_group.add_argument("--compile_mode", type=str, default="default", 
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="Compile mode (default: default)")
+    perf_group.add_argument("--compile_fullgraph", action="store_true",
+                        help="Force single graph compilation (max optimization, may fail)")
+    perf_group.add_argument("--compile_dynamic", action="store_true",
+                        help="Handle dynamic input shapes (slower but more flexible)")
+    perf_group.add_argument("--compile_dynamo_cache_size_limit", type=int, default=64,
+                        help="Max compiled versions cached per function (default: 64)")
+    perf_group.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
+                        help="Max recompile attempts before fallback (default: 128)")
+    
+    # Model Caching (for batch processing)
+    cache_group = parser.add_argument_group('Model caching (batch processing)')
+    cache_group.add_argument("--cache_dit", action="store_true",
+                        help="Cache DiT model between files (single GPU only, speeds up directory processing)")
+    cache_group.add_argument("--cache_vae", action="store_true",
+                        help="Cache VAE model between files (single GPU only, speeds up directory processing)")
+    
+    # Debugging
+    debug_group = parser.add_argument_group('Debugging')
+    debug_group.add_argument("--debug", action="store_true",
+                        help="Enable verbose debug logging")
+    
+    # Auto-show help if no arguments provided
+    if len(sys.argv) == 1:
+        sys.argv.append('--help')
+
     return parser.parse_args()
+
 
 # =============================================================================
 # Main Entry Point
