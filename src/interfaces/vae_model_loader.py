@@ -35,82 +35,129 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             display_name="SeedVR2 (Down)Load VAE Model",
             category="SEEDVR2",
             description=(
-                "Configure VAE model for SeedVR2 encoding/decoding. Supports tiled processing for VRAM reduction, "
-                "model caching, and torch.compile optimization. Connect output to SeedVR2 Video Upscaler."
+                "Load and configure SeedVR2 VAE (Variational Autoencoder) for encoding/decoding video frames to/from latent space. "
+                "Supports tiled processing to handle high resolutions on limited VRAM, model caching, "
+                "multi-GPU offloading, and torch.compile acceleration. \n\n"
+                "Connect to Video Upscaler node."
             ),
             inputs=[
                 io.Combo.Input("model",
                     options=vae_models,
                     default=DEFAULT_VAE,
-                    tooltip="VAE model for encoding/decoding. Models will automatically download on first use. Additional models can be added to the ComfyUI models folder."
+                    tooltip=(
+                        "VAE (Variational Autoencoder) model for encoding/decoding.\n"
+                        "Models automatically download on first use.\n"
+                        "Additional models can be added to the ComfyUI models folder."
+                    )
                 ),
                 io.Combo.Input("device",
                     options=devices,
                     default=devices[0],
-                    tooltip="Device for VAE inference (encoding/decoding)"
+                    tooltip="GPU/CPU device for VAE model inference (encoding/decoding phases)"
                 ),
                 io.Boolean.Input("encode_tiled",
                     default=False,
                     optional=True,
-                    tooltip="Enable tiled decoding to reduce VRAM during decoding"
+                    tooltip="Enable tiled encoding to reduce VRAM usage during the encoding phase"
                 ),
                 io.Int.Input("encode_tile_size",
                     default=1024,
                     min=64,
                     step=32,
                     optional=True,
-                    tooltip="Encoding tile size in pixels (default: 1024). Adjust based on available VRAM."
+                    tooltip=(
+                        "Encoding tile size in pixels (default: 1024).\n"
+                        "Applied to both height and width.\n"
+                        "Lower values reduce VRAM usage but may increase processing time.\n"
+                        "Only used when encode_tiled is enabled."
+                    )
                 ),
                 io.Int.Input("encode_tile_overlap",
                     default=128,
                     min=0,
                     step=32,
                     optional=True,
-                    tooltip="Pixel overlap between encoding tiles to reduce visible seams (default: 128). Higher values improve blending at the cost of slower processing."
+                    tooltip=(
+                        "Pixel overlap between encoding tiles (default: 128).\n"
+                        "Reduces visible seams between tiles through blending.\n"
+                        "Higher values improve quality but slow processing.\n"
+                        "Only used when encode_tiled is enabled."
+                    )
                 ),
                 io.Boolean.Input("decode_tiled",
                     default=False,
                     optional=True,
-                    tooltip="Enable tiled decoding to reduce VRAM during decoding"
+                    tooltip="Enable tiled decoding to reduce VRAM usage during the decoding phase"
                 ),
                 io.Int.Input("decode_tile_size",
                     default=1024,
                     min=64,
                     step=32,
                     optional=True,
-                    tooltip="Decoding tile size in pixels (default: 1024). Adjust based on available VRAM."
+                    tooltip=(
+                        "Decoding tile size in pixels (default: 1024).\n"
+                        "Applied to both height and width.\n"
+                        "Lower values reduce VRAM usage but may increase processing time.\n"
+                        "Only used when decode_tiled is enabled."
+                    )
                 ),
                 io.Int.Input("decode_tile_overlap",
                     default=128,
                     min=0,
                     step=32,
                     optional=True,
-                    tooltip="Pixel overlap between decoding tiles to reduce visible seams (default: 128). Higher values improve blending at the cost of slower processing."
+                    tooltip=(
+                        "Pixel overlap between decoding tiles (default: 128).\n"
+                        "Reduces visible seams between tiles through blending.\n"
+                        "Higher values improve quality but slow processing.\n"
+                        "Only used when decode_tiled is enabled."
+                    )
                 ),
                 io.Combo.Input("tile_debug",
                     options=["false", "encode", "decode"],
                     default="false",
                     optional=True,
-                    tooltip="Enable tile debug visualization: 'false' (no overlay), 'encode' (show encode tiles), 'decode' (show decode tiles). Only works when respective tiling is enabled."
+                    tooltip=(
+                        "Tile debug visualization mode:\n"
+                        "• 'false': No visualization overlay (default)\n"
+                        "• 'encode': Show encoding tile boundaries\n"
+                        "• 'decode': Show decoding tile boundaries\n"
+                        "\n"
+                        "Only works when respective tiling is enabled."
+                    )
                 ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="none",
                     optional=True,
-                    tooltip="Device to offload VAE model to when not in use. Select 'none' to keep on inference device, or 'cpu' for CPU offload (slower but reduces VRAM usage). Required for BlockSwap."
+                    tooltip=(
+                        "Device to offload VAE model when not actively processing.\n"
+                        "• 'none': Keep model on inference device (default, fastest)\n"
+                        "• 'cpu': Offload to system RAM (reduces VRAM usage)\n"
+                        "• 'cuda:X': Offload to another GPU (good balance if available)"
+                    )
                 ),
                 io.Boolean.Input("cache_model",
                     default=False,
                     optional=True,
-                    tooltip="Keep VAE model loaded on offload_device between workflow runs. Useful for batch processing."
+                    tooltip=(
+                        "Keep VAE model loaded on offload_device between workflow runs.\n"
+                        "Useful for batch processing to avoid repeated loading.\n"
+                        "Requires offload_device to be set."
+                    )
                 ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
-                    tooltip="Optional torch.compile settings from SeedVR2 Torch Compile Settings node for speedup"
+                    tooltip=(
+                        "Optional torch.compile optimization settings from SeedVR2 Torch Compile Settings node.\n"
+                        "Provides 15-25% speedup with compatible PyTorch 2.0+ and Triton installation."
+                    )
                 ),
             ],
             outputs=[
-                io.Custom("SEEDVR2_VAE").Output()
+                io.Custom("SEEDVR2_VAE").Output(
+                    tooltip="VAE model configuration containing model path, device settings, tiling parameters, and compilation options. Connect to Video Upscaler node."
+                )
             ]
         )
     

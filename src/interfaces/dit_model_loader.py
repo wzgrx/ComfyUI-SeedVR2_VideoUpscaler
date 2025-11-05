@@ -34,19 +34,25 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             display_name="SeedVR2 (Down)Load DiT Model",
             category="SEEDVR2",
             description=(
-                "Configure DiT model for SeedVR2 upscaling. Supports BlockSwap for limited VRAM, "
-                "model caching, and torch.compile optimization. Connect output to SeedVR2 Video Upscaler."
+                "Load and configure SeedVR2 DiT (Diffusion Transformer) model for video upscaling. "
+                "Supports BlockSwap memory optimization for low VRAM systems, model caching for batch processing, "
+                "multi-GPU offloading, and torch.compile acceleration. \n\n"
+                "Connect to Video Upscaler node."
             ),
             inputs=[
                 io.Combo.Input("model",
                     options=dit_models,
                     default=DEFAULT_DIT,
-                    tooltip="DiT model for upscaling. Models will automatically download on first use. Additional models can be added to the ComfyUI models folder."
+                    tooltip=(
+                        "DiT (Diffusion Transformer) model for video upscaling.\n"
+                        "Models automatically download on first use.\n"
+                        "Additional models can be added to the ComfyUI models folder."
+                    )
                 ),
                 io.Combo.Input("device",
                     options=devices,
                     default=devices[0],
-                    tooltip="Device for DiT inference (upscaling)"
+                    tooltip="GPU/CPU device for DiT model inference (upscaling phase)"
                 ),
                 io.Int.Input("blocks_to_swap",
                     default=0,
@@ -54,23 +60,44 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     max=36,
                     step=1,
                     optional=True,
-                    tooltip="Number of transformer blocks to swap. Requires offload_device to be set and different from device. 0=disabled. 3B model: 0-32 blocks, 7B model: 0-36 blocks."
+                    tooltip=(
+                        "Number of transformer blocks to swap between devices for VRAM optimization.\n"
+                        "• 0: Disabled (default)\n"
+                        "• 3B model: 0-32 blocks\n"
+                        "• 7B model: 0-36 blocks\n"
+                        "\n"
+                        "Requires offload_device to be set and different from device."
+                    )
                 ),
                 io.Boolean.Input("swap_io_components",
                     default=False,
                     optional=True,
-                    tooltip="Offload input/output embeddings and norm layers. Requires offload_device to be set and different from device."
+                    tooltip=(
+                        "Offload input/output embeddings and normalization layers to reduce VRAM.\n"
+                        "Requires offload_device to be set and different from device."
+                    )
                 ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="none",
                     optional=True,
-                    tooltip="Device to offload DiT model to when not in use. Select 'none' to keep on inference device, or 'cpu' for CPU offload (slower but reduces VRAM usage). Required for BlockSwap."
+                    tooltip=(
+                        "Device to offload DiT model when not actively processing.\n"
+                        "• 'none': Keep model on inference device (default, fastest)\n"
+                        "• 'cpu': Offload to system RAM (reduces VRAM usage)\n"
+                        "• 'cuda:X': Offload to another GPU (good balance if available)\n"
+                        "\n"
+                        "Required for BlockSwap (blocks_to_swap or swap_io_components)."
+                    )
                 ),
                 io.Boolean.Input("cache_model",
                     default=False,
                     optional=True,
-                    tooltip="Keep DiT model loaded on offload_device between workflow runs. Useful for batch processing."
+                    tooltip=(
+                        "Keep DiT model loaded on offload_device between workflow runs.\n"
+                        "Useful for batch processing to avoid repeated loading.\n"
+                        "Requires offload_device to be set."
+                    )
                 ),
                 io.Combo.Input("attention_mode",
                     options=["sdpa", "flash_attn"],
@@ -78,20 +105,25 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     optional=True,
                     tooltip=(
                         "Attention computation backend:\n"
-                        "• sdpa: PyTorch scaled_dot_product_attention (default, always available)\n"
-                        "• flash_attn: Flash Attention 2 (faster, requires flash-attn package)\n"
+                        "• sdpa: PyTorch scaled_dot_product_attention (default, stable, always available)\n"
+                        "• flash_attn: Flash Attention 2 (faster on supported hardware, requires flash-attn package)\n"
                         "\n"
-                        "SDPA is recommended as the default - it's stable and works everywhere.\n"
-                        "Flash Attention provides speedup on some hardware through optimized CUDA kernels."
+                        "SDPA is recommended - stable and works everywhere.\n"
+                        "Flash Attention provides speedup through optimized CUDA kernels on compatible GPUs."
                     )
                 ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
-                    tooltip="Optional torch.compile settings from SeedVR2 Torch Compile Settings node for speedup"
+                    tooltip=(
+                        "Optional torch.compile optimization settings from SeedVR2 Torch Compile Settings node.\n"
+                        "Provides 20-40% speedup with compatible PyTorch 2.0+ and Triton installation."
+                    )
                 ),
             ],
             outputs=[
-                io.Custom("SEEDVR2_DIT").Output()
+                io.Custom("SEEDVR2_DIT").Output(
+                    tooltip="DiT model configuration containing model path, device settings, BlockSwap parameters, and compilation options. Connect to Video Upscaler node."
+                )
             ]
         )
     

@@ -703,11 +703,11 @@ def _process_frames_core(
             'offload_device': dit_offload,
         },
         encode_tiled=args.vae_encode_tiling_enabled,
-        encode_tile_size=args.vae_encode_tile_size,
-        encode_tile_overlap=args.vae_encode_tile_overlap,
+        encode_tile_size=(args.vae_encode_tile_size, args.vae_encode_tile_size),
+        encode_tile_overlap=(args.vae_encode_tile_overlap, args.vae_encode_tile_overlap),
         decode_tiled=args.vae_decode_tiling_enabled,
-        decode_tile_size=args.vae_decode_tile_size,
-        decode_tile_overlap=args.vae_decode_tile_overlap,
+        decode_tile_size=(args.vae_decode_tile_size, args.vae_decode_tile_size),
+        decode_tile_overlap=(args.vae_decode_tile_overlap, args.vae_decode_tile_overlap),
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
@@ -980,53 +980,12 @@ def _gpu_processing(
 # Argument Parsing
 # =============================================================================
 
-class OneOrTwoValues(argparse.Action):
-    """
-    Custom argparse action for tile size arguments accepting 1 or 2 integers.
-    
-    Allows flexible input formats:
-        - Single integer: --tile_size 1024 → (1024, 1024)
-        - Two integers: --tile_size 1024 768 → (1024, 768)
-        - Comma-separated: --tile_size 1024,768 → (1024, 768)
-    
-    Used for VAE tiling parameters where height and width can be specified
-    separately or as a single value applied to both dimensions.
-    """
-    
-    def __call__(
-        self, 
-        parser: argparse.ArgumentParser, 
-        namespace: argparse.Namespace, 
-        values: List[str], 
-        option_string: Optional[str] = None
-    ) -> None:
-        """Parse and validate tile size arguments."""
-        if len(values) not in [1, 2]:
-            parser.error(f"{option_string} requires 1 or 2 arguments")
-
-        if len(values) == 1:
-            values = values[0]
-            if ',' in values:
-                values = [v.strip() for v in values.split(',') if v.strip()]
-            else:
-                values = values.split()
-        
-        try:
-            result = tuple(int(v) for v in values)
-            if len(result) == 1:
-                result = (result[0], result[0])  # Convert single value to (h, w)
-            setattr(namespace, self.dest, result)
-        except ValueError:
-            parser.error(f"{option_string} arguments must be integers")
-
-
 def parse_arguments() -> argparse.Namespace:
     """
     Parse and validate command-line arguments for SeedVR2 CLI.
     
     Configures all available options including model selection, processing parameters,
-    memory optimization settings, and output configuration. Uses custom action classes
-    for complex argument types (e.g., OneOrTwoValues for tile sizes).
+    memory optimization settings, and output configuration.
     
     Returns:
         Parsed arguments namespace with all CLI parameters
@@ -1034,7 +993,6 @@ def parse_arguments() -> argparse.Namespace:
     Note:
         - cuda_device argument only available on non-macOS systems
         - Default model directory resolves to "models/SEEDVR2" if not specified
-        - Tile size/overlap arguments use OneOrTwoValues for flexible input
     """
     
     # Multi-line usage examples for --help
@@ -1107,13 +1065,13 @@ Examples:
     quality_group = parser.add_argument_group('Quality control')
     quality_group.add_argument("--color_correction", type=str, default="lab", 
                     choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
-                    help="Color correction: 'lab' (best, perceptual matching), 'wavelet' (natural, preserves detail), "
-                         "'wavelet_adaptive' (adaptive saturation), 'hsv' (hue-conditional), 'adain' (style transfer), "
-                         "'none' (no correction). Default: lab")
+                    help="Color correction method: 'lab' (perceptual color matching, recommended), 'wavelet' (frequency-based), "
+                    "'wavelet_adaptive' (wavelet + saturation correction), 'hsv' (hue-conditional), 'adain' (statistical transfer), "
+                    "'none' (disabled) (default: lab)")
     quality_group.add_argument("--input_noise_scale", type=float, default=0.0,
-                        help="Input noise (0.0-1.0) to add variation to input (default: 0.0)")
+                        help="Input noise injection scale (0.0-1.0). Adds variation to input images (default: 0.0)")
     quality_group.add_argument("--latent_noise_scale", type=float, default=0.0,
-                        help="Latent noise (0.0-1.0) during diffusion. Can soften details (default: 0.0)")
+                        help="Latent noise injection scale (0.0-1.0). Adds variation to latent space (default: 0.0)")
     
     # Device Management
     device_group = parser.add_argument_group('Device management')
@@ -1140,16 +1098,16 @@ Examples:
     vae_group = parser.add_argument_group('VAE tiling (for high resolution upscale)')
     vae_group.add_argument("--vae_encode_tiling_enabled", action="store_true",
                         help="Enable VAE encode tiling to reduce VRAM during encoding")
-    vae_group.add_argument("--vae_encode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
-                        help="Encode tile size in pixels (height width or single value). Default: 1024")
-    vae_group.add_argument("--vae_encode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="Encode tile overlap in pixels. Higher = better blending. Default: 128")
+    vae_group.add_argument("--vae_encode_tile_size", type=int, default=1024,
+                        help="VAE encode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_encode_tiling_enabled is set")
+    vae_group.add_argument("--vae_encode_tile_overlap", type=int, default=128,
+                        help="VAE encode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_encode_tiling_enabled is set")
     vae_group.add_argument("--vae_decode_tiling_enabled", action="store_true",
-                        help="Enable VAE decode tiling to reduce VRAM during decoding (recommended for 4K+)")
-    vae_group.add_argument("--vae_decode_tile_size", action=OneOrTwoValues, nargs='+', default=(1024, 1024),
-                        help="Decode tile size in pixels (height width or single value). Default: 1024")
-    vae_group.add_argument("--vae_decode_tile_overlap", action=OneOrTwoValues, nargs='+', default=(128, 128),
-                        help="Decode tile overlap in pixels. Higher = better blending. Default: 128")
+                        help="Enable VAE decode tiling to reduce VRAM during decoding")
+    vae_group.add_argument("--vae_decode_tile_size", type=int, default=1024,
+                        help="VAE decode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_decode_tiling_enabled is set")
+    vae_group.add_argument("--vae_decode_tile_overlap", type=int, default=128,
+                        help="VAE decode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_decode_tiling_enabled is set")
     vae_group.add_argument("--tile_debug", type=str, default="false", choices=["false", "encode", "decode"],
                         help="Visualize tiles: 'false' (default), 'encode', or 'decode'")
     
@@ -1158,23 +1116,23 @@ Examples:
     perf_group.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn"],
                         help="Attention backend: 'sdpa' (default, always available) or 'flash_attn' (faster, requires package)")
-    perf_group.add_argument("--compile_dit", action="store_true",
-                        help="Enable torch.compile for DiT (20-40%% speedup, slower first run)")
+    perf_group.add_argument("--compile_dit", action="store_true", 
+                        help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",
-                        help="Enable torch.compile for VAE (15-25%% speedup, slower first run)")
+                        help="Enable torch.compile for VAE model (15-25%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_backend", type=str, default="inductor", choices=["inductor", "cudagraphs"],
-                        help="Compile backend (default: inductor)")
-    perf_group.add_argument("--compile_mode", type=str, default="default", 
-                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-                        help="Compile mode (default: default)")
+                        help="Compilation backend: 'inductor' (full optimization with Triton) or 'cudagraphs' (lightweight, no kernel optimization) (default: inductor)")
+    perf_group.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="Optimization level: 'default' (fast compilation), 'reduce-overhead' (lower overhead), 'max-autotune' (best runtime, slow compilation), "
+                        "'max-autotune-no-cudagraphs' (like max-autotune without cudagraphs) (default: default)")
     perf_group.add_argument("--compile_fullgraph", action="store_true",
-                        help="Force single graph compilation (max optimization, may fail)")
+                        help="Compile entire model as single graph (faster but less flexible). May fail with dynamic shapes (default: False)")
     perf_group.add_argument("--compile_dynamic", action="store_true",
-                        help="Handle dynamic input shapes (slower but more flexible)")
+                        help="Handle varying input shapes without recompilation. Useful for different resolutions/batch sizes (default: False)")
     perf_group.add_argument("--compile_dynamo_cache_size_limit", type=int, default=64,
-                        help="Max compiled versions cached per function (default: 64)")
+                        help="Max cached compiled versions per function. Increase when using many different input shapes. Higher uses more memory (default: 64)")
     perf_group.add_argument("--compile_dynamo_recompile_limit", type=int, default=128,
-                        help="Max recompile attempts before fallback (default: 128)")
+                        help="Max recompilation attempts before fallback to eager mode. Safety limit to prevent compilation loops (default: 128)")
     
     # Model Caching (for batch processing)
     cache_group = parser.add_argument_group('Model caching (batch processing)')
@@ -1232,12 +1190,12 @@ def main() -> None:
     for key, value in vars(args).items():
         debug.log(f"{key}: {value}", category="none", indent_level=1)
 
-    if args.vae_encode_tiling_enabled and (args.vae_encode_tile_overlap[0] >= args.vae_encode_tile_size[0] or args.vae_encode_tile_overlap[1] >= args.vae_encode_tile_size[1]):
-        debug.log(f"VAE encode tile overlap {args.vae_encode_tile_overlap} must be smaller than tile size {args.vae_encode_tile_size}", level="ERROR", category="vae", force=True)
+    if args.vae_encode_tiling_enabled and args.vae_encode_tile_overlap >= args.vae_encode_tile_size:
+        debug.log(f"VAE encode tile overlap ({args.vae_encode_tile_overlap}) must be smaller than tile size ({args.vae_encode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
-    if args.vae_decode_tiling_enabled and (args.vae_decode_tile_overlap[0] >= args.vae_decode_tile_size[0] or args.vae_decode_tile_overlap[1] >= args.vae_decode_tile_size[1]):
-        debug.log(f"VAE decode tile overlap {args.vae_decode_tile_overlap} must be smaller than tile size {args.vae_decode_tile_size}", level="ERROR", category="vae", force=True)
+    if args.vae_decode_tiling_enabled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
+        debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
     # Validate BlockSwap configuration - either blocks_to_swap or swap_io_components requires dit_offload_device

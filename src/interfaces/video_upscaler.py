@@ -53,46 +53,72 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             display_name="SeedVR2 Video Upscaler",
             category="SEEDVR2",
             description=(
-                "High-quality video upscaling using diffusion models. "
-                "Supports RGB and RGBA formats, temporal consistency, and adaptive VRAM management."
+                "SeedVR2 main upscaling node: processes video frames using DiT and VAE models with diffusion-based enhancement. "
+                "Handles RGB/RGBA formats, maintains temporal consistency across frames, applies color correction, "
+                "and manages VRAM through intelligent tensor offloading. \n\n"
+                "Requires DiT and VAE model configurations."
             ),
             inputs=[
                 io.Image.Input("image",
-                    tooltip="Input video frames. Accepts both RGB (3-channel) and RGBA (4-channel) images. Output will match input format."
+                    tooltip=(
+                        "Input video frames as image batch.\n"
+                        "Accepts both RGB (3-channel) and RGBA (4-channel) formats.\n"
+                        "Output format will match input format."
+                    )
                 ),
                 io.Custom("SEEDVR2_DIT").Input("dit",
-                    tooltip="DiT model configuration from SeedVR2 Load DiT Model node"
+                    tooltip="DiT model configuration from SeedVR2 (Down)Load DiT Model node"
                 ),
                 io.Custom("SEEDVR2_VAE").Input("vae",
-                    tooltip="VAE model configuration from SeedVR2 Load VAE Model node"
+                    tooltip="VAE model configuration from SeedVR2 (Down)Load VAE Model node"
                 ),
                 io.Int.Input("seed",
                     default=42,
                     min=0,
                     max=2**32 - 1,
                     step=1,
-                    tooltip="Random seed for generation. Same seed = same output."
+                    tooltip=(
+                        "Random seed for reproducible generation (default: 42).\n"
+                        "Same seed with same inputs produces identical output."
+                    )
                 ),
                 io.Int.Input("new_resolution",
                     default=1080,
                     min=16,
                     max=16384,
                     step=2,
-                    tooltip="Target resolution for the shortest edge. Maintains aspect ratio."
+                    tooltip=(
+                        "Target resolution for the shortest edge in pixels (default: 1080).\n"
+                        "Automatically maintains aspect ratio of input.\n"
+                        "Even values required for optimal processing."
+                    )
                 ),
                 io.Int.Input("max_resolution",
                     default=0,
                     min=0,
                     max=16384,
                     step=2,
-                    tooltip="Maximum resolution for any edge. If any dimension exceeds this after new_resolution is applied, both dimensions are scaled down proportionally. 0 = no limit (default)."
+                    tooltip=(
+                        "Maximum resolution limit for any dimension (default: 0, no limit).\n"
+                        "If any edge exceeds this after applying new_resolution,\n"
+                        "both dimensions are scaled down proportionally.\n"
+                        "Useful to prevent excessive VRAM usage on extreme aspect ratios."
+                    )
                 ),
                 io.Int.Input("batch_size",
                     default=5,
                     min=1,
                     max=16384,
                     step=4,
-                    tooltip="Frames per batch (4n+1: 1,5,9,13,17,21,...). Ideally match shot length. Higher = better temporal consistency + speed but more VRAM."
+                    tooltip=(
+                        "Number of frames processed together per batch (default: 5).\n"
+                        "Must follow pattern 4n+1: 1, 5, 9, 13, 17, 21, ...\n"
+                        "\n"
+                        "• Higher values: Better temporal consistency and faster processing\n"
+                        "• Lower values: Reduced VRAM usage\n"
+                        "\n"
+                        "Ideally match to shot length for best quality."
+                    )
                 ),
                 io.Int.Input("temporal_overlap",
                     default=0,
@@ -100,7 +126,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     max=16,
                     step=1,
                     optional=True,
-                    tooltip="Overlapping frames between batches for smoother transitions. 0 = disabled. Values 1-4 work well for temporal consistency."
+                    tooltip=(
+                        "Overlapping frames between consecutive batches (default: 0, disabled).\n"
+                        "Improves temporal consistency across batch boundaries through blending.\n"
+                        "Values 1-4 work well for most content."
+                    )
                 ),
                 io.Int.Input("prepend_frames",
                     default=0,
@@ -108,12 +138,26 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     max=32,
                     step=1,
                     optional=True,
-                    tooltip="Number of frames to prepend to the video (reversed from start). This can help with artifacts at the start of the video and are automatically removed after processing."
+                    tooltip=(
+                        "Number of frames to prepend (reversed from start) before processing (default: 0).\n"
+                        "Helps reduce artifacts at video beginning.\n"
+                        "Prepended frames are automatically removed from final output."
+                    )
                 ),
                 io.Combo.Input("color_correction",
                     options=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"],
                     default="lab",
-                    tooltip="Color correction method: 'lab' (full perceptual color matching with detail preservation, recommended), 'wavelet' (frequency-based natural colors, preserves details), 'wavelet_adaptive' (wavelet base + targeted saturation correction), 'hsv' (hue-conditional saturation matching), 'adain' (statistical style transfer), 'none' (no correction)"
+                    tooltip=(
+                        "Corrects color shifts in upscaled output to match original input (default: lab).\n"
+                        "The upscaling process may alter colors; this applies color grading to restore them.\n"
+                        "\n"
+                        "• lab: Perceptual color matching with detail preservation (recommended)\n"
+                        "• wavelet: Frequency-based natural colors, preserves fine details\n"
+                        "• wavelet_adaptive: Wavelet base with targeted saturation correction\n"
+                        "• hsv: Hue-conditional saturation matching\n"
+                        "• adain: Statistical style transfer approach\n"
+                        "• none: No color correction applied"
+                    )
                 ),
                 io.Float.Input("input_noise_scale",
                     default=0.0,
@@ -121,7 +165,12 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     max=1.0,
                     step=0.001,
                     optional=True,
-                    tooltip="Input noise injection scale [0.0-1.0]. Adds variation to input. 0.0 = disabled."
+                    tooltip=(
+                        "Input noise injection scale (default: 0.0, disabled).\n"
+                        "Adds controlled variation to input images before encoding.\n"
+                        "Range: 0.0 (no noise) to 1.0 (maximum noise).\n"
+                        "Can help with certain types of artifacts."
+                    )
                 ),
                 io.Float.Input("latent_noise_scale",
                     default=0.0,
@@ -129,22 +178,38 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     max=1.0,
                     step=0.001,
                     optional=True,
-                    tooltip="Latent noise injection scale [0.0-1.0]. Adds variation to latent space. 0.0 = disabled."
+                    tooltip=(
+                        "Latent space noise injection scale (default: 0.0, disabled).\n"
+                        "Adds controlled variation during the diffusion process.\n"
+                        "Range: 0.0 (no noise) to 1.0 (maximum noise).\n"
+                        "Can soften details if input_noise_scale doesn't help."
+                    )
                 ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="cpu",
                     optional=True,
-                    tooltip="Device to offload intermediate tensors. 'cpu' prevents VRAM accumulation for long videos. 'none' keeps all tensors on inference device (faster but increases VRAM usage)."
+                    tooltip=(
+                        "Device for storing intermediate tensors between processing phases (default: cpu).\n"
+                        "• 'none': Keep all tensors on inference device (fastest but highest VRAM usage)\n"
+                        "• 'cpu': Offload to system RAM (recommended for long videos, slower transfers)\n"
+                        "• 'cuda:X': Offload to another GPU (good balance if available, faster than CPU)"
+                    )
                 ),
                 io.Boolean.Input("enable_debug",
                     default=False,
                     optional=True,
-                    tooltip="Show detailed memory usage and timing information during generation, useful for troubleshooting."
+                    tooltip=(
+                        "Enable detailed debug logging (default: False).\n"
+                        "Shows memory usage, timing information, and processing details.\n"
+                        "Useful for troubleshooting errors and performance issues."
+                    )
                 ),
             ],
             outputs=[
-                io.Image.Output()
+                io.Image.Output(
+                    tooltip="Upscaled video frames with color correction applied. Format (RGB/RGBA) matches input. Range [0, 1] normalized for ComfyUI compatibility."
+                )
             ]
         )
     
