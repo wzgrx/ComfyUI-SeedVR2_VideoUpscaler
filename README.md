@@ -4,7 +4,7 @@
 
 Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for ComfyUI that enables high-quality video and image upscaling.
 
-Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#️-run-as-standalone) section.
+Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#️-run-as-standalone-cli) section.
 
 <img src="docs/demo_01.jpg">
 <img src="docs/demo_02.jpg">
@@ -19,7 +19,7 @@ Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#�
 - [🔧 Requirements](#-requirements)
 - [📦 Installation](#-installation)
 - [📖 Usage](#-usage)
-- [🖥️ Run as Standalone](#️-run-as-standalone)
+- [🖥️ Run as Standalone](#️-run-as-standalone-cli)
 - [⚠️ Limitations](#️-limitations)
 - [🤝 Contributing](#-contributing)
 - [🙏 Credits](#-credits)
@@ -63,7 +63,7 @@ We're actively working on improvements and new features. To stay informed:
 
 **2025.07.03**
 
-- 🛠️ Can run as **standalone mode** with **Multi GPU** see [🖥️ Run as Standalone](#️-run-as-standalone)
+- 🛠️ Can run as **standalone mode** with **Multi GPU** see [🖥️ Run as Standalone](#️-run-as-standalone-cli)
 
 **2025.06.30**
 
@@ -797,8 +797,8 @@ For detailed contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Get Help:**
 - YouTube: [AInVFX Channel](https://www.youtube.com/@AInVFX)
-- GitHub Issues: For bug reports and feature requests
-- GitHub Discussions: For questions and community support
+- GitHub [Issues](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/issues): For bug reports and feature requests
+- GitHub [Discussions](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/discussions): For questions and community support
 - Discord: adrientoupet & NumZ#7184
 
 ## 🙏 Credits
