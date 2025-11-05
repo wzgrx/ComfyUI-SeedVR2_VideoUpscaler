@@ -52,7 +52,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                 io.Combo.Input("device",
                     options=devices,
                     default=devices[0],
-                    tooltip="GPU/CPU device for DiT model inference (upscaling phase)"
+                    tooltip="GPU device for DiT model inference (upscaling phase)"
                 ),
                 io.Int.Input("blocks_to_swap",
                     default=0,
