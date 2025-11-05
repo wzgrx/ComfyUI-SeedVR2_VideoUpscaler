@@ -60,11 +60,6 @@ if script_dir not in sys.path:
 # Set environment variable so all spawned processes can find modules
 os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
 
-# Import Debug early for validation (single instance used throughout)
-# NOTE: Must import after path setup but before CUDA validation
-from src.utils.debug import Debug
-debug = Debug(enabled=True)  # Enabled for validation errors, updated later by --debug flag
-
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
     mp.set_start_method('spawn', force=True)
@@ -88,17 +83,11 @@ if platform.system() != "Darwin":
             available_count = _torch_check.cuda.device_count()
             invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
             if invalid_devices:
-                debug.log(
-                    f"Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
-                    f"Available devices: 0-{available_count-1} (total: {available_count})",
-                    level="ERROR", category="device", force=True
-                )
+                print(f"❌ [ERROR] Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
+                      f"Available devices: 0-{available_count-1} (total: {available_count})")
                 sys.exit(1)
         else:
-            debug.log(
-                "CUDA is not available on this system. Cannot use --cuda_device argument.",
-                level="ERROR", category="device", force=True
-            )
+            print("❌ [ERROR] CUDA is not available on this system. Cannot use --cuda_device argument.")
             sys.exit(1)
         
         # Set CUDA_VISIBLE_DEVICES for single GPU after validation
@@ -127,6 +116,8 @@ from src.core.generation_phases import (
     decode_all_batches, 
     postprocess_all_batches
 )
+from src.utils.debug import Debug
+debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
 
 
 # =============================================================================
