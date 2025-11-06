@@ -155,40 +155,19 @@ With the current optimizations (tiling, BlockSwap, GGUF quantization), SeedVR2 c
 
 ### Option 2: Manual Installation
 
-#### For ComfyUI with Virtual Environment (using UV)
-
 1. **Clone the repository** into your ComfyUI custom nodes directory:
 ```bash
 cd ComfyUI
 git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
 ```
 
-2. **Activate your virtual environment** and install dependencies:
+2. **Install dependencies using standalone Python**:
 ```bash
-# Activate your ComfyUI virtual environment first
+# Install requirements (from same ComfyUI directory)
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\python.exe -m pip install -r custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\requirements.txt
 # Linux/macOS:
-source .venv/bin/activate
-# Then install dependencies with uv
-uv pip install -r custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/requirements.txt
-```
-
-#### For ComfyUI Standalone (python_embeded)
-
-1. **Clone the repository** into your ComfyUI custom nodes directory:
-```bash
-# Navigate to your ComfyUI standalone root directory (e.g., ComfyUI_standalone, ComfyUI_windows_portable, etc.)
-cd ComfyUI_standalone
-
-# Clone directly to custom_nodes
-git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
-```
-
-2. **Install dependencies using embedded Python**:
-```bash
-# Install requirements using embedded Python (from same root directory)
-.\python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\requirements.txt
+.venv/bin/python -m pip install -r custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/requirements.txt
 ```
 
 3. **Restart ComfyUI**
@@ -551,18 +530,16 @@ Choose the appropriate setup based on your installation:
 #### Option 1: Already Have ComfyUI with SeedVR2 Installed
 
 If you've already installed SeedVR2 as part of ComfyUI (via [ComfyUI installation](#-installation)), you can use the CLI directly:
-```bash
-# Activate your ComfyUI virtual environment
-# (if using venv, adjust path accordingly)
-source venv/bin/activate  # Linux/macOS
-# or
-venv\Scripts\activate     # Windows
 
-# Navigate to ComfyUI root directory
+```bash
+# Navigate to your ComfyUI directory
 cd ComfyUI
 
-# Run the CLI (display help message)
-python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/inference_cli.py --help
+# Run the CLI using standalone Python (display help message)
+# Windows:
+.venv\Scripts\python.exe custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\inference_cli.py --help
+# Linux/macOS:
+.venv/bin/python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/inference_cli.py --help
 ```
 
 **Skip to [Command Line Usage](#command-line-usage) below.**
@@ -582,8 +559,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 2. **Clone the repository**:
 ```bash
-git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git SeedVR2_VideoUpscaler
-cd SeedVR2_VideoUpscaler
+git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git ComfyUI-SeedVR2_VideoUpscaler
+cd ComfyUI-SeedVR2_VideoUpscaler
 ```
 
 3. **Create virtual environment and install dependencies**:
@@ -603,6 +580,12 @@ uv pip install --pre torch torchvision torchaudio --index-url https://download.p
 
 # Install SeedVR2 requirements
 uv pip install -r requirements.txt
+
+# Run the CLI (display help message)
+# Windows:
+.venv\Scripts\python.exe inference_cli.py --help
+# Linux/macOS:
+.venv/bin/python inference_cli.py --help
 ```
 
 ### Command Line Usage
