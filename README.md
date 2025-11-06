@@ -762,6 +762,7 @@ Result: Frames 0-100 with smooth transition at frame 48
 2. **For OOM errors during encoding**: Enable VAE encode tiling and reduce tile size
 3. **For OOM errors during upscaling**: Enable BlockSwap and increase blocks_to_swap
 4. **For OOM errors during decoding**: Enable VAE decode tiling and reduce tile size
+   - **If still getting OOM after trying all above**: Reduce batch_size or new_resolution
 5. **For best quality**: Use higher batch_size matching your shot length, FP16 models, and LAB color correction
 6. **For speed**: Use FP8/GGUF models, enable torch.compile, and use Flash Attention if available
 7. **Test settings with a short clip first** before processing long videos
