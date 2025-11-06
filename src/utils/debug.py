@@ -70,6 +70,7 @@ class Debug:
         self.vram_history: List[float] = []
         self.active_timer_stack: List[str] = [] 
         self.timer_namespace: str = ""
+        self.phase_peaks: Dict[str, float] = {}
         
     @torch._dynamo.disable  # Skip tracing to avoid datetime.now() warnings
     def log(self, message: str, level: str = "INFO", category: str = "general", force: bool = False, indent_level: int = 0) -> None:
@@ -298,6 +299,14 @@ class Debug:
         # Store checkpoint with memory limit
         self._store_checkpoint(label, memory_info)
 
+        # Store phase peak before reset
+        if label.startswith('After phase') and memory_info['vram_peak_since_last'] > 0:
+            phase_num = label.split()[2]  # "After phase 1 ..." -> "1"
+            self.phase_peaks[f'phase{phase_num}'] = max(
+                self.phase_peaks.get(f'phase{phase_num}', 0),
+                memory_info['vram_peak_since_last']
+            )
+
         # Reset PyTorch's peak memory stats for next interval
         reset_vram_peak(device=None, debug=self)
     
@@ -482,6 +491,30 @@ class Debug:
         if diffs:
             self.log(f"Memory changes: {', '.join(diffs)}", category="memory", force=force, indent_level=1)
     
+    def log_peak_vram_summary(self, force: bool = True) -> None:
+        """Display peak VRAM usage across all phases"""
+        if not self.phase_peaks:
+            return
+        
+        phase_names = {
+            'phase1': 'VAE encoding',
+            'phase2': 'DiT upscaling', 
+            'phase3': 'VAE decoding',
+            'phase4': 'Post-processing'
+        }
+        
+        self.log("", category="none", force=force)
+        self.log("────────────────────────", category="none", force=force)
+        self.log("Peak VRAM by Phase:", category="memory", force=force)
+        
+        for phase_key in sorted(self.phase_peaks.keys()):
+            phase_num = phase_key[-1]
+            self.log(f"  Phase {phase_num}: {phase_names[phase_key]}: {self.phase_peaks[phase_key]:.2f}GB", 
+                    category="memory", force=force)
+        
+        overall_max = max(self.phase_peaks.values())
+        self.log(f"Overall Peak VRAM: {overall_max:.2f}GB", category="memory", force=force)
+    
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def _store_checkpoint(self, label: str, metrics: Dict[str, Any]) -> None:
         """Store checkpoint with memory limit to prevent leaks."""
@@ -590,3 +623,4 @@ class Debug:
         self.timer_durations.clear()
         self.timer_messages.clear()
         self.active_timer_stack.clear()
+        self.phase_peaks.clear()
