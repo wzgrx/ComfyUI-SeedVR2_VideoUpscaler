@@ -12,13 +12,12 @@ Setup Functions:
 - prepare_runner: Configure VideoDiffusionInfer with all settings
 
 Video Processing Utilities:
-- prepend_video_frames: Add frames at start to reduce initial artifacts
+- pad_video_temporal: Unified temporal padding with reversed frames (prepend/append, any format)
 - blend_overlapping_frames: Smooth blending for temporal overlap between batches
-- cut_videos: Format videos to meet 4n+1 frame constraint
 
 Configuration Helpers:
 - load_text_embeddings: Load positive/negative text embeddings for DiT
-- calculate_optimal_batch_params: Compute batch parameters and padding waste
+- calculate_optimal_batch_params: Compute batch processing parameters
 - check_interrupt: Check for user interruption
 
 Debugging Utilities:
@@ -159,12 +158,13 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
 def compute_generation_info(
     ctx: Dict[str, Any],
     images: torch.Tensor,
-    resolution: int,
-    max_resolution: int,
-    batch_size: int,
-    seed: int,
-    prepend_frames: int,
-    temporal_overlap: int,
+    resolution: int = 1080,
+    max_resolution: int = 0,
+    batch_size: int = 5,
+    uniform_batch_size: bool = False,
+    seed: int = 42,
+    prepend_frames: int = 0,
+    temporal_overlap: int = 0,
     debug: Optional['Debug'] = None
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
@@ -176,6 +176,7 @@ def compute_generation_info(
         resolution: Target resolution for shortest edge
         max_resolution: Maximum resolution for any edge (0 = no limit)
         batch_size: Frames per batch
+        uniform_batch_size: Whether to pad final batch to match batch_size
         seed: Random seed
         prepend_frames: Number of frames to prepend
         temporal_overlap: Overlapping frames between batches
@@ -193,7 +194,7 @@ def compute_generation_info(
     
     # Apply prepending if requested
     if prepend_frames > 0:
-        images = prepend_video_frames(images, prepend_frames, debug)
+        images = pad_video_temporal(images, count=prepend_frames, temporal_dim=0, prepend=True, debug=debug)
     
     # Track total frames after prepending
     total_frames = len(images)
@@ -217,6 +218,7 @@ def compute_generation_info(
         'padded_w': padded_w,
         'channels_info': channels_info,
         'batch_size': batch_size,
+        'uniform_batch_size': uniform_batch_size,
         'seed': seed,
         'prepend_frames': prepend_frames,
         'temporal_overlap': temporal_overlap,
@@ -242,7 +244,10 @@ def log_generation_start(info: Dict[str, Any], debug: Optional['Debug'] = None) 
     debug.log("Starting upscaling generation...", category="generation", force=True)
     
     # Build concise parameter info
-    params_info = f"Batch size: {info['batch_size']}"
+    batch_text = f"Batch size: {info['batch_size']}"
+    if info.get('uniform_batch_size', False):
+        batch_text += " (uniform)"
+    params_info = batch_text
     if info['prepend_frames'] > 0:
         params_info += f", Prepend frames: {info['prepend_frames']}"
     if info['temporal_overlap'] > 0:
@@ -273,41 +278,6 @@ def log_generation_start(info: Dict[str, Any], debug: Optional['Debug'] = None) 
             )
     
     debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
-
-
-def prepend_video_frames(frames: torch.Tensor, prepend_count: int, debug: Optional['Debug'] = None) -> torch.Tensor:
-    """
-    Prepend reversed frames to the video to help prevent artifacts at the start of the video.
-
-    Args:
-        frames: Input video tensor [T, H, W, C]
-        prepend_count: Number of frames to prepend
-        debug: Optional debug instance for logging
-        
-    Returns:
-        torch.Tensor: Video with prepended frames [T+prepend_count, H, W, C]
-    """
-    if prepend_count <= 0:
-        return frames
-    
-    if len(frames) == 0:
-        raise ValueError("Cannot prepend frames to empty video tensor")
-    
-    if debug:
-        debug.log(f"Prepending {prepend_count} reversed frames to help prevent artifacts at the start of the video", category="video", indent_level=1)
-    
-    # If prepend_count >= total frames, repeat last frame to fill gap
-    if prepend_count >= len(frames):
-        repeat_count = prepend_count - len(frames) + 1
-        repeated_frames = frames[-1:].repeat(repeat_count, 1, 1, 1)
-        # Reverse all frames except first (PyTorch-compatible)
-        reversed_frames = frames[1:].flip(0)
-        return torch.cat([repeated_frames, reversed_frames, frames], dim=0)
-    
-    # Normal case: reverse frames from index 1 to prepend_count (inclusive)
-    # frames[1:prepend_count+1] selects the range, then .flip(0) reverses it
-    reversed_frames = frames[1:prepend_count+1].flip(0)
-    return torch.cat([reversed_frames, frames], dim=0)
 
 
 def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, overlap: int) -> torch.Tensor:
@@ -581,7 +551,7 @@ def load_text_embeddings(script_directory: str, device: torch.device,
 def calculate_optimal_batch_params(total_frames: int, batch_size: int, 
                                   temporal_overlap: int) -> Dict[str, Any]:
     """
-    Calculate optimal batch processing parameters for 4n+1 constraint.
+    Calculate batch processing parameters.
     
     Args:
         total_frames (int): Total number of frames to process
@@ -592,13 +562,10 @@ def calculate_optimal_batch_params(total_frames: int, batch_size: int,
         dict: {
             'step': Effective step size between batches,
             'temporal_overlap': Adjusted temporal overlap,
-            'best_batch': Optimal batch size for temporal stability,
-            'padding_waste': Total frames that will be padded,
-            'is_optimal': Whether current batch_size causes no padding
+            'best_batch': Optimal batch size matching video length (4n+1 format)
         }
         
     The 4n+1 constraint (1, 5, 9, 13, 17, 21...) is required by the model.
-    Best batch prioritizes temporal stability (larger batches) over padding waste.
     """
     # Calculate step size
     step = batch_size - temporal_overlap
@@ -612,59 +579,73 @@ def calculate_optimal_batch_params(total_frames: int, batch_size: int,
     # Best batch: largest valid size ≤ total_frames (maximizes temporal stability)
     best_batch = max(valid_sizes) if valid_sizes else 1
     
-    # Calculate padding waste for current batch_size
-    padding_waste = 0
-    current_frame = 0
-    
-    while current_frame < total_frames:
-        frames_in_batch = min(batch_size, total_frames - current_frame)
-        
-        # Find next 4n+1 target
-        if frames_in_batch % 4 == 1:
-            target = frames_in_batch
-        else:
-            target = ((frames_in_batch - 1) // 4 + 1) * 4 + 1
-        
-        padding_waste += target - frames_in_batch
-        current_frame += step if step > 0 else batch_size
-    
     return {
         'step': step,
         'temporal_overlap': temporal_overlap,
-        'best_batch': best_batch,
-        'padding_waste': padding_waste,
-        'is_optimal': padding_waste == 0
+        'best_batch': best_batch
     }
 
 
-def cut_videos(videos: torch.Tensor) -> torch.Tensor:
+def pad_video_temporal(videos: torch.Tensor, count: int = 0, temporal_dim: int = 1, 
+                       prepend: bool = False, debug: Optional['Debug'] = None) -> torch.Tensor:
     """
-    Correct video cutting respecting the constraint: frames % 4 == 1
+    Extend video with reversed frames for temporal continuity.
+    
+    Single source of truth for all temporal padding (prepend/append, 4n+1 constraint).
     
     Args:
-        videos (torch.Tensor): Video tensor to format
+        videos: Video tensor (TCHW or CTHW format)
+        count: Frames to add (0 = auto-calculate for 4n+1 when prepend=False)
+        temporal_dim: Temporal axis (0=TCHW, 1=CTHW)
+        prepend: Add to start (True) or end (False)
+        debug: Optional debug logger
         
     Returns:
-        torch.Tensor: Properly formatted video tensor
-        
-    Features:
-        - Ensures frames % 4 == 1 constraint for model compatibility
-        - Intelligent padding with last frame repetition
-        - Memory-efficient tensor operations
+        torch.Tensor: Extended video
     """
-    t = videos.size(1)
+    t = videos.size(temporal_dim)
     
-    if t % 4 == 1:
+    # Auto-calculate for 4n+1 constraint
+    if count == 0 and not prepend:
+        if t % 4 == 1:
+            return videos
+        count = ((t - 1) // 4 + 1) * 4 + 1 - t
+    
+    if count <= 0:
         return videos
     
-    # Calculate next valid number (4n + 1)
-    padding_needed = (4 - (t % 4)) % 4 + 1
+    if debug and prepend:
+        debug.log(f"Prepending {count} reversed frames to reduce start artifacts", 
+                 category="video", indent_level=1)
     
-    # Apply padding to reach 4n+1 format
-    last_frame = videos[:, -1:].expand(-1, padding_needed, -1, -1).contiguous()
-    result = torch.cat([videos, last_frame], dim=1)
+    # Helper to select frames along temporal dimension
+    def select(start, end):
+        return videos[start:end] if temporal_dim == 0 else videos[:, start:end]
     
-    return result
+    # Padding exceeds video length: repeat + reverse
+    if count >= t:
+        repeat_count = count - t + 1
+        last = select(-1, None)
+        
+        # Repeat last frame
+        if temporal_dim == 0:
+            repeated = last.repeat(repeat_count, 1, 1, 1)
+            reversed_frames = select(1, None).flip(temporal_dim) if t > 1 else last[:0]
+        else:
+            repeated = last.expand(-1, repeat_count, -1, -1).contiguous()
+            reversed_frames = select(1, None).flip(temporal_dim) if t > 1 else last[:, :0]
+        
+        return torch.cat([repeated, reversed_frames, videos] if prepend else 
+                        [videos, reversed_frames, repeated], dim=temporal_dim)
+    
+    # Normal case: extract and reverse frames
+    if prepend:
+        reversed_frames = select(1, count+1).flip(temporal_dim)
+    else:
+        reversed_frames = select(-count-1, -1).flip(temporal_dim)
+    
+    return torch.cat([reversed_frames, videos] if prepend else 
+                    [videos, reversed_frames], dim=temporal_dim)
 
 
 def check_interrupt(ctx: Dict[str, Any]) -> None:

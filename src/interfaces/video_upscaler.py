@@ -120,6 +120,14 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Ideally match to shot length for best quality."
                     )
                 ),
+                io.Boolean.Input("uniform_batch_size",
+                    default=False,
+                    tooltip=(
+                        "Pad final batch to match batch_size (default: False).\n"
+                        "Prevents temporal artifacts caused by small final batch.\n"
+                        "Add extra compute but recommended for optimal quality."
+                    )
+                ),
                 io.Int.Input("temporal_overlap",
                     default=0,
                     min=0,
@@ -216,7 +224,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
                 seed: int, new_resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
-                temporal_overlap: int = 0, prepend_frames: int = 0,
+                uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
                 enable_debug: bool = False) -> io.NodeOutput:
@@ -235,6 +243,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             new_resolution: Target resolution for shortest edge (maintains aspect ratio)
             max_resolution: Maximum resolution for any edge (0 = no limit)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
+            uniform_batch_size: Whether to pad final batch to match batch_size
             temporal_overlap: Overlapping frames between batches (0-16)
             prepend_frames: Frames to prepend (0-32) to reduce initial artifacts.
             color_correction: Color correction method
@@ -439,6 +448,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 resolution=new_resolution,
                 max_resolution=max_resolution,
                 batch_size=batch_size,
+                uniform_batch_size=uniform_batch_size,
                 seed=seed,
                 prepend_frames=prepend_frames,
                 temporal_overlap=temporal_overlap,
@@ -457,6 +467,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 images=image,
                 debug=debug,
                 batch_size=batch_size,
+                uniform_batch_size=uniform_batch_size,
                 seed=seed,
                 progress_callback=progress_callback,
                 temporal_overlap=temporal_overlap,

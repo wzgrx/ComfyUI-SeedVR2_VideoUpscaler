@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 
 from .generation_utils import (
     setup_video_transform,
-    cut_videos,
+    pad_video_temporal,
     check_interrupt,
     ensure_precision_initialized,
     _draw_tile_boundaries,
@@ -72,6 +72,7 @@ def encode_all_batches(
     images: torch.Tensor,
     debug: 'Debug',
     batch_size: int = 5,
+    uniform_batch_size: bool = False,
     seed: int = 42,
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     temporal_overlap: int = 0,
@@ -92,6 +93,7 @@ def encode_all_batches(
         images: Input frames tensor [T, H, W, C] range [0,1] (required) 
         debug: Debug instance for logging (required)
         batch_size: Frames per batch (4n+1 format: 1, 5, 9, 13...)
+        uniform_batch_size: Pad final batch to match batch_size for uniform batches
         seed: Random seed for deterministic VAE sampling (default: 42)
         progress_callback: Optional callback(current, total, frames, phase_name)
         temporal_overlap: Overlapping frames between batches for continuity
@@ -150,23 +152,13 @@ def encode_all_batches(
     # Detect if input is RGBA (4 channels)
     ctx['is_rgba'] = images[0].shape[-1] == 4
     
-    # Display batch optimization tips
+    # Display batch optimization tip if applicable
     if total_frames > 0:
         batch_params = calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap)
-        if batch_params['padding_waste'] > 0:
-            debug.log("", category="none", force=True)
-            debug.log(f"Padding waste: {batch_params['padding_waste']}", category="info", force=True)
-            debug.log(f"Why padding? Each batch must be 4n+1 frames (1, 5, 9, 13, 17, 21, ...)", category="info", force=True, indent_level=1)
-            debug.log(f"Current batch_size creates partial batches that need padding to meet this constraint", category="info", force=True, indent_level=1)
-            debug.log(f"This increases memory usage and processing time unnecessarily", category="info", force=True, indent_level=1)
-        
         if batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames:
             debug.log("", category="none", force=True)
-            debug.log(f"For {total_frames} frames, batch_size={batch_params['best_batch']} avoids padding waste", category="tip", force=True)
-            debug.log(f"Match batch_size to shot length for better temporal coherence", category="tip", force=True, indent_level=1)
-
-        
-        if batch_params['padding_waste'] > 0 or (batch_params['best_batch'] != batch_size and batch_params['best_batch'] <= total_frames):
+            debug.log(f"Tip: For {total_frames} frames, batch_size={batch_params['best_batch']} matches video length optimally", category="tip", force=True)
+            debug.log(f"Matching batch_size to shot length improves temporal coherence", category="tip", force=True, indent_level=1)
             debug.log("", category="none", force=True)
     
     # Calculate batching parameters
@@ -249,12 +241,27 @@ def encode_all_batches(
                     break
             
             current_frames = end_idx - start_idx
+            is_uniform_padding = uniform_batch_size and current_frames < batch_size
             
             debug.log(f"Encoding batch {encode_idx+1}/{num_encode_batches}", category="vae", force=True)
             debug.start_timer(f"encode_batch_{encode_idx+1}")
             
+            # Save original length BEFORE any padding (critical for post-processing trimming)
+            ori_length = current_frames
+            
             # Process current batch
             video = images[start_idx:end_idx]
+            
+            # Log uniform padding if applied
+            if is_uniform_padding:
+                padding_for_uniform = batch_size - current_frames
+                debug.log(f"Sequence of {current_frames} frames", category="video", force=True, indent_level=1)
+                debug.log(f"Padding batch: {padding_for_uniform} frame{'s' if padding_for_uniform != 1 else ''} added ({current_frames} → {batch_size}) for uniform batches", 
+                         category="video", force=True, indent_level=1)
+                video = pad_video_temporal(video, count=padding_for_uniform, temporal_dim=0, prepend=False, debug=None)
+                current_frames = batch_size
+            
+            # Permute and move to device
             video = video.permute(0, 3, 1, 2)
             video = manage_tensor(
                 tensor=video,
@@ -266,20 +273,23 @@ def encode_all_batches(
                 indent_level=1
             )
 
-            # Check temporal dimension and pad ONCE if needed (format: T, C, H, W)
+            # Check temporal dimension for 4n+1 padding
             t = video.size(0)
-            debug.log(f"Sequence of {t} frames", category="video", force=True, indent_level=1)
+            
+            # Log sequence size if not already logged (for non-uniform batches)
+            if not is_uniform_padding:
+                debug.log(f"Sequence of {t} frames", category="video", force=True, indent_level=1)
 
-            ori_length = t
-
+            # Apply 4n+1 padding if needed
             if t % 4 != 1:
                 target = ((t-1)//4+1)*4+1
                 padding_frames = target - t
-                debug.log(f"Applying padding: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} -> {target})", category="video", force=True, indent_level=1)
+                debug.log(f"Padding batch: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} → {target}) to meet 4n+1 constraint", 
+                         category="video", force=True, indent_level=1)
                 
-                # Pad original video once (TCHW format, need to convert to CTHW)
+                # Pad video using reversed frames (TCHW format, need to convert to CTHW)
                 video = optimized_single_video_rearrange(video)  # TCHW -> CTHW
-                video = cut_videos(video)
+                video = pad_video_temporal(video, temporal_dim=1, prepend=False, debug=None)
                 video = optimized_single_video_rearrange(video)  # CTHW -> TCHW
 
             # Extract RGB for transforms (view, not copy)

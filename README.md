@@ -158,16 +158,16 @@ With the current optimizations (tiling, BlockSwap, GGUF quantization), SeedVR2 c
 1. **Clone the repository** into your ComfyUI custom nodes directory:
 ```bash
 cd ComfyUI
-git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
+git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git custom_nodes/seedvr2_videoupscaler
 ```
 
 2. **Install dependencies using standalone Python**:
 ```bash
 # Install requirements (from same ComfyUI directory)
 # Windows:
-.venv\Scripts\python.exe -m pip install -r custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\requirements.txt
+.venv\Scripts\python.exe -m pip install -r custom_nodes\seedvr2_videoupscaler\requirements.txt
 # Linux/macOS:
-.venv/bin/python -m pip install -r custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/requirements.txt
+.venv/bin/python -m pip install -r custom_nodes/seedvr2_videoupscaler/requirements.txt
 ```
 
 3. **Restart ComfyUI**
@@ -228,31 +228,31 @@ Configure the DiT (Diffusion Transformer) model for video upscaling.
 
 - **device**: GPU device for DiT inference (e.g., `cuda:0`)
 
-- **offload_device** (optional): Device to offload DiT model when not actively processing
+- **offload_device**: Device to offload DiT model when not actively processing
   - `none`: Keep model on inference device (fastest, highest VRAM)
   - `cpu`: Offload to system RAM (reduces VRAM)
   - `cuda:X`: Offload to another GPU (good balance if available)
 
-- **cache_model** (optional): Keep DiT model loaded on offload_device between workflow runs
+- **cache_model**: Keep DiT model loaded on offload_device between workflow runs
   - Useful for batch processing to avoid repeated loading
   - Requires offload_device to be set
 
-- **blocks_to_swap** (optional): BlockSwap memory optimization
+- **blocks_to_swap**: BlockSwap memory optimization
   - `0`: Disabled (default)
   - `1-32`: Number of transformer blocks to swap for 3B model
   - `1-36`: Number of transformer blocks to swap for 7B model
   - Higher values = more VRAM savings but slower processing
   - Requires offload_device to be set and different from device
 
-- **swap_io_components** (optional): Offload input/output embeddings and normalization layers
+- **swap_io_components**: Offload input/output embeddings and normalization layers
   - Additional VRAM savings when combined with blocks_to_swap
   - Requires offload_device to be set and different from device
 
-- **attention_mode** (optional): Attention computation backend
+- **attention_mode**: Attention computation backend
   - `sdpa`: PyTorch scaled_dot_product_attention (default, stable, always available)
   - `flash_attn`: Flash Attention 2 (faster on supported hardware, requires flash-attn package)
 
-- **torch_compile_args** (optional): Connect to SeedVR2 Torch Compile Settings node for 20-40% speedup
+- **torch_compile_args**: Connect to SeedVR2 Torch Compile Settings node for 20-40% speedup
 
 **BlockSwap Explained:**
 
@@ -285,32 +285,32 @@ Configure the VAE (Variational Autoencoder) model for encoding/decoding video fr
 
 - **device**: GPU device for VAE inference (e.g., `cuda:0`)
 
-- **offload_device** (optional): Device to offload VAE model when not actively processing
+- **offload_device**: Device to offload VAE model when not actively processing
   - `none`: Keep model on inference device (default, fastest)
   - `cpu`: Offload to system RAM (reduces VRAM)
   - `cuda:X`: Offload to another GPU (good balance if available)
 
-- **cache_model** (optional): Keep VAE model loaded on offload_device between workflow runs
+- **cache_model**: Keep VAE model loaded on offload_device between workflow runs
   - Requires offload_device to be set
 
-- **encode_tiled** (optional): Enable tiled encoding to reduce VRAM usage during encoding phase
+- **encode_tiled**: Enable tiled encoding to reduce VRAM usage during encoding phase
   - Enable if you see OOM errors during the "Encoding" phase in debug logs
 
-- **encode_tile_size** (optional): Encoding tile size in pixels (default: 1024)
+- **encode_tile_size**: Encoding tile size in pixels (default: 1024)
   - Applied to both height and width
   - Lower values reduce VRAM but may increase processing time
 
-- **encode_tile_overlap** (optional): Encoding tile overlap in pixels (default: 128)
+- **encode_tile_overlap**: Encoding tile overlap in pixels (default: 128)
   - Reduces visible seams between tiles
 
-- **decode_tiled** (optional): Enable tiled decoding to reduce VRAM usage during decoding phase
+- **decode_tiled**: Enable tiled decoding to reduce VRAM usage during decoding phase
   - Enable if you see OOM errors during the "Decoding" phase in debug logs
 
-- **decode_tile_size** (optional): Decoding tile size in pixels (default: 1024)
+- **decode_tile_size**: Decoding tile size in pixels (default: 1024)
 
-- **decode_tile_overlap** (optional): Decoding tile overlap in pixels (default: 128)
+- **decode_tile_overlap**: Decoding tile overlap in pixels (default: 128)
 
-- **torch_compile_args** (optional): Connect to SeedVR2 Torch Compile Settings node for 15-25% speedup
+- **torch_compile_args**: Connect to SeedVR2 Torch Compile Settings node for 15-25% speedup
 
 **VAE Tiling Explained:**
 
@@ -399,7 +399,7 @@ Main upscaling node that processes video frames using DiT and VAE models.
 - **new_resolution**: Target resolution for shortest edge in pixels (default: 1080)
   - Maintains aspect ratio automatically
 
-- **max_resolution** (optional): Maximum resolution for any edge (default: 0 = no limit)
+- **max_resolution**: Maximum resolution for any edge (default: 0 = no limit)
   - Automatically scales down if exceeded to prevent OOM
 
 - **batch_size**: Frames per batch (default: 5)
@@ -410,11 +410,18 @@ Main upscaling node that processes video frames using DiT and VAE models.
   - **VRAM impact**: Higher batch_size = better quality and speed but requires more VRAM
   - **If you get OOM with batch_size=5**: Try optimization techniques first (model offloading, BlockSwap, GGUF models...) before reducing batch_size or input resolution, as these directly impact quality
 
-- **temporal_overlap** (optional): Overlapping frames between batches (default: 0)
+**uniform_batch_size** (default: False)
+  - Pads the final batch to match `batch_size` for uniform processing
+  - Prevents temporal artifacts when the last batch is significantly smaller than others
+  - Example: 45 frames with `batch_size=33` creates [33, 33] instead of [33, 12]
+  - Recommended when using large batch sizes and video length is not a multiple of `batch_size`
+  - Increases VRAM usage slightly but ensures consistent temporal coherence across all batches
+
+- **temporal_overlap**: Overlapping frames between batches (default: 0)
   - Used for blending between batches to reduce temporal artifacts
   - Range: 0-16 frames
 
-- **prepend_frames** (optional): Frames to prepend (default: 0)
+- **prepend_frames**: Frames to prepend (default: 0)
   - Prepends reversed frames to reduce artifacts at video start
   - Automatically removed after processing
   - Range: 0-32 frames
@@ -427,20 +434,20 @@ Main upscaling node that processes video frames using DiT and VAE models.
   - **`adain`**: Statistical style transfer
   - **`none`**: No color correction
 
-- **input_noise_scale** (optional): Input noise injection scale 0.0-1.0 (default: 0.0)
+- **input_noise_scale**: Input noise injection scale 0.0-1.0 (default: 0.0)
   - Adds noise to input frames to reduce artifacts at very high resolutions
   - Try 0.1-0.3 if you see artifacts with high output resolutions
 
-- **latent_noise_scale** (optional): Latent space noise scale 0.0-1.0 (default: 0.0)
+- **latent_noise_scale**: Latent space noise scale 0.0-1.0 (default: 0.0)
   - Adds noise during diffusion process, can soften excessive detail
   - Use if input_noise doesn't help, try 0.05-0.15
 
-- **offload_device** (optional): Device for storing intermediate tensors between processing phases (default: "cpu")
+- **offload_device**: Device for storing intermediate tensors between processing phases (default: "cpu")
   - `none`: Keep all tensors on inference device (fastest but highest VRAM)
   - `cpu`: Offload to system RAM (recommended for long videos, slower transfers)
   - `cuda:X`: Offload to another GPU (good balance if available, faster than CPU)
 
-- **enable_debug** (optional): Enable detailed debug logging (default: False)
+- **enable_debug**: Enable detailed debug logging (default: False)
   - Shows memory usage, timing information, and processing details
   - **Highly recommended** for troubleshooting OOM issues
 
@@ -537,9 +544,9 @@ cd ComfyUI
 
 # Run the CLI using standalone Python (display help message)
 # Windows:
-.venv\Scripts\python.exe custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\inference_cli.py --help
+.venv\Scripts\python.exe custom_nodes\seedvr2_videoupscaler\inference_cli.py --help
 # Linux/macOS:
-.venv/bin/python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/inference_cli.py --help
+.venv/bin/python custom_nodes/seedvr2_videoupscaler/inference_cli.py --help
 ```
 
 **Skip to [Command Line Usage](#command-line-usage) below.**
@@ -559,8 +566,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 2. **Clone the repository**:
 ```bash
-git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git ComfyUI-SeedVR2_VideoUpscaler
-cd ComfyUI-SeedVR2_VideoUpscaler
+git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler
+cd seedvr2_videoupscaler
 ```
 
 3. **Create virtual environment and install dependencies**:
@@ -596,38 +603,41 @@ The CLI provides comprehensive options for single-GPU, multi-GPU, and batch proc
 
 ```bash
 # Basic image upscaling
-python inference_cli.py --input image.jpg --resolution 720 --model seedvr2_ema_3b_fp8_e4m3fn.safetensors
+python inference_cli.py --input image.jpg
 
-# Video upscaling with temporal consistency
-python inference_cli.py --input video.mp4 --resolution 1080 --batch_size 5
-
-# Memory-optimized for low VRAM (8GB)
-python inference_cli.py --input image.png \
-    --model seedvr2_ema_3b-Q8_0.gguf \
-    --blocks_to_swap 32 \
-    --swap_io_components \
-    --dit_offload_device cpu
-
-# High resolution with VAE tiling
-python inference_cli.py --input video.mp4 \
-    --resolution 1440 \
-    --max_resolution 3840 \
-    --batch_size 21 \
-    --vae_encode_tiling_enabled \
-    --vae_decode_tiling_enabled
+# Basic video video upscaling with temporal consistency
+python inference_cli.py --input video.mp4 --resolution 720 --batch_size 33
 
 # Multi-GPU processing with temporal overlap
 python inference_cli.py --input video.mp4 \
     --cuda_device 0,1 \
     --resolution 1080 \
     --batch_size 81 \
-    --temporal_overlap 4 \
-    --prepend_frames 2
+    --uniform_batch_size \
+    --temporal_overlap 3 \
+    --prepend_frames 4
+
+# Memory-optimized for low VRAM (8GB)
+python inference_cli.py --input image.png \
+    --model seedvr2_ema_3b-Q8_0.gguf \
+    --resolution 1080 \
+    --blocks_to_swap 32 \
+    --swap_io_components \
+    --dit_offload_device cpu \
+    --vae_offload_device cpu
+
+# High resolution with VAE tiling
+python inference_cli.py --input video.mp4 \
+    --resolution 1440 \
+    --batch_size 31 \
+    --uniform_batch_size \
+    --temporal_overlap 3 \
+    --vae_encode_tiling_enabled \
+    --vae_decode_tiling_enabled
 
 # Batch directory processing with model caching
 python inference_cli.py --input media_folder/ \
     --output processed/ \
-    --output_format png \
     --cuda_device 0 \
     --cache_dit \
     --cache_vae \
@@ -635,14 +645,6 @@ python inference_cli.py --input media_folder/ \
     --vae_offload_device cpu \
     --resolution 1080 \
     --max_resolution 1920
-
-# Performance optimized with torch.compile
-python inference_cli.py --input video.mp4 \
-    --resolution 1080 \
-    --batch_size 45 \
-    --compile_dit \
-    --compile_vae \
-    --compile_mode max-autotune
 ```
 
 ### Command Line Arguments

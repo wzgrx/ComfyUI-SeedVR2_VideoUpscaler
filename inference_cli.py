@@ -725,6 +725,7 @@ def _process_frames_core(
         resolution=args.resolution,
         max_resolution=args.max_resolution,
         batch_size=args.batch_size,
+        uniform_batch_size=args.uniform_batch_size,
         seed=args.seed,
         prepend_frames=args.prepend_frames,
         temporal_overlap=args.temporal_overlap,
@@ -737,6 +738,7 @@ def _process_frames_core(
         runner, ctx=ctx, images=frames_tensor,
         debug=debug, 
         batch_size=args.batch_size,
+        uniform_batch_size=args.uniform_batch_size,
         seed=args.seed,
         progress_callback=None, 
         temporal_overlap=args.temporal_overlap,
@@ -995,24 +997,30 @@ def parse_arguments() -> argparse.Namespace:
         - Default model directory resolves to "models/SEEDVR2" if not specified
     """
     
+    # Get the actual invocation path for usage examples
+    invocation = sys.argv[0]
+    
     # Multi-line usage examples for --help
-    usage_examples = """
+    usage_examples = f"""
 Examples:
 
-  Basic usage:
-    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input image.jpg --resolution 720 --model seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors
-    
-  Multi-GPU processing:
-    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input video.mp4 --cuda_device 0,1 --temporal_overlap 4 --resolution 1080 --batch_size 81 --prepend_frames 2 --temporal_overlap 4
+  Basic image upscaling:
+    python {invocation} --input image.jpg
 
-  Memory optimization (Low VRAM):
-    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input image.png --blocks_to_swap 36 --swap_io_components --dit_offload_device cpu --model seedvr2_ema_3b_fp8_e4m3fn.safetensors
+  Basic video video upscaling with temporal consistency
+    python {invocation} --input video.mp4 --resolution 720 --batch_size 33
     
-  High resolution:
-    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input video.mp4 --resolution 1440 --max_resolution 3840 --batch_size 45 --vae_encode_tiling_enabled --vae_decode_tiling_enabled
+  Multi-GPU processing with temporal overlap:
+    python {invocation} --input video.mp4 --cuda_device 0,1 --resolution 1080 --batch_size 81 --uniform_batch_size --temporal_overlap 3 --prepend_frames 4 
+
+  Memory-optimized for low VRAM (8GB):
+    python {invocation} --input image.png --model seedvr2_ema_3b-Q8_0.gguf --blocks_to_swap 32 --swap_io_components --dit_offload_device cpu --vae_offload_device cpu
+    
+  High resolution with VAE tiling:
+    python {invocation} --input video.mp4 --resolution 1440 --batch_size 31 --uniform_batch_size --temporal_overlap 3 --vae_encode_tiling_enabled --vae_decode_tiling_enabled
     
   Batch directory processing:
-    python custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/%(prog)s --input media/ --output processed/ --output_format png --cuda_device 0 --cache_dit --cache_vae --dit_offload_device cpu --vae_offload_device cpu --resolution 1080 --max_resolution 1920   
+    python {invocation} --input media_folder/ --output processed/ --cuda_device 0 --cache_dit --cache_vae --dit_offload_device cpu --vae_offload_device cpu --resolution 1080 --max_resolution 1920   
 
 """
     
@@ -1050,6 +1058,9 @@ Examples:
                         help="Frames per batch (must follow 4n+1: 1, 5, 9, 13, 17, 21,...). "
                          "Ideally matches shot length for best temporal consistency. Higher values improve "
                          "quality and speed but require more VRAM. Default: 5")
+    process_group.add_argument("--uniform_batch_size", action="store_true",
+                        help="Pad final batch to match batch_size. Prevents temporal artifacts caused by small "
+                         "final batches. Add extra compute but recommended for optimal quality.")
     process_group.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
     process_group.add_argument("--skip_first_frames", type=int, default=0,
