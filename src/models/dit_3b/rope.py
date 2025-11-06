@@ -138,13 +138,12 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         torch.Tensor,
     ]:
         """
-        Generate RoPE frequencies for video and text with adaptive dimensions.
+        Generate RoPE frequencies for variable batch shapes.
         
-        Note: This method uses @torch._dynamo.disable because .tolist() creates
-        data-dependent control flow that breaks torch.compile's computational graph.
-        Since this is only called during cache initialization (not in the hot path),
-        the performance impact is negligible while ensuring compilation compatibility
-        for the rest of the model.
+        Note: This method uses @torch._dynamo.disable because it requires
+        data-dependent control flow (shape.tolist()) that cannot be symbolically
+        traced by torch.compile. The cache() wrapper in the forward pass memoizes
+        results to reduce recomputation overhead.
         """
         # Calculate actual max dimensions needed for this batch
         max_temporal = 0

@@ -67,6 +67,7 @@ class Debug:
         self.timer_durations: Dict[str, float] = {}
         self.timer_messages: Dict[str, str] = {} 
         self.swap_times: List[Dict[str, Any]] = []
+        self.current_phase: Optional[str] = None
         self.vram_history: List[float] = []
         self.active_timer_stack: List[str] = [] 
         self.timer_namespace: str = ""
@@ -153,6 +154,12 @@ class Debug:
 
             self.timers[name] = time.time()
             
+            # Track phase for memory peak monitoring
+            if name.startswith("phase") and name.endswith(("_encoding", "_upscaling", "_decoding", "_postprocessing")):
+                # Extract phase number (e.g., "phase3_decoding" -> "3")
+                phase_num = name.split("_")[0].replace("phase", "")
+                self.current_phase = f"phase{phase_num}"
+                
             # Auto-hierarchy: if there's an active timer, this is a child
             if self.active_timer_stack:
                 parent = self.active_timer_stack[-1]
@@ -299,11 +306,10 @@ class Debug:
         # Store checkpoint with memory limit
         self._store_checkpoint(label, memory_info)
 
-        # Store phase peak before reset
-        if label.startswith('After phase') and memory_info['vram_peak_since_last'] > 0:
-            phase_num = label.split()[2]  # "After phase 1 ..." -> "1"
-            self.phase_peaks[f'phase{phase_num}'] = max(
-                self.phase_peaks.get(f'phase{phase_num}', 0),
+        # Update phase peak if we're in an active phase
+        if self.current_phase and memory_info['vram_peak_since_last'] > 0:
+            self.phase_peaks[self.current_phase] = max(
+                self.phase_peaks.get(self.current_phase, 0),
                 memory_info['vram_peak_since_last']
             )
 
@@ -624,3 +630,4 @@ class Debug:
         self.timer_messages.clear()
         self.active_timer_stack.clear()
         self.phase_peaks.clear()
+        self.current_phase = None

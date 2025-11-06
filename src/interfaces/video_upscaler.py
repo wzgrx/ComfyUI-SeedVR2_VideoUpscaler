@@ -545,8 +545,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 child_times["  Phase 2: DiT upscaling"] = debug.timer_durations.get("phase2_upscaling", 0)
             if "phase3_decoding" in debug.timer_durations:
                 child_times["  Phase 3: VAE decoding"] = debug.timer_durations.get("phase3_decoding", 0)
-            if "phase4_postprocess" in debug.timer_durations:
-                child_times["  Phase 4: Post-processing"] = debug.timer_durations.get("phase4_postprocess", 0)
+            if "phase4_postprocessing" in debug.timer_durations:
+                child_times["  Phase 4: Post-processing"] = debug.timer_durations.get("phase4_postprocessing", 0)
 
             total_execution_time = debug.end_timer("total_execution", "Total execution", show_breakdown=True, custom_children=child_times)
             

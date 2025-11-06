@@ -57,7 +57,8 @@ def _tensor_split(tensor: torch.Tensor, lengths: torch.LongTensor, dim: int = 0)
     
     # Calculate split indices: torch.tensor_split splits BEFORE each index
     # So we need cumsum[:-1] to get the split points
-    split_indices = lengths.cumsum(0)[:-1]
+    # NOTE: torch.tensor_split requires indices on CPU (PyTorch requirement)
+    split_indices = lengths.cumsum(0)[:-1].cpu()
     
     # Use torch.tensor_split - native C++ implementation
     # Compilable: accepts tensor indices (symbolic shapes work)
@@ -208,18 +209,16 @@ def concat_idx(
     vid_idx = torch.arange(vid_sum, device=device)
     txt_idx = torch.arange(vid_sum, vid_sum + txt_sum, device=device)
     
-    # Build interleaving indices using tensor operations
+    # Build interleaving indices using compile-friendly _tensor_split
     batch_size = len(vid_len)
-    vid_cumsum = torch.cat([torch.zeros(1, dtype=torch.long, device=device), vid_len.cumsum(0)])
-    txt_cumsum = torch.cat([torch.zeros(1, dtype=torch.long, device=device), txt_len.cumsum(0)])
+    vid_idx_splits = _tensor_split(vid_idx, vid_len, dim=0)
+    txt_idx_splits = _tensor_split(txt_idx, txt_len, dim=0)
     
     # Create interleaved target indices
     tgt_idx_list = []
     for i in range(batch_size):
-        vid_start, vid_end = vid_cumsum[i], vid_cumsum[i + 1]
-        txt_start, txt_end = txt_cumsum[i], txt_cumsum[i + 1]
-        tgt_idx_list.append(vid_idx[vid_start:vid_end])
-        tgt_idx_list.append(txt_idx[txt_start:txt_end])
+        tgt_idx_list.append(vid_idx_splits[i])
+        tgt_idx_list.append(txt_idx_splits[i])
     
     tgt_idx = torch.cat(tgt_idx_list)
     src_idx = torch.argsort(tgt_idx)
@@ -374,20 +373,18 @@ def repeat_concat_idx(
         # Use tensor operations for division
         num_repeats_tensor = torch.tensor([len(vid_len) // batch_size], dtype=torch.long, device=device)
     
-    # Build concatenated indices using tensor operations
-    vid_cumsum = torch.cat([torch.zeros(1, dtype=torch.long, device=device), vid_len.cumsum(0)])
-    txt_cumsum = torch.cat([torch.zeros(1, dtype=torch.long, device=device), txt_len.cumsum(0)])
+    # Build concatenated indices using compile-friendly _tensor_split
+    vid_idx_splits = _tensor_split(vid_idx, vid_len, dim=0)
+    txt_idx_splits = _tensor_split(txt_idx, txt_len, dim=0)
     
     tgt_idx_list = []
     for i in range(len(vid_len)):
         # Add video window
-        vid_start, vid_end = vid_cumsum[i], vid_cumsum[i + 1]
-        tgt_idx_list.append(vid_idx[vid_start:vid_end])
+        tgt_idx_list.append(vid_idx_splits[i])
         
         # Add corresponding text (with repeat)
         batch_idx = i % batch_size
-        txt_start, txt_end = txt_cumsum[batch_idx], txt_cumsum[batch_idx + 1]
-        tgt_idx_list.append(txt_idx[txt_start:txt_end])
+        tgt_idx_list.append(txt_idx_splits[batch_idx])
     
     tgt_idx = torch.cat(tgt_idx_list)
     src_idx = torch.argsort(tgt_idx)
@@ -395,10 +392,6 @@ def repeat_concat_idx(
     
     # Pre-compute split lengths for coalescing using tensor operations
     repeat_txt_len = txt_len * num_repeats_tensor.squeeze()
-    
-    # COMPILE OPTIMIZATION: Extract scalar BEFORE creating closure
-    # This happens during cache setup (outside compiled graph), not during forward pass
-    num_repeats_int = int(num_repeats_tensor.item())
 
     def unconcat_coalesce(all):
         """
@@ -407,27 +400,22 @@ def repeat_concat_idx(
         The text features appear multiple times (once per window) and need
         to be averaged to produce a single set of text features.
         
-        Example:
-            vid [0 1 2 3 4 5 6 7 8] -> 3 windows -> [0 1 2] [3 4 5] [6 7 8]
-            txt [9 10]
-            repeat_concat ==> [0 1 2 9 10 3 4 5 9 10 6 7 8 9 10]
-            
-            After argsort: [0 1 2 3 4 5 6 7 8 9 9 9 10 10 10]
-            Split: vid_out=[0,1,2,3,4,5,6,7,8], txt_out=[9,9,9,10,10,10]
-            Reshape & mean: txt_coalesced=[9, 10]
+        COMPILE OPTIMIZATION: Uses split-stack-mean instead of reshape to avoid .item()
         """
         vid_out, txt_out = all[src_idx].split([len(vid_idx), txt_idx_len])
         
-        # Coalesce repeated text using tensor operations
+        # Coalesce repeated text using pure tensor operations (no .item())
         txt_splits = _tensor_split(txt_out, repeat_txt_len, dim=0)
         txt_out_coalesced = []
         
-        # num_repeats_int captured from outer scope (already extracted as Python int)
-        for txt in txt_splits:
-            # Reshape to separate repetitions and average
-            other_dims = txt.shape[1:]
-            txt = txt.reshape(-1, num_repeats_int, *other_dims).mean(1)
-            txt_out_coalesced.append(txt)
+        for txt, base_len in zip(txt_splits, txt_len):
+            # txt has shape (base_len * num_repeats, *other_dims)
+            # Split into num_repeats equal pieces using tensor operations
+            split_lens = base_len.unsqueeze(0).repeat_interleave(num_repeats_tensor.squeeze())
+            pieces = _tensor_split(txt, split_lens, dim=0)
+            # Stack and average across repetitions
+            txt_avg = torch.stack(pieces, dim=0).mean(0)
+            txt_out_coalesced.append(txt_avg)
         
         return vid_out, torch.cat(txt_out_coalesced)
 

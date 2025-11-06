@@ -28,22 +28,18 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
     
     NOTE: max_seqlen_q and max_seqlen_k are accepted for API compatibility but not used.
     PyTorch's scaled_dot_product_attention automatically handles variable sequence lengths.
+    
+    COMPILE OPTIMIZATION: Uses torch.tensor_split to avoid .item() graph breaks
     """
-    # Create an empty tensor to store the output.
-    output = torch.empty_like(q)
+    # Split q, k, v using cumulative sequence lengths
+    # NOTE: torch.tensor_split requires int64 dtype and CPU device (PyTorch requirements)
+    q_splits = list(torch.tensor_split(q, cu_seqlens_q[1:-1].long().cpu(), dim=0))
+    k_splits = list(torch.tensor_split(k, cu_seqlens_k[1:-1].long().cpu(), dim=0))
+    v_splits = list(torch.tensor_split(v, cu_seqlens_k[1:-1].long().cpu(), dim=0))
 
-    # Iterate over each sequence in the batch. The batch size is the number of sequences.
-    for i in range(len(cu_seqlens_q) - 1):
-        # Determine the start and end indices for the current sequence.
-        start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i+1]
-        start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i+1]
-
-        # Slice the q, k, and v tensors to get the data for the current sequence.
-        # The shape is (seq_len, heads, head_dim).
-        q_i = q[start_q:end_q]
-        k_i = k[start_k:end_k]
-        v_i = v[start_k:end_k]
-
+    # Process each sequence
+    output_splits = []
+    for q_i, k_i, v_i in zip(q_splits, k_splits, v_splits):
         # Reshape for torch's scaled_dot_product_attention which expects (batch, heads, seq, dim).
         # Here, we treat each sequence as a batch of 1.
         q_i = q_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_q, head_dim)
@@ -59,11 +55,10 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
 
         # Reshape the output back to the original format (seq_len, heads, head_dim)
         output_i = output_i.squeeze(0).permute(1, 0, 2)
-
-        # Place the result for the current sequence into the main output tensor.
-        output[start_q:end_q] = output_i
-        
-    return output
+        output_splits.append(output_i)
+    
+    # Concatenate all outputs
+    return torch.cat(output_splits, dim=0)
 
 
 @torch._dynamo.disable

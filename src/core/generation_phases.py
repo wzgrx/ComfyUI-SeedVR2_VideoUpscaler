@@ -914,7 +914,7 @@ def postprocess_all_batches(
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 4: Post-processing ━━━━━━━━", category="none", force=True)
-    debug.start_timer("phase4_postprocess")
+    debug.start_timer("phase4_postprocessing")
     
     # Total_frames represents the original input frame count (set in Phase 1)
     total_frames = ctx.get('total_frames', 0)
@@ -937,11 +937,11 @@ def postprocess_all_batches(
                            isinstance(ctx.get('all_alpha_channels'), list))
     
     if has_alpha_processing:
-        total_postprocess_steps = num_valid_samples * 2  # Alpha + main processing
+        total_postprocessing_steps = num_valid_samples * 2  # Alpha + main processing
     else:
-        total_postprocess_steps = num_valid_samples  # Main processing only
+        total_postprocessing_steps = num_valid_samples  # Main processing only
     
-    current_postprocess_step = 0
+    current_postprocessing_step = 0
     
     # Pre-allocation will happen after processing first sample to get exact dimensions
     ctx['final_video'] = None
@@ -996,9 +996,9 @@ def postprocess_all_batches(
                 debug.end_timer(f"alpha_batch_{batch_idx+1}", f"Alpha batch {batch_idx+1}")
                 
                 # Update progress for alpha processing step
-                current_postprocess_step += 1
+                current_postprocessing_step += 1
                 if progress_callback:
-                    progress_callback(current_postprocess_step, total_postprocess_steps,
+                    progress_callback(current_postprocessing_step, total_postprocessing_steps,
                                     1, "Phase 4: Post-processing")
 
         debug.log("Alpha processing complete for all batches", category="alpha")
@@ -1221,9 +1221,9 @@ def postprocess_all_batches(
             debug.end_timer(f"postprocess_batch_{batch_idx+1}", f"Post-processed batch {batch_idx+1}")
             
             # Update progress for main processing step
-            current_postprocess_step += 1
+            current_postprocessing_step += 1
             if progress_callback:
-                progress_callback(current_postprocess_step, total_postprocess_steps,
+                progress_callback(current_postprocessing_step, total_postprocessing_steps,
                                 1, "Phase 4: Post-processing")
 
         # Verify final assembly
@@ -1312,7 +1312,7 @@ def postprocess_all_batches(
         if 'true_target_dims' in ctx:
             del ctx['true_target_dims']
 
-    debug.end_timer("phase4_postprocess", "Phase 4: Post-processing complete", show_breakdown=True)
+    debug.end_timer("phase4_postprocessing", "Phase 4: Post-processing complete", show_breakdown=True)
     debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)
     
     return ctx
