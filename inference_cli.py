@@ -25,7 +25,7 @@ Architecture:
     4. Postprocess: Color correction and temporal blending
 
 Usage:
-    python inference_cli.py --input video.mp4 --resolution 1080
+    python inference_cli.py video.mp4 --resolution 1080
     For complete usage examples, run: python inference_cli.py --help
 
 Requirements:
@@ -688,7 +688,7 @@ def _process_frames_core(
     vae_id = "cli_vae" if cache_vae else None
     
     runner, cache_context = prepare_runner(
-        dit_model=args.model,
+        dit_model=args.dit_model,
         vae_model=DEFAULT_VAE,
         model_dir=model_dir,
         debug=debug,
@@ -702,10 +702,10 @@ def _process_frames_core(
             'swap_io_components': args.swap_io_components,
             'offload_device': dit_offload,
         },
-        encode_tiled=args.vae_encode_tiling_enabled,
+        encode_tiled=args.vae_encode_tiled,
         encode_tile_size=(args.vae_encode_tile_size, args.vae_encode_tile_size),
         encode_tile_overlap=(args.vae_encode_tile_overlap, args.vae_encode_tile_overlap),
-        decode_tiled=args.vae_decode_tiling_enabled,
+        decode_tiled=args.vae_decode_tiled,
         decode_tile_size=(args.vae_decode_tile_size, args.vae_decode_tile_size),
         decode_tile_overlap=(args.vae_decode_tile_overlap, args.vae_decode_tile_overlap),
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
@@ -1005,22 +1005,22 @@ def parse_arguments() -> argparse.Namespace:
 Examples:
 
   Basic image upscaling:
-    python {invocation} --input image.jpg
+    python {invocation} image.jpg
 
   Basic video video upscaling with temporal consistency
-    python {invocation} --input video.mp4 --resolution 720 --batch_size 33
+    python {invocation} video.mp4 --resolution 720 --batch_size 33
     
   Multi-GPU processing with temporal overlap:
-    python {invocation} --input video.mp4 --cuda_device 0,1 --resolution 1080 --batch_size 81 --uniform_batch_size --temporal_overlap 3 --prepend_frames 4 
+    python {invocation} video.mp4 --cuda_device 0,1 --resolution 1080 --batch_size 81 --uniform_batch_size --temporal_overlap 3 --prepend_frames 4 
 
   Memory-optimized for low VRAM (8GB):
-    python {invocation} --input image.png --model seedvr2_ema_3b-Q8_0.gguf --blocks_to_swap 32 --swap_io_components --dit_offload_device cpu --vae_offload_device cpu
+    python {invocation} image.png --dit_model seedvr2_ema_3b-Q8_0.gguf --blocks_to_swap 32 --swap_io_components --dit_offload_device cpu --vae_offload_device cpu
     
   High resolution with VAE tiling:
-    python {invocation} --input video.mp4 --resolution 1440 --batch_size 31 --uniform_batch_size --temporal_overlap 3 --vae_encode_tiling_enabled --vae_decode_tiling_enabled
+    python {invocation} video.mp4 --resolution 1440 --batch_size 31 --uniform_batch_size --temporal_overlap 3 --vae_encode_tiled --vae_decode_tiled
     
   Batch directory processing:
-    python {invocation} --input media_folder/ --output processed/ --cuda_device 0 --cache_dit --cache_vae --dit_offload_device cpu --vae_offload_device cpu --resolution 1080 --max_resolution 1920   
+    python {invocation} media_folder/ --output processed/ --cuda_device 0 --cache_dit --cache_vae --dit_offload_device cpu --vae_offload_device cpu --resolution 1080 --max_resolution 1920
 
 """
     
@@ -1033,7 +1033,7 @@ Examples:
     
     # Input/Output
     io_group = parser.add_argument_group('Input/Output options')
-    io_group.add_argument("--input", type=str, required=True,
+    io_group.add_argument("input", type=str,
                         help="Input: video file (.mp4, .avi, etc.), image file (.png, .jpg, etc.), or directory")
     io_group.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto-generated in 'output/' directory)")
@@ -1044,7 +1044,7 @@ Examples:
     
     # Model Selection
     model_group = parser.add_argument_group('Model selection')
-    model_group.add_argument("--model", type=str, default=DEFAULT_DIT,
+    model_group.add_argument("--dit_model", type=str, default=DEFAULT_DIT,
                         choices=get_available_dit_models(),
                         help="DiT model to use. Options: 3B (fp16/fp8/GGUF) or 7B (fp16/fp8/GGUF). Default: 3B FP8")
     
@@ -1107,18 +1107,18 @@ Examples:
     
     # VAE Tiling
     vae_group = parser.add_argument_group('VAE tiling (for high resolution upscale)')
-    vae_group.add_argument("--vae_encode_tiling_enabled", action="store_true",
+    vae_group.add_argument("--vae_encode_tiled", action="store_true",
                         help="Enable VAE encode tiling to reduce VRAM during encoding")
     vae_group.add_argument("--vae_encode_tile_size", type=int, default=1024,
-                        help="VAE encode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_encode_tiling_enabled is set")
+                        help="VAE encode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_encode_tiled is set")
     vae_group.add_argument("--vae_encode_tile_overlap", type=int, default=128,
-                        help="VAE encode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_encode_tiling_enabled is set")
-    vae_group.add_argument("--vae_decode_tiling_enabled", action="store_true",
+                        help="VAE encode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_encode_tiled is set")
+    vae_group.add_argument("--vae_decode_tiled", action="store_true",
                         help="Enable VAE decode tiling to reduce VRAM during decoding")
     vae_group.add_argument("--vae_decode_tile_size", type=int, default=1024,
-                        help="VAE decode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_decode_tiling_enabled is set")
+                        help="VAE decode tile size in pixels (default: 1024). Applied to both height and width. Only used if --vae_decode_tiled is set")
     vae_group.add_argument("--vae_decode_tile_overlap", type=int, default=128,
-                        help="VAE decode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_decode_tiling_enabled is set")
+                        help="VAE decode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_decode_tiled is set")
     vae_group.add_argument("--tile_debug", type=str, default="false", choices=["false", "encode", "decode"],
                         help="Visualize tiles: 'false' (default), 'encode', or 'decode'")
     
@@ -1201,11 +1201,11 @@ def main() -> None:
     for key, value in vars(args).items():
         debug.log(f"{key}: {value}", category="none", indent_level=1)
 
-    if args.vae_encode_tiling_enabled and args.vae_encode_tile_overlap >= args.vae_encode_tile_size:
+    if args.vae_encode_tiled and args.vae_encode_tile_overlap >= args.vae_encode_tile_size:
         debug.log(f"VAE encode tile overlap ({args.vae_encode_tile_overlap}) must be smaller than tile size ({args.vae_encode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
-    if args.vae_decode_tiling_enabled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
+    if args.vae_decode_tiled and args.vae_decode_tile_overlap >= args.vae_decode_tile_size:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
@@ -1269,7 +1269,7 @@ def main() -> None:
             debug.log(f"Using devices: {device_list}", category="device")
         
         # Download models once before processing
-        if not download_weight(dit_model=args.model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
+        if not download_weight(dit_model=args.dit_model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
             debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
             sys.exit(1)
         

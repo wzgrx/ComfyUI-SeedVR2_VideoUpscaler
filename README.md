@@ -396,7 +396,7 @@ Main upscaling node that processes video frames using DiT and VAE models.
 - **seed**: Random seed for reproducible generation (default: 42)
   - Same seed with same inputs produces identical output
 
-- **new_resolution**: Target resolution for shortest edge in pixels (default: 1080)
+- **resolution**: Target resolution for shortest edge in pixels (default: 1080)
   - Maintains aspect ratio automatically
 
 - **max_resolution**: Maximum resolution for any edge (default: 0 = no limit)
@@ -472,7 +472,7 @@ SeedVR2 Load VAE Model
     ↓
 SeedVR2 Video Upscaler
   ├─ batch_size: 21
-  └─ new_resolution: 1080
+  └─ resolution: 1080
     ↓
 Save Video/Frames
 ```
@@ -496,7 +496,7 @@ SeedVR2 Load VAE Model
     ↓
 SeedVR2 Video Upscaler
   ├─ batch_size: 5
-  └─ new_resolution: 720
+  └─ resolution: 720
     ↓
 Save Video/Frames
 ```
@@ -521,7 +521,7 @@ SeedVR2 Load VAE Model
     ↓
 SeedVR2 Video Upscaler
   ├─ batch_size: 81
-  └─ new_resolution: 1080
+  └─ resolution: 1080
     ↓
 Save Video/Frames
 ```
@@ -603,13 +603,13 @@ The CLI provides comprehensive options for single-GPU, multi-GPU, and batch proc
 
 ```bash
 # Basic image upscaling
-python inference_cli.py --input image.jpg
+python inference_cli.py image.jpg
 
 # Basic video video upscaling with temporal consistency
-python inference_cli.py --input video.mp4 --resolution 720 --batch_size 33
+python inference_cli.py video.mp4 --resolution 720 --batch_size 33
 
 # Multi-GPU processing with temporal overlap
-python inference_cli.py --input video.mp4 \
+python inference_cli.py video.mp4 \
     --cuda_device 0,1 \
     --resolution 1080 \
     --batch_size 81 \
@@ -618,8 +618,8 @@ python inference_cli.py --input video.mp4 \
     --prepend_frames 4
 
 # Memory-optimized for low VRAM (8GB)
-python inference_cli.py --input image.png \
-    --model seedvr2_ema_3b-Q8_0.gguf \
+python inference_cli.py image.png \
+    --dit_model seedvr2_ema_3b-Q8_0.gguf \
     --resolution 1080 \
     --blocks_to_swap 32 \
     --swap_io_components \
@@ -627,16 +627,16 @@ python inference_cli.py --input image.png \
     --vae_offload_device cpu
 
 # High resolution with VAE tiling
-python inference_cli.py --input video.mp4 \
+python inference_cli.py video.mp4 \
     --resolution 1440 \
     --batch_size 31 \
     --uniform_batch_size \
     --temporal_overlap 3 \
-    --vae_encode_tiling_enabled \
-    --vae_decode_tiling_enabled
+    --vae_encode_tiled \
+    --vae_decode_tiled
 
 # Batch directory processing with model caching
-python inference_cli.py --input media_folder/ \
+python inference_cli.py media_folder/ \
     --output processed/ \
     --cuda_device 0 \
     --cache_dit \
@@ -650,13 +650,13 @@ python inference_cli.py --input media_folder/ \
 ### Command Line Arguments
 
 **Input/Output:**
-- `--input`: Input file (.mp4, .avi, .png, .jpg, etc.) or directory (required)
+- `<input>`: Input file (.mp4, .avi, .png, .jpg, etc.) or directory
 - `--output`: Output path (default: auto-generated in 'output/' directory)
 - `--output_format`: Output format: 'mp4' (video) or 'png' (image sequence). Default: auto-detect from input type
 - `--model_dir`: Model directory (default: ./models/SEEDVR2)
 
 **Model Selection:**
-- `--model`: DiT model to use. Options: 3B/7B with fp16/fp8/GGUF variants (default: 3B FP8)
+- `--dit_model`: DiT model to use. Options: 3B/7B with fp16/fp8/GGUF variants (default: 3B FP8)
 
 **Processing Parameters:**
 - `--resolution`: Target short-side resolution in pixels (default: 1080)
@@ -681,10 +681,10 @@ python inference_cli.py --input media_folder/ \
 - `--use_non_blocking`: Use non-blocking memory transfers for BlockSwap (recommended)
 
 **VAE Tiling:**
-- `--vae_encode_tiling_enabled`: Enable VAE encode tiling to reduce VRAM during encoding
+- `--vae_encode_tiled`: Enable VAE encode tiling to reduce VRAM during encoding
 - `--vae_encode_tile_size`: VAE encode tile size in pixels (default: 1024)
 - `--vae_encode_tile_overlap`: VAE encode tile overlap in pixels (default: 128)
-- `--vae_decode_tiling_enabled`: Enable VAE decode tiling to reduce VRAM during decoding
+- `--vae_decode_tiled`: Enable VAE decode tiling to reduce VRAM during decoding
 - `--vae_decode_tile_size`: VAE decode tile size in pixels (default: 1024)
 - `--vae_decode_tile_overlap`: VAE decode tile overlap in pixels (default: 128)
 - `--tile_debug`: Visualize tiles: 'false' (default), 'encode', or 'decode'
@@ -762,7 +762,7 @@ Result: Frames 0-100 with smooth transition at frame 48
 2. **For OOM errors during encoding**: Enable VAE encode tiling and reduce tile size
 3. **For OOM errors during upscaling**: Enable BlockSwap and increase blocks_to_swap
 4. **For OOM errors during decoding**: Enable VAE decode tiling and reduce tile size
-   - **If still getting OOM after trying all above**: Reduce batch_size or new_resolution
+   - **If still getting OOM after trying all above**: Reduce batch_size or resolution
 5. **For best quality**: Use higher batch_size matching your shot length, FP16 models, and LAB color correction
 6. **For speed**: Use FP8/GGUF models, enable torch.compile, and use Flash Attention if available
 7. **Test settings with a short clip first** before processing long videos

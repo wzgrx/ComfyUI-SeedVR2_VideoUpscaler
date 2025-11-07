@@ -82,7 +82,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Same seed with same inputs produces identical output."
                     )
                 ),
-                io.Int.Input("new_resolution",
+                io.Int.Input("resolution",
                     default=1080,
                     min=16,
                     max=16384,
@@ -100,7 +100,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                     step=2,
                     tooltip=(
                         "Maximum resolution limit for any dimension (default: 0, no limit).\n"
-                        "If any edge exceeds this after applying new_resolution,\n"
+                        "If any edge exceeds this after applying resolution,\n"
                         "both dimensions are scaled down proportionally.\n"
                         "Useful to prevent excessive VRAM usage on extreme aspect ratios."
                     )
@@ -223,7 +223,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
     
     @classmethod
     def execute(cls, image: torch.Tensor, dit: Dict[str, Any], vae: Dict[str, Any], 
-                seed: int, new_resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
+                seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
                 uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
                 latent_noise_scale: float = 0.0, offload_device: str = "none", 
@@ -240,7 +240,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             dit: DiT model configuration from SeedVR2LoadDiTModel node
             vae: VAE model configuration from SeedVR2LoadVAEModel node
             seed: Random seed for reproducible generation
-            new_resolution: Target resolution for shortest edge (maintains aspect ratio)
+            resolution: Target resolution for shortest edge (maintains aspect ratio)
             max_resolution: Maximum resolution for any edge (0 = no limit)
             batch_size: Frames per batch (minimum 5 for temporal consistency)
             uniform_batch_size: Whether to pad final batch to match batch_size
@@ -445,7 +445,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             image, gen_info = compute_generation_info(
                 ctx=ctx,
                 images=image,
-                resolution=new_resolution,
+                resolution=resolution,
                 max_resolution=max_resolution,
                 batch_size=batch_size,
                 uniform_batch_size=uniform_batch_size,
@@ -471,7 +471,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 seed=seed,
                 progress_callback=progress_callback,
                 temporal_overlap=temporal_overlap,
-                resolution=new_resolution,
+                resolution=resolution,
                 max_resolution=max_resolution,
                 input_noise_scale=input_noise_scale,
                 color_correction=color_correction
