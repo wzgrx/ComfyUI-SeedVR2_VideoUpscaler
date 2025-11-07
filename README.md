@@ -6,10 +6,10 @@ Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for Comf
 
 Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#️-run-as-standalone-cli) section.
 
-<img src="docs/demo_01.jpg">
-<img src="docs/demo_02.jpg">
+![Demo 01](docs/demo_01.jpg)
+![Demo 02](docs/demo_02.jpg)
 
-<img src="docs/usage.png">
+![Usage Example](docs/usage.png)
 
 ## 📋 Quick Access
 
@@ -35,8 +35,7 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
-**2025.11.05**
-
+**2025.11.07**
 - 
 
 
@@ -210,6 +209,8 @@ SeedVR2 uses a modular node architecture with four specialized nodes:
 
 #### 1. SeedVR2 (Down)Load DiT Model
 
+![SeedVR2 (Down)Load DiT Model](docs/dit_model_loader.png)
+
 Configure the DiT (Diffusion Transformer) model for video upscaling.
 
 **Parameters:**
@@ -276,6 +277,8 @@ BlockSwap enables running large models on GPUs with limited VRAM by dynamically 
 
 #### 2. SeedVR2 (Down)Load VAE Model
 
+![SeedVR2 (Down)Load VAE Model](docs/vae_model_loader.png)
+
 Configure the VAE (Variational Autoencoder) model for encoding/decoding video frames.
 
 **Parameters:**
@@ -335,6 +338,8 @@ VAE tiling processes large resolutions in smaller tiles to reduce VRAM requireme
 
 #### 3. SeedVR2 Torch Compile Settings (Optional)
 
+![SeedVR2 Torch Compile Settings](docs/torch_compile_settings.png)
+
 Configure torch.compile optimization for 20-40% DiT speedup and 15-25% VAE speedup.
 
 **Requirements:**
@@ -382,6 +387,8 @@ Configure torch.compile optimization for 20-40% DiT speedup and 15-25% VAE speed
 - For production: `mode=max-autotune`, `backend=inductor`, `fullgraph=False`
 
 #### 4. SeedVR2 Video Upscaler (Main Node)
+
+![SeedVR2 Video Upscaler](docs/video_upscaler.png)
 
 Main upscaling node that processes video frames using DiT and VAE models.
 
