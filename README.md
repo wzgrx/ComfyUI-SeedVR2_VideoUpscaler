@@ -9,7 +9,9 @@ Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#�
 ![Demo 01](docs/demo_01.jpg)
 ![Demo 02](docs/demo_02.jpg)
 
-![Usage Example](docs/usage.png)
+![Usage Example](docs/usage_01.png)
+
+![Usage Example](docs/usage_02.png)
 
 ## 📋 Quick Access
 
@@ -35,9 +37,67 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
-**2025.11.07**
-- 
+**2025.11.07 - Version 2.5.0** 🎉
 
+⚠️ **BREAKING CHANGE**: This is a major update requiring workflow recreation. All nodes and CLI parameters have been redesigned for better usability and consistency. Watch the latest video from [AInVFX](https://www.youtube.com/@AInVFX) for a deep dive and check out the [usage](#-usage) section.
+
+**📦 Official Release**: Now available on main branch with ComfyUI Manager support for easy installation and automatic version tracking. Updated dependencies and local imports prevent conflicts with other ComfyUI custom nodes.
+
+### 🎨 ComfyUI Improvements
+
+- **Four-Node Modular Architecture**: Split into dedicated nodes for DiT model, VAE model, torch.compile settings, and main upscaler for granular control
+- **Global Model Cache**: Models now shared across multiple upscaler instances with automatic config updates - no more redundant loading
+- **ComfyUI V3 Migration**: Full compatibility with ComfyUI V3 stateless node design
+- **RGBA Support**: Native alpha channel processing with edge-guided upscaling for clean transparency
+- **Improved Memory Management**: Streaming architecture prevents VRAM spikes regardless of video length
+- **Flexible Resolution Support**: Upscale to any resolution divisible by 2 with lossless padding approach (replaced restrictive cropping)
+- **Enhanced Parameters**: Added `uniform_batch_size`, `temporal_overlap`, `prepend_frames`, and `max_resolution` for better control
+
+### 🖥️ CLI Enhancements
+
+- **Batch Directory Processing**: Process entire folders of videos/images with model caching for efficiency
+- **Single Image Support**: Direct image upscaling without video conversion
+- **Smart Output Detection**: Auto-detects output format (MP4/PNG) based on input type
+- **Enhanced Multi-GPU**: Improved workload distribution with temporal overlap blending
+- **Unified Parameters**: CLI and ComfyUI now use identical parameter names for consistency
+- **Better UX**: Auto-display help, validation improvements, progress tracking, and cleaner output
+
+### ⚡ Performance & Optimization
+
+- **torch.compile Support**: 20-40% DiT speedup and 15-25% VAE speedup with full graph compilation
+- **Optimized BlockSwap**: Adaptive memory clearing (5% threshold), separate I/O component handling, reduced overhead
+- **Enhanced VAE Tiling**: Tensor offload support for accumulation buffers, separate encode/decode configuration
+- **Native Dtype Pipeline**: Eliminated unnecessary conversions, maintains bfloat16 precision throughout for speed and quality
+- **Optimized Tensor Operations**: Replaced einops rearrange with native PyTorch ops for 2-5x faster transforms
+
+### 🎯 Quality Improvements
+
+- **LAB Color Correction**: New perceptual color transfer method with superior color accuracy (now default)
+- **Additional Color Methods**: HSV saturation matching, wavelet adaptive, and hybrid approaches
+- **Deterministic Generation**: Seed-based reproducibility with phase-specific seeding strategy
+- **Better Temporal Consistency**: Hann window blending for smooth transitions between batches
+
+### 💾 Memory Management
+
+- **Smarter Offloading**: Independent device configuration for DiT, VAE, and tensors (CPU/GPU/none)
+- **Four-Phase Pipeline**: Completes each phase (encode→upscale→decode→postprocess) for all batches before moving to next, minimizing model swaps
+- **Better Cleanup**: Phase-specific resource management with proper tensor memory release
+- **Peak VRAM Tracking**: Per-phase memory monitoring with summary display
+
+### 🔧 Technical Improvements
+
+- **GGUF Quantization Support**: Added full GGUF support for 4-bit/8-bit inference on low-VRAM systems
+- **Improved GGUF Handling**: Fixed VRAM leaks, torch.compile compatibility, non-persistent buffers
+- **AMD ROCm Compatibility**: Conditional FSDP imports for PyTorch ROCm 7+ support
+- **Conv3d Memory Workaround**: Fixes PyTorch 2.9+ cuDNN memory bug (3x usage reduction)
+- **Flash Attention Optional**: Graceful fallback to SDPA when flash-attn unavailable
+
+### 📚 Code Quality
+
+- **Modular Architecture**: Split monolithic files into focused modules (generation_phases, model_configuration, etc.)
+- **Comprehensive Documentation**: Extensive docstrings with type hints across all modules
+- **Better Error Handling**: Early validation, clear error messages, installation instructions
+- **Consistent Logging**: Unified indentation, better categorization, concise messages
 
 **2025.08.07**
 
