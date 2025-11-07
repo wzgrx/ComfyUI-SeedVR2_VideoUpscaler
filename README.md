@@ -88,6 +88,7 @@ We're actively working on improvements and new features. To stay informed:
 
 - **GGUF Quantization Support**: Added full GGUF support for 4-bit/8-bit inference on low-VRAM systems
 - **Improved GGUF Handling**: Fixed VRAM leaks, torch.compile compatibility, non-persistent buffers
+- **Apple Silicon Support**: Full MPS (Metal Performance Shaders) support for Apple Silicon Macs
 - **AMD ROCm Compatibility**: Conditional FSDP imports for PyTorch ROCm 7+ support
 - **Conv3d Memory Workaround**: Fixes PyTorch 2.9+ cuDNN memory bug (3x usage reduction)
 - **Flash Attention Optional**: Graceful fallback to SDPA when flash-attn unavailable
