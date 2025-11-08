@@ -36,6 +36,11 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.08 - Version 2.5.3**
+
+- 🍎 **Fix: Apple Silicon MPS device handling** - Corrected MPS device enumeration to use `"mps"` instead of `"mps:0"`, resolving invalid device errors on M-series Macs
+- 🪟 **Fix: torch.mps AttributeError on Windows** - Add defensive checks for `torch.mps.is_available()` to handle PyTorch versions where the method doesn't exist on non-Mac platforms
+
 **2025.11.07 - Version 2.5.0** 🎉
 
 ⚠️ **BREAKING CHANGE**: This is a major update requiring workflow recreation. All nodes and CLI parameters have been redesigned for better usability and consistency. Watch the latest video from [AInVFX](https://www.youtube.com/@AInVFX) for a deep dive and check out the [usage](#-usage) section.

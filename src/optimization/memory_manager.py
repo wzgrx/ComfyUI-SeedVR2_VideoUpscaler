@@ -39,7 +39,7 @@ def get_device_list(include_none: bool = False, include_cpu: bool = False) -> Li
     
     try:
         if hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.mps.is_available():
-            devs += [f"mps:{i}" for i in range(torch.mps.device_count())]
+            devs.append("mps")  # MPS doesn't use device indices
             has_mps = True
     except Exception:
         pass
