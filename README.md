@@ -6,8 +6,7 @@ Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for Comf
 
 Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#️-run-as-standalone-cli) section.
 
-![Demo 01](docs/demo_01.jpg)
-![Demo 02](docs/demo_02.jpg)
+[![SeedVR2 v2.5 Deep Dive Tutorial](https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg)](https://youtu.be/MBtWYXq_r60)
 
 ![Usage Example](docs/usage_01.png)
 
@@ -246,23 +245,27 @@ You can also manually download models from:
 
 #### Latest Version Deep Dive (Recommended)
 
-Complete walkthrough of the latest version showing all nodes and functionalities, by the developer behind the integration:
+Complete walkthrough of version 2.5 by Adrien from [AInVFX](https://www.youtube.com/@AInVFX), covering the new 4-node architecture, GGUF support, memory optimizations, and production workflows:
 
-**[Coming Soon]** - A comprehensive tutorial covering the November 2025 update will be released shortly, featuring:
-- All four SeedVR2 nodes and their configuration
-- GGUF model usage for low VRAM systems
-- torch.compile optimization setup
-- VAE tiling configuration
-- Multi-GPU CLI workflows
-- Real-world production tips
+[![SeedVR2 v2.5 Deep Dive Tutorial](https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg)](https://youtu.be/MBtWYXq_r60)
+
+This comprehensive tutorial covers:
+- Installing v2.5 through ComfyUI Manager and troubleshooting conflicts
+- Understanding the new 4-node modular architecture and why we rebuilt it
+- Running 7B models on 8GB VRAM with GGUF quantization
+- Configuring BlockSwap, VAE tiling, and torch.compile for your hardware
+- Image and video upscaling workflows with alpha channel support
+- CLI for batch processing and multi-GPU rendering
+- Memory optimization strategies for different VRAM levels
+- Real production tips and the critical batch_size formula (4n+1)
 
 #### Previous Version Tutorial
 
-Learn everything about SeedVR2 in this comprehensive tutorial by Adrien from [AInVFX](https://www.youtube.com/@AInVFX), covering ComfyUI setup, BlockSwap for consumer GPUs, alpha workflows, and production tips:
+For reference, here's the original tutorial covering the initial release:
 
 [![SeedVR2 Deep Dive Tutorial](https://img.youtube.com/vi/I0sl45GMqNg/maxresdefault.jpg)](https://youtu.be/I0sl45GMqNg)
 
-*Note: This tutorial covers the previous node architecture. The core concepts remain valid, but the UI and some node configurations have changed in the latest version.*
+*Note: This tutorial covers the previous single-node architecture. While the UI has changed significantly in v2.5, the core concepts about BlockSwap and memory management remain valuable.*
 
 ### Node Setup
 
