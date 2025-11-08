@@ -36,6 +36,11 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.08 - Version 2.5.4**
+
+- 🎨 **Fix: AdaIN color correction** - Replace `.view()` with `.reshape()` to handle non-contiguous tensors after spatial padding, resolving "view size is not compatible with input tensor's size and stride" error
+- 🔴 **Fix: AMD ROCm compatibility** - Add cuDNN availability check in Conv3d workaround to prevent "ATen not compiled with cuDNN support" error on ROCm systems (AMD GPUs on Windows/Linux)
+
 **2025.11.08 - Version 2.5.3**
 
 - 🍎 **Fix: Apple Silicon MPS device handling** - Corrected MPS device enumeration to use `"mps"` instead of `"mps:0"`, resolving invalid device errors on M-series Macs
