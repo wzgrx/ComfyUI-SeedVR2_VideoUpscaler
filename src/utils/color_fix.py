@@ -84,9 +84,9 @@ def calc_mean_std(feat: Tensor, eps: float = 1e-5) -> tuple[Tensor, Tensor]:
     assert len(size) == 4, 'The input feature should be 4D tensor.'
     b, c = size[:2]
     
-    feat_var = feat.view(b, c, -1).var(dim=2) + eps
-    feat_std = feat_var.sqrt().view(b, c, 1, 1)
-    feat_mean = feat.view(b, c, -1).mean(dim=2).view(b, c, 1, 1)
+    feat_var = feat.reshape(b, c, -1).var(dim=2) + eps
+    feat_std = feat_var.sqrt().reshape(b, c, 1, 1)
+    feat_mean = feat.reshape(b, c, -1).mean(dim=2).reshape(b, c, 1, 1)
     
     return feat_mean, feat_std
 
