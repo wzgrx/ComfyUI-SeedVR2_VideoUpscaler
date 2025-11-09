@@ -375,13 +375,11 @@ def setup_generation_context(
         'interrupt_fn': interrupt_fn,
         'video_transform': None,
         'text_embeds': None,
-        'all_transformed_videos': [],
         'all_latents': [],
         'all_upscaled_latents': [],
         'batch_samples': [],
         'final_video': None,
         'comfyui_available': comfyui_available,
-        'interrupt_fn': interrupt_fn,
     }
     
     if debug:
