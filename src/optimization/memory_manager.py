@@ -423,12 +423,11 @@ def clear_rope_lru_caches(model: Optional[torch.nn.Module], debug: Optional['Deb
 
 
 def release_tensor_memory(tensor: Optional[torch.Tensor]) -> None:
-    """Release tensor memory properly without CPU allocation"""
+    """Release tensor memory from any device (CPU/CUDA/MPS)"""
     if tensor is not None and torch.is_tensor(tensor):
-        if tensor.is_cuda or tensor.is_mps:
-            # Release GPU memory directly without CPU transfer
-            if tensor.numel() > 0:
-                tensor.data.set_()
+        # Release storage for all devices (CPU, CUDA, MPS)
+        if tensor.numel() > 0:
+            tensor.data.set_()
         tensor.grad = None
 
 

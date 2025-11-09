@@ -36,6 +36,10 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.09 - Version 2.5.5**
+
+- 💾 **Memory: Fixed RAM leak for long videos** - On-demand reconstruction with lightweight batch indices instead of storing full transformed videos, fixed release_tensor_memory to handle CPU/CUDA/MPS consistently, and refactored batch processing helpers
+
 **2025.11.08 - Version 2.5.4**
 
 - 🎨 **Fix: AdaIN color correction** - Replace `.view()` with `.reshape()` to handle non-contiguous tensors after spatial padding, resolving "view size is not compatible with input tensor's size and stride" error

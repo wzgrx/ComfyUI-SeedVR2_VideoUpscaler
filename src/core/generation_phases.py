@@ -66,6 +66,108 @@ from ..utils.color_fix import (
 )
 
 
+def _prepare_video_batch(
+    images: torch.Tensor,
+    start_idx: int,
+    end_idx: int,
+    uniform_padding: int = 0,
+    debug: Optional['Debug'] = None,
+    log_info: bool = False
+) -> torch.Tensor:
+    """
+    Extract and prepare video batch with uniform padding and permutation.
+    
+    Args:
+        images: Source video frames [T, H, W, C]
+        start_idx: Start frame index
+        end_idx: End frame index (exclusive)
+        uniform_padding: Number of frames to pad (0 = no padding)
+        debug: Debug instance for optional logging
+        log_info: If True, log padding operations (used during encoding only)
+        
+    Returns:
+        Prepared video in TCHW format
+    """
+    # Extract frames (view/slice, not copy)
+    video = images[start_idx:end_idx]
+    
+    # Apply uniform padding if needed
+    if uniform_padding > 0:
+        if log_info and debug:
+            current_frames = end_idx - start_idx
+            debug.log(f"Sequence of {current_frames} frames", category="video", force=True, indent_level=1)
+            debug.log(f"Padding batch: {uniform_padding} frame{'s' if uniform_padding != 1 else ''} added ({current_frames} → {current_frames + uniform_padding}) for uniform batches", 
+                     category="video", force=True, indent_level=1)
+        video = pad_video_temporal(video, count=uniform_padding, temporal_dim=0, prepend=False, debug=None)
+    
+    # Permute to TCHW format
+    video = video.permute(0, 3, 1, 2)
+    
+    return video
+
+
+def _apply_4n1_padding(video: torch.Tensor) -> torch.Tensor:
+    """
+    Apply 4n+1 temporal padding constraint required by VAE.
+    
+    Args:
+        video: Video tensor in TCHW format
+        
+    Returns:
+        Padded video in TCHW format
+    """
+    t = video.size(0)
+    if t % 4 != 1:
+        video = optimized_single_video_rearrange(video)  # TCHW -> CTHW
+        video = pad_video_temporal(video, temporal_dim=1, prepend=False, debug=None)
+        video = optimized_single_video_rearrange(video)  # CTHW -> TCHW
+    return video
+
+
+def _reconstruct_and_transform_batch(
+    ctx: Dict[str, Any],
+    batch_idx: int,
+    debug: Optional['Debug'] = None
+) -> torch.Tensor:
+    """
+    Reconstruct and transform a video batch for color correction (Phase 4).
+    
+    Args:
+        ctx: Context with input_images, batch_metadata, video_transform
+        batch_idx: Index of batch to reconstruct
+        debug: Debug instance for logging
+        
+    Returns:
+        Transformed video in CTHW format, ready for color correction
+    """
+    start_idx, end_idx, uniform_padding = ctx['batch_metadata'][batch_idx]
+    
+    # Prepare video batch
+    video = _prepare_video_batch(
+        images=ctx['input_images'],
+        start_idx=start_idx,
+        end_idx=end_idx,
+        uniform_padding=uniform_padding,
+        debug=None,
+        log_info=False
+    )
+    
+    # Apply 4n+1 padding using shared helper
+    video = _apply_4n1_padding(video)
+    
+    # Extract RGB and transform
+    if ctx.get('is_rgba', False):
+        rgb_video = video[:, :3, :, :]
+    else:
+        rgb_video = video
+    
+    transformed_video = ctx['video_transform'](rgb_video)
+    
+    del video
+    
+    return transformed_video
+
+
 def encode_all_batches(
     runner: 'VideoDiffusionInfer',
     ctx: Dict[str, Any],
@@ -106,7 +208,7 @@ def encode_all_batches(
         
     Returns:
         dict: Context containing:
-            - all_transformed_videos: List of (video, original_length) tuples
+            - batch_metadata: Lightweight indices for on-demand transform reconstruction
             - all_latents: List of encoded latents ready for upscaling
             - Other state for subsequent phases
             
@@ -179,9 +281,7 @@ def encode_all_batches(
     ctx['all_latents'] = [None] * num_encode_batches
     ctx['all_ori_lengths'] = [None] * num_encode_batches
     if color_correction != "none":
-        ctx['all_transformed_videos'] = [None] * num_encode_batches
-    else:
-        ctx['all_transformed_videos'] = None
+        ctx['batch_metadata'] = [None] * num_encode_batches
     
     encode_idx = 0
     
@@ -246,23 +346,21 @@ def encode_all_batches(
             debug.log(f"Encoding batch {encode_idx+1}/{num_encode_batches}", category="vae", force=True)
             debug.start_timer(f"encode_batch_{encode_idx+1}")
             
-            # Save original length BEFORE any padding (critical for post-processing trimming)
+            # Save original length before any padding
             ori_length = current_frames
             
-            # Process current batch
-            video = images[start_idx:end_idx]
-            
-            # Log uniform padding if applied
+            # Prepare video batch with uniform padding
+            video = _prepare_video_batch(
+                images=images,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                uniform_padding=batch_size - current_frames if is_uniform_padding else 0,
+                debug=debug,
+                log_info=True
+            )
             if is_uniform_padding:
-                padding_for_uniform = batch_size - current_frames
-                debug.log(f"Sequence of {current_frames} frames", category="video", force=True, indent_level=1)
-                debug.log(f"Padding batch: {padding_for_uniform} frame{'s' if padding_for_uniform != 1 else ''} added ({current_frames} → {batch_size}) for uniform batches", 
-                         category="video", force=True, indent_level=1)
-                video = pad_video_temporal(video, count=padding_for_uniform, temporal_dim=0, prepend=False, debug=None)
                 current_frames = batch_size
             
-            # Permute and move to device
-            video = video.permute(0, 3, 1, 2)
             video = manage_tensor(
                 tensor=video,
                 target_device=ctx['vae_device'],
@@ -280,29 +378,23 @@ def encode_all_batches(
             if not is_uniform_padding:
                 debug.log(f"Sequence of {t} frames", category="video", force=True, indent_level=1)
 
-            # Apply 4n+1 padding if needed
+            # Apply 4n+1 padding using shared helper
             if t % 4 != 1:
                 target = ((t-1)//4+1)*4+1
                 padding_frames = target - t
                 debug.log(f"Padding batch: {padding_frames} frame{'s' if padding_frames != 1 else ''} added ({t} → {target}) to meet 4n+1 constraint", 
                          category="video", force=True, indent_level=1)
-                
-                # Pad video using reversed frames (TCHW format, need to convert to CTHW)
-                video = optimized_single_video_rearrange(video)  # TCHW -> CTHW
-                video = pad_video_temporal(video, temporal_dim=1, prepend=False, debug=None)
-                video = optimized_single_video_rearrange(video)  # CTHW -> TCHW
+                # Apply 4n+1 padding to match exact frame count from encoding
+                video = _apply_4n1_padding(video)
 
-            # Extract RGB for transforms (view, not copy)
+            # Apply transformations (matches reconstruction logic)
             if ctx.get('is_rgba', False):
-                rgb_for_transform = video[:, :3, :, :]
                 debug.log(f"Extracted Alpha channel for edge-guided upscaling", category="alpha", indent_level=1)
+                rgb_video = video[:, :3, :, :]
             else:
-                rgb_for_transform = video
+                rgb_video = video
 
-            # Apply transformations (to RGB from already-padded video)
-            transformed_video = ctx['video_transform'](rgb_for_transform)
-
-            del rgb_for_transform
+            transformed_video = ctx['video_transform'](rgb_video)
 
             # Apply input noise if requested (to reduce artifacts at high resolutions)
             if input_noise_scale > 0:
@@ -325,6 +417,10 @@ def encode_all_batches(
             # Store original length for proper trimming later
             ctx['all_ori_lengths'][encode_idx] = ori_length
 
+            # Store batch frame indices for on-demand reconstruction
+            if color_correction != "none":
+                ctx['batch_metadata'][encode_idx] = (start_idx, end_idx, batch_size - ori_length if is_uniform_padding else 0)
+            
             # Extract and store Alpha and RGB from padded original video (before encoding)
             if ctx.get('is_rgba', False):
                 if 'all_alpha_channels' not in ctx:
@@ -375,26 +471,9 @@ def encode_all_batches(
             
             # Encode to latents
             cond_latents = runner.vae_encode([transformed_video])
-            
-            # Store transformed video for color correction after encoding
-            if color_correction != "none":
-                if ctx['tensor_offload_device'] is not None:
-                    # Move to offload device to free VRAM
-                    ctx['all_transformed_videos'][encode_idx] = manage_tensor(
-                        tensor=transformed_video,
-                        target_device=ctx['tensor_offload_device'],
-                        tensor_name=f"transformed_video_{encode_idx+1}",
-                        debug=debug,
-                        reason="storing input reference for color correction",
-                        indent_level=1
-                    )
-                else:
-                    # No offload device - keep reference on VAE device
-                    ctx['all_transformed_videos'][encode_idx] = transformed_video
-            
-            # Clean up transformed_video reference if not needed or already offloaded
-            if color_correction == "none" or ctx['tensor_offload_device'] is not None:
-                del transformed_video
+
+            # Don't store transformed_video - will reconstruct on-demand in Phase 4
+            del transformed_video, rgb_video
             
             # Convert from VAE dtype to compute dtype and offload to avoid VRAM accumulation
             if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps):
@@ -1031,13 +1110,14 @@ def postprocess_all_batches(
                 video_idx = min(batch_idx, len(ctx['all_ori_lengths']) - 1)
                 ori_length = ctx['all_ori_lengths'][video_idx] if 'all_ori_lengths' in ctx else sample.shape[0]
                 
-                # Retrieve transformed video early for consistent trimming
+                # Reconstruct transformed video on-demand for color correction
                 input_video = None
-                if color_correction != "none" and ctx.get('all_transformed_videos') is not None:
-                    if video_idx < len(ctx['all_transformed_videos']) and ctx['all_transformed_videos'][video_idx] is not None:
-                        transformed_video = ctx['all_transformed_videos'][video_idx]
-                        # Convert transformed video from C T H W to T C H W format
+                if color_correction != "none" and ctx.get('batch_metadata') is not None:
+                    if video_idx < len(ctx['batch_metadata']) and ctx['batch_metadata'][video_idx] is not None:
+                        # Reconstruct transformation
+                        transformed_video = _reconstruct_and_transform_batch(ctx, video_idx, debug)
                         input_video = optimized_single_video_rearrange(transformed_video)
+                        del transformed_video
                 
                 # Trim both sample and input_video to original length if necessary (handles temporal padding)
                 if ori_length < sample.shape[0]:
@@ -1112,9 +1192,8 @@ def postprocess_all_batches(
                     
                     debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                     
-                    # Free the transformed video
-                    ctx['all_transformed_videos'][video_idx] = None
-                    del input_video, transformed_video
+                    # Free the reconstructed transformed video
+                    del input_video
 
                     # Recombine with Alpha if it was present in input
                     if has_alpha and alpha_channel is not None:
@@ -1299,8 +1378,7 @@ def postprocess_all_batches(
             del ctx['video_transform']
         
         # 3. Clean up storage lists (all_latents, all_alpha_channels, etc.)
-        tensor_storage_keys = ['all_latents', 'all_transformed_videos', 
-                            'all_alpha_channels', 'all_input_rgb']
+        tensor_storage_keys = ['all_latents', 'all_alpha_channels', 'all_input_rgb']
         for key in tensor_storage_keys:
             if key in ctx and ctx[key]:
                 release_tensor_collection(ctx[key])
@@ -1311,6 +1389,11 @@ def postprocess_all_batches(
             del ctx['all_ori_lengths']
         if 'true_target_dims' in ctx:
             del ctx['true_target_dims']
+        if 'batch_metadata' in ctx:
+            del ctx['batch_metadata']
+        if 'input_images' in ctx:
+            release_tensor_memory(ctx['input_images'])
+            del ctx['input_images']
 
     debug.end_timer("phase4_postprocessing", "Phase 4: Post-processing complete", show_breakdown=True)
     debug.log_memory_state("After phase 4 (Post-processing)", show_tensors=False)
