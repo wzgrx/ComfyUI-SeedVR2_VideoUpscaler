@@ -105,7 +105,21 @@ def _check_conv3d_memory_bug():
     with fp16/bfloat16 due to buggy dispatch layer.
     """
     try:
-        if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 3):
+        # Exclude AMD ROCm/HIP builds (they use MIOpen, not cuDNN)
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            return False
+        
+        # Must have CUDA available
+        if not (hasattr(torch, 'cuda') and torch.cuda.is_available()):
+            return False
+        
+        # Must have cuDNN actually available (not just the attribute)
+        if not (hasattr(torch.backends.cudnn, 'is_available') and 
+                torch.backends.cudnn.is_available()):
+            return False
+        
+        # Check device capability (NVIDIA GPUs)
+        if torch.cuda.get_device_capability()[0] < 3:
             return False
         
         # Parse torch version

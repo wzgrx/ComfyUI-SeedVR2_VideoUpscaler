@@ -96,17 +96,21 @@ class InflatedCausalConv3d(Conv3d):
             hasattr(torch.backends.cudnn, 'is_available') and
             torch.backends.cudnn.is_available() and
             getattr(torch.backends.cudnn, 'enabled', True)):
-            # Direct cuDNN call bypasses buggy PyTorch dispatch layer (NVIDIA only)
-            out = torch.cudnn_convolution(
-                input, weight, self.padding, self.stride, self.dilation, self.groups,
-                benchmark=False, deterministic=False, allow_tf32=True
-            )
-            if bias is not None:
-                out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
-            return out
-        else:
-            # Use standard path for unaffected configurations
-            return super()._conv_forward(input, weight, bias, *args, **kwargs)
+            try:
+                # Direct cuDNN call bypasses buggy PyTorch dispatch layer (NVIDIA only)
+                out = torch.cudnn_convolution(
+                    input, weight, self.padding, self.stride, self.dilation, self.groups,
+                    benchmark=False, deterministic=False, allow_tf32=True
+                )
+                if bias is not None:
+                    out += bias.reshape((1, -1) + (1,) * (out.ndim - 2))
+                return out
+            except RuntimeError:
+                # Fallback if direct cuDNN call fails (dev builds, edge cases)
+                pass
+        
+        # Use standard path for unaffected configurations or if workaround failed
+        return super()._conv_forward(input, weight, bias, *args, **kwargs)
 
     def memory_limit_conv(
         self,
