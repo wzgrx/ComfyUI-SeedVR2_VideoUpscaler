@@ -229,7 +229,7 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
         
     Returns:
         Tuple containing:
-            - frames_tensor: Single frame as tensor [1, H, W, C], Float16, range [0,1]
+            - frames_tensor: Single frame as tensor [1, H, W, C], Float16, range [0,1] (C=3 for RGB, C=4 for RGBA)
             - fps: Default FPS value (30.0) for image-to-video conversion
     
     Raises:
@@ -241,13 +241,17 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
-    # Read image
-    frame = cv2.imread(image_path)
+    # Read image with alpha channel preserved
+    frame = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
     if frame is None:
         raise ValueError(f"Cannot open image file: {image_path}")
     
-    # Convert BGR to RGB
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Convert BGR(A) to RGB(A) based on channel count
+    if frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+        debug.log(f"Detected RGBA image (alpha channel preserved)", category="file")
+    else:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
     # Convert to float32 and normalize
     frame = frame.astype(np.float32) / 255.0
@@ -291,37 +295,51 @@ def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'u
 
 
 def generate_output_path(input_path: str, output_format: str, output_dir: Optional[str] = None, 
-                        input_type: Optional[str] = None) -> str:
+                        input_type: Optional[str] = None, from_directory: bool = False) -> str:
     """
     Generate output path based on input path and format.
     
     Args:
         input_path: Source file path
         output_format: "mp4" or "png"
-        output_dir: Optional output directory
+        output_dir: Optional output directory (overrides default behavior)
         input_type: Optional input type ("image", "video", "directory")
+        from_directory: True if processing files from a directory (batch mode)
     
     Returns:
-        Output path (file for single image/video, directory for sequences)
+        Absolute output path (file for single image/video, directory for sequences)
     """
-    input_name = Path(input_path).stem
+    input_path_obj = Path(input_path)
+    input_name = input_path_obj.stem
     
-    if output_format == "png":
-        # Single image → single PNG file
-        if input_type == "image":
-            if output_dir:
-                return str(Path(output_dir) / f"{input_name}_upscaled.png")
-            return f"output/{input_name}_upscaled.png"
-        # Video/sequence → directory of numbered PNGs
-        else:
-            if output_dir:
-                return str(Path(output_dir) / f"{input_name}_upscaled")
-            return f"output/{input_name}_upscaled"
+    # Determine base directory and whether to add suffix
+    if output_dir:
+        # User specified output directory - use as-is, no suffix
+        base_dir = Path(output_dir)
+        add_suffix = False
+    elif from_directory:
+        # Batch mode: create sibling folder with _upscaled, keep original filenames
+        original_dir = input_path_obj.parent
+        base_dir = original_dir.parent / f"{original_dir.name}_upscaled"
+        add_suffix = False
     else:
-        # Video format always returns file path
-        if output_dir:
-            return str(Path(output_dir) / f"{input_name}_upscaled.mp4")
-        return f"output/{input_name}_upscaled.mp4"
+        # Single file mode: output to same directory with _upscaled suffix
+        base_dir = input_path_obj.parent
+        add_suffix = True
+    
+    # Build filename with optional suffix
+    file_suffix = "_upscaled" if add_suffix else ""
+    
+    # Generate output path based on format
+    if output_format == "png":
+        if input_type == "image":
+            output_path = base_dir / f"{input_name}{file_suffix}.png"
+        else:
+            output_path = base_dir / f"{input_name}{file_suffix}"
+    else:
+        output_path = base_dir / f"{input_name}{file_suffix}.mp4"
+    
+    return str(output_path.resolve())
 
 
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
@@ -393,8 +411,12 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         # Single PNG file
         os.makedirs(Path(output_path).parent, exist_ok=True)
         frame_np = (result[0].cpu().numpy() * 255.0).astype(np.uint8)
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_path, frame_bgr)
+        # Convert RGB(A) to BGR(A) based on channel count
+        if frame_np.shape[2] == 4:
+            frame_save = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
+        else:
+            frame_save = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_path, frame_save)
     
     elif is_png_format:
         # PNG sequence (save_frames_to_png creates directory internally)
@@ -571,7 +593,7 @@ def save_frames_to_png(
     Save frames tensor as sequential PNG image files.
     
     Each frame saved as {base_name}_{index:05d}.png with zero-padded indices.
-    Converts Float32 [0,1] to uint8 [0,255] and RGB to BGR for OpenCV.
+    Converts Float32 [0,1] to uint8 [0,255] and RGB(A) to BGR(A) for OpenCV.
     
     Args:
         frames_tensor: Frames in format [T, H, W, C], Float32, range [0,1]
@@ -591,9 +613,12 @@ def save_frames_to_png(
     for idx, frame in enumerate(frames_np):
         filename = f"{base_name}_{idx:0{digits}d}.png"
         file_path = os.path.join(output_dir, filename)
-        # Convert RGB to BGR for cv2
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(file_path, frame_bgr)
+        # Convert RGB(A) to BGR(A) for cv2 based on channel count
+        if frame.shape[2] == 4:
+            frame_save = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
+        else:
+            frame_save = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(file_path, frame_save)
         if debug.enabled and (idx + 1) % 100 == 0:
             debug.log(f"Saved {idx + 1}/{total} PNGs", category="file")
 
@@ -1328,7 +1353,7 @@ def main() -> None:
                 
                 # generate_output_path handles None gracefully with "outputs" default
                 output_path = generate_output_path(file_path, file_output_format, args.output, 
-                                   input_type=get_input_type(file_path))
+                                   input_type=get_input_type(file_path), from_directory=True)
                 
                 # Process with explicit output path and runner cache
                 frames = process_single_file(file_path, args, device_list, output_path, 
