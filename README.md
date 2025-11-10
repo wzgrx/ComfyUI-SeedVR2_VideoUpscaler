@@ -35,6 +35,11 @@ We're actively working on improvements and new features. To stay informed:
 - **🔮 Next Model Survey**: We're looking for community input on the next open-source super-powerful generic restoration model. Share your suggestions in [Issue #164](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/issues/164)
 
 ## 🚀 Updates
+**2025.11.10 - Version 2.5.8**
+
+- **🐛 Fix (CLI): Windows batch processing duplicate files** - Fixed CLI batch mode processing each file twice on Windows due to case-insensitive filesystem. Improved directory scanning performance by 2-3x
+- **📁 Fix(CLI): Output folder location** - Output files now created in sensible locations: batch mode creates `{folder_name}_upscaled/` sibling folder with original filenames preserved; single file mode adds `_upscaled` suffix in same directory. All logs now show absolute paths for clarity
+- **🎨 Fix(CLI): RGBA alpha channel support** - PNG images with transparency are now properly detected and preserved through the upscaling pipeline, matching ComfyUI behavior
 
 **2025.11.10 - Version 2.5.7**
 
