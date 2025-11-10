@@ -208,10 +208,12 @@ def get_media_files(directory: str) -> List[str]:
     Returns:
         Sorted list of file paths (strings) matching video or image extensions
     """
-    files = []
-    for ext in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
-        files.extend(Path(directory).glob(f'*{ext}'))
-        files.extend(Path(directory).glob(f'*{ext.upper()}'))
+    valid_extensions = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+    path = Path(directory)
+    
+    # Get all files and filter by extension (case-insensitive)
+    files = [f for f in path.iterdir() if f.is_file() and f.suffix.lower() in valid_extensions]
+    
     return sorted([str(f) for f in files])
 
 
