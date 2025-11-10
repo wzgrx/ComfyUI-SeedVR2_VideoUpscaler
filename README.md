@@ -36,6 +36,10 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.10 - Version 2.5.7**
+
+- **🔧 Fix: Conv3d workaround compatibility** - Enhanced platform detection and added graceful fallback to prevent errors on PyTorch dev builds and AMD ROCm systems
+
 **2025.11.09 - Version 2.5.6**
 
 - 🎨 **Fix: Restored natural look for 7b model** - Corrected torch.compile optimization that was causing overly plastic/ high-specular appearance in upscaled videos with 7b model.
