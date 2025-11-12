@@ -11,6 +11,7 @@ import gc
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 from ..optimization.memory_manager import get_vram_usage, get_basic_vram_info, get_ram_usage, reset_vram_peak
+from ..utils.constants import __version__
 
 
 class Debug:
@@ -111,7 +112,7 @@ class Debug:
         # Add indentation
         indent = " " * (indent_level * 2)
         
-        print(f"{prefix} {indent}{message}")
+        print(f"{prefix} {indent}{message}", flush=True)
 
     def print_header(self, cli: bool = False) -> None:
         """Print the header with banner - always displayed"""
@@ -123,10 +124,16 @@ class Debug:
         self.log(" ║ ███████ █████   █████   ██   ██ ██    ██ ██████  █████   ║", category="none", force=True)
         self.log(" ║      ██ ██      ██      ██   ██  ██  ██  ██   ██ ██      ║", category="none", force=True)
         self.log(" ║ ███████ ███████ ███████ ██████    ████   ██   ██ ███████ ║", category="none", force=True)
-        if cli:
-            self.log(" ║ 💻 CLI mode             © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
-        else:
-            self.log(" ║                         © ByteDance Seed · NumZ · AInVFX ║", category="none", force=True)
+        
+        # Version number with dynamic padding to maintain visual alignment with any version length
+        version_text = f"v{__version__}"
+        prefix = " 💻 CLI mode · " if cli else " "
+        suffix = "© ByteDance Seed · NumZ · AInVFX "
+        emoji_compensation = 1 if cli else 0
+        padding_width = 59 - len(prefix) - len(version_text) - len(suffix) - 2 - emoji_compensation
+        padding = " " * max(1, padding_width)
+        self.log(f" ║{prefix}{version_text}{padding} {suffix}║", category="none", force=True)
+
         self.log(" ╚══════════════════════════════════════════════════════════╝", category="none", force=True)
         self.log("", category="none", force=True)
 
