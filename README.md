@@ -35,6 +35,17 @@ We're actively working on improvements and new features. To stay informed:
 - **🔮 Next Model Survey**: We're looking for community input on the next open-source super-powerful generic restoration model. Share your suggestions in [Issue #164](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/issues/164)
 
 ## 🚀 Updates
+
+**2025.11.12 - Version 2.5.9**
+
+- **🐛 Fix: Tile debug visualization crash** - Fixed OpenCV error when using VAE tile debug mode on certain systems.
+- **🍎 Fix: macOS MPS loading error** - Added automatic CPU fallback for MPS allocator issues on certain PyTorch/macOS versions.
+- **🖥️ Fix: Windows log buffering** - Added flush to print statements for real-time log visibility in ComfyUI on Windows
+- **📦 Fix: ComfyUI Registry logo** - Updated icon URL to display properly in ComfyUI node registry
+- **ℹ️ Feature: Version display** - Added version number to node name and CLI/ComfyUI header for better tracking
+- **💝 Feature: GitHub Sponsors** - Added sponsor button to support project development. Thank you everyone for your support!
+- **📜 License: Apache 2.0** - Reverted License from MIT to Apache 2.0 to match ByteDance Seed project
+
 **2025.11.10 - Version 2.5.8**
 
 - **🐛 Fix (CLI): Windows batch processing duplicate files** - Fixed CLI batch mode processing each file twice on Windows due to case-insensitive filesystem. Improved directory scanning performance by 2-3x
@@ -891,4 +902,4 @@ Special thanks to our community contributors including [benjaminherb](https://gi
 
 ## 📜 License
 
-The code in this repository is released under the MIT license as found in the [LICENSE](LICENSE) file.
+The code in this repository is released under the Apache 2.0 license as found in the [LICENSE](LICENSE) file.

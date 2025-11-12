@@ -722,7 +722,7 @@ def _draw_tile_boundaries(image: torch.Tensor, debug: 'Debug', tile_boundaries: 
     annotated_frames = []
     for frame_idx in range(T):
         # Convert frame to numpy (handle RGB and RGBA)
-        img = (image[frame_idx].float().cpu().numpy() * 255).astype(np.uint8)  # [H, W, C]
+        img = np.ascontiguousarray((image[frame_idx].float().cpu().numpy() * 255).astype(np.uint8))  # [H, W, C]
         
         # Draw boundary lines inside each tile
         for idx, tile_info in enumerate(tile_boundaries):

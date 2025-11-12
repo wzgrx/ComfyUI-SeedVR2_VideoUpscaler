@@ -3,6 +3,9 @@ Shared constants and utilities for SeedVR2
 Only includes constants actually used in the codebase
 """
 
+# Version information
+__version__ = "2.5.9"
+
 import os
 import warnings
 import inspect
