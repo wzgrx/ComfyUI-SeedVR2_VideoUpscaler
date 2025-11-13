@@ -762,7 +762,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
     else:
         # Moving to GPU (reload)
         # Check if we're in bypass mode (coming from offload)
-        if not getattr(runner, "_blockswap_bypass_protection", False):
+        if not getattr(model, "_blockswap_bypass_protection", False):
             # Not in bypass mode, blocks are already configured
             if debug:
                 debug.log(f"{model_name} with BlockSwap active - blocks already distributed across devices, skipping movement", category="general")
@@ -787,7 +787,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         # Restore blocks to their configured devices
         if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
             # Use configured offload_device from BlockSwap config
-            offload_device = runner._block_swap_config.get("offload_device")
+            offload_device = model._block_swap_config.get("offload_device")
             if not offload_device:
                 raise ValueError("BlockSwap config missing offload_device")
             
@@ -801,7 +801,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
                     block.to(offload_device)
             
             # Handle I/O components
-            if not runner._block_swap_config.get("swap_io_components", False):
+            if not model._block_swap_config.get("swap_io_components", False):
                 # I/O components should be on GPU if not offloaded
                 for name, module in model.named_children():
                     if name != "blocks":
@@ -814,10 +814,10 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
             
             if debug:
                 # Get actual configuration from runner
-                if hasattr(runner, '_block_swap_config'):
-                    blocks_on_gpu = runner._block_swap_config.get('total_blocks', 32) - runner._block_swap_config.get('blocks_swapped', 16)
-                    total_blocks = runner._block_swap_config.get('total_blocks', 32)
-                    main_device = runner._block_swap_config.get('main_device', 'GPU')
+                if hasattr(model, '_block_swap_config'):
+                    blocks_on_gpu = model._block_swap_config.get('total_blocks', 32) - model._block_swap_config.get('blocks_swapped', 16)
+                    total_blocks = model._block_swap_config.get('total_blocks', 32)
+                    main_device = model._block_swap_config.get('main_device', 'GPU')
                     debug.log(f"BlockSwap blocks restored to configured devices ({blocks_on_gpu}/{total_blocks} blocks on {str(main_device).upper()})", category="success")
                 else:
                     debug.log("BlockSwap blocks restored to configured devices", category="success")

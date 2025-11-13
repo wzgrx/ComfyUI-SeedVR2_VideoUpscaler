@@ -36,6 +36,16 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.13 - Version 2.5.10**
+
+- **🎯 Fix: Deterministic generation** - Identical images with the same seed now produce identical results across different sessions and batch positions
+- **🔧 Fix: Model caching with BlockSwap** - Resolved issue where cached DiT models wouldn't properly reload when VAE caching state changed
+- **💾 Fix: Runner caching optimization** - Runner templates now correctly cache whenever both DiT and VAE are cached, regardless of caching order
+- **📁 Fix: Case-insensitive model paths** - Extra model paths in YAML config now work regardless of case (seedvr2, SEEDVR2, SeedVR2, etc.)
+- **🐛 Fix: High resolution tile debug crash** - Fixed "NoneType has no attribute log" error when using maximum resolution with VAE tiling
+- **📊 Fix: Temporal overlap logging** - Corrected frame count reporting when temporal overlap is automatically adjusted
+- **🔍 Feature: Enhanced model path debugging** - Added detailed logging to help troubleshoot model loading issues (visible in debug mode)
+
 **2025.11.12 - Version 2.5.9**
 
 - **🐛 Fix: Tile debug visualization crash** - Fixed OpenCV error when using VAE tile debug mode on certain systems.
