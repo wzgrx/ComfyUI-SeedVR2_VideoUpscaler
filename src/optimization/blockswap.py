@@ -193,7 +193,7 @@ def apply_block_swap_to_dit(
     runner._blockswap_active = True
 
     # Store configuration for debugging and cleanup
-    runner._block_swap_config = {
+    model._block_swap_config = {
         "blocks_swapped": blocks_to_swap,
         "swap_io_components": swap_io_components,
         "total_blocks": total_blocks,
@@ -650,11 +650,11 @@ def _protect_model_from_move(
     
     Wraps model.to() method to prevent other code from accidentally moving
     the entire model to GPU, which would defeat BlockSwap's memory savings.
-    Allows movement only when explicitly bypassed via runner flag.
+    Allows movement only when explicitly bypassed via model flag.
     
     Args:
         model: DiT model to protect
-        runner: VideoDiffusionInfer instance (stored as weak reference)
+        runner: VideoDiffusionInfer instance (for active status check)
         debug: Debug instance for logging (required)
     """
     if not hasattr(model, '_original_to'):
@@ -665,34 +665,46 @@ def _protect_model_from_move(
         # Define the protected method without closures
         def protected_model_to(self, device, *args, **kwargs):
             # Check if protection is temporarily bypassed for offloading
+            # Flag is stored on model itself (not runner) to survive runner recreation
+            if getattr(self, "_blockswap_bypass_protection", False):
+                # Protection bypassed, allow movement
+                if hasattr(self, '_original_to'):
+                    return self._original_to(device, *args, **kwargs)
+            
+            # Get configured offload device directly from model
+            blockswap_offload_device = "cpu"  # default
+            if hasattr(self, "_block_swap_config"):
+                blockswap_offload_device = self._block_swap_config.get("offload_device", "cpu")
+            
+            # Check if BlockSwap is currently active via runner weak reference
             runner_ref = getattr(self, '_blockswap_runner_ref', None)
+            blockswap_is_active = False
             if runner_ref:
                 runner_obj = runner_ref()
-                if runner_obj and getattr(runner_obj, "_blockswap_bypass_protection", False):
-                    # Protection bypassed, allow movement
-                    if hasattr(self, '_original_to'):
-                        return self._original_to(device, *args, **kwargs)
+                if runner_obj and hasattr(runner_obj, "_blockswap_active"):
+                    blockswap_is_active = runner_obj._blockswap_active
             
-            # Check blockswap status using weak reference
-            # Get configured offload device from runner
-            blockswap_offload_device = "cpu" # default
-            if runner_ref:
-                runner_obj = runner_ref()
-                if runner_obj and hasattr(runner_obj, "_block_swap_config"):
-                    blockswap_offload_device = runner_obj._block_swap_config.get("offload_device", "cpu")
+            # Block attempts to move model away from configured offload device when active
+            if blockswap_is_active and str(device) != str(blockswap_offload_device):
+                # Get debug instance from runner if available
+                debug_instance = None
+                if runner_ref:
+                    runner_obj = runner_ref()
+                    if runner_obj and hasattr(runner_obj, 'debug'):
+                        debug_instance = runner_obj.debug
                 
-                # Block attempts to move model away from configured offload device
-                if str(device) != str(blockswap_offload_device):
-                    if runner_obj and hasattr(runner_obj, "_blockswap_active") and runner_obj._blockswap_active:
-                        debug.log(f"Blocked attempt to move blockswapped model from {blockswap_offload_device} to {device}", 
-                                level="WARNING", category="blockswap", force=True)
-                        return self
+                if debug_instance:
+                    debug_instance.log(
+                        f"Blocked attempt to move BlockSwap model from {blockswap_offload_device} to {device}",
+                        level="WARNING", category="blockswap", force=True
+                    )
+                return self
             
-            # Use original method stored as attribute
+            # Allow movement (either bypass is enabled or target is offload device)
             if hasattr(self, '_original_to'):
                 return self._original_to(device, *args, **kwargs)
             else:
-                # This shouldn't happen, but fallback to super().to()
+                # Fallback - shouldn't happen
                 return super(type(self), self).to(device, *args, **kwargs)
         
         # Bind as a method to the model instance
@@ -712,7 +724,13 @@ def set_blockswap_bypass(runner, bypass: bool, debug):
     if not hasattr(runner, "_blockswap_active") or not runner._blockswap_active:
         return
     
-    runner._blockswap_bypass_protection = bypass
+    # Get the actual model (handle FP8CompatibleDiT wrapper)
+    model = runner.dit
+    if hasattr(model, "dit_model"):
+        model = model.dit_model
+    
+    # Store on model so it survives runner recreation during caching
+    model._blockswap_bypass_protection = bypass
     
     if bypass:
         debug.log("BlockSwap protection disabled to allow model DiT offloading", category="success")
@@ -741,11 +759,16 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     
     debug = runner.debug
     
-    # Check if there's any BlockSwap state to clean up
+    # Get the actual model (handle FP8CompatibleDiT wrapper)
+    model = runner.dit
+    if hasattr(model, "dit_model"):
+        model = model.dit_model
+    
+    # Check if there's any BlockSwap state to clean up (check both runner and model)
     has_blockswap_state = (
         hasattr(runner, "_blockswap_active") or 
-        hasattr(runner, "_block_swap_config") or
-        hasattr(runner, "_blockswap_bypass_protection")
+        hasattr(model, "_block_swap_config") or
+        hasattr(model, "_blockswap_bypass_protection")
     )
     
     if not has_blockswap_state:
@@ -757,7 +780,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
         # Minimal cleanup for caching - just mark as inactive and allow offloading
         # Everything else stays intact for fast reactivation
         if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-            if not getattr(runner, "_blockswap_bypass_protection", False):
+            if not getattr(model, "_blockswap_bypass_protection", False):
                 set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
             runner._blockswap_active = False
         debug.log("BlockSwap deactivated for caching (configuration preserved)", category="success")
@@ -829,7 +852,7 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
 
     # 5. Clean up BlockSwap-specific attributes
     for attr in ['_blockswap_runner_ref', 'blocks_to_swap', 'main_device', 
-                 'offload_device', '_blockswap_configured']:
+                 'offload_device']:
         if hasattr(model, attr):
             delattr(model, attr)
 

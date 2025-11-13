@@ -268,6 +268,10 @@ def encode_all_batches(
     if step <= 0:
         step = batch_size
         temporal_overlap = 0
+        debug.log(f"temporal_overlap >= batch_size, resetting to 0", level="WARNING", category="setup", force=True)
+    
+    # Store actual temporal overlap used (may differ from parameter if reset)
+    ctx['actual_temporal_overlap'] = temporal_overlap
     
     # Calculate number of batches
     num_encode_batches = 0
@@ -306,6 +310,14 @@ def encode_all_batches(
                 runner.vae, ctx['cache_context']['vae_model'], debug
             )
             ctx['cache_context']['vae_newly_cached'] = True
+            
+            # If both models now cached, cache runner template
+            dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
+            if dit_is_cached:
+                ctx['cache_context']['global_cache'].set_runner(
+                    ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
+                    runner, debug
+                )
         
         # Set deterministic seed for VAE encoding (separate from diffusion noise)
         # Uses seed + 1,000,000 to avoid collision with upscaling batch seeds
@@ -620,6 +632,7 @@ def upscale_all_batches(
                 runner.dit, ctx['cache_context']['dit_model'], debug
             )
             ctx['cache_context']['dit_newly_cached'] = True
+            
             # If both models now cached, cache runner template
             vae_is_cached = ctx['cache_context']['cached_vae'] or ctx['cache_context']['vae_newly_cached']
             if vae_is_cached:
@@ -627,11 +640,6 @@ def upscale_all_batches(
                     ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
                     runner, debug
                 )
-        
-        # Set base seed for DiT noise generation
-        # Ensures deterministic noise across all batches in this upscaling phase
-        set_seed(seed)
-        debug.log(f"Using seed: {seed}", category="dit")
         
         # Move DiT to GPU for upscaling (no-op if already there)
         manage_model_device(model=runner.dit, target_device=ctx['dit_device'], 
@@ -646,6 +654,11 @@ def upscale_all_batches(
             check_interrupt(ctx)
             
             debug.log(f"Upscaling batch {upscale_idx+1}/{num_valid_latents}", category="generation", force=True)
+            # Reset seed for each batch to ensure identical RNG state
+            # This ensures identical inputs produce identical outputs regardless of batch position
+            set_seed(seed)
+            debug.log(f"Using seed: {seed} for deterministic generation", category="dit")
+
             debug.start_timer(f"upscale_batch_{upscale_idx+1}")
             
             # Move to DiT device with correct dtype for upscaling (no-op if already there)
@@ -1332,16 +1345,19 @@ def postprocess_all_batches(
             if total_padding_removed > 0:
                 adjustments.append(f"{total_padding_removed} padding")
             
+            # Use actual temporal overlap from encoding (may have been reset)
+            actual_overlap = ctx.get('actual_temporal_overlap', temporal_overlap)
+            
             # Calculate and include temporal overlap blending info
-            if temporal_overlap > 0:
-                frames_blended = (num_valid_samples - 1) * temporal_overlap
+            if actual_overlap > 0:
+                frames_blended = (num_valid_samples - 1) * actual_overlap
                 adjustments.append(f"{frames_blended} overlap")
 
             if adjustments:
                 # Add back all removed/blended frames to get true computed count
                 total_computed = frames_before_removal + total_padding_removed
-                if temporal_overlap > 0:
-                    total_computed += (num_valid_samples - 1) * temporal_overlap
+                if actual_overlap > 0:
+                    total_computed += (num_valid_samples - 1) * actual_overlap
                 frame_info += f" ({total_computed} computed with {' + '.join(adjustments)} removed)"
             
             debug.log(f"Final output assembled: {frame_info}, Resolution: {Wf}x{Hf}px, Channels: {channels_str}", 
