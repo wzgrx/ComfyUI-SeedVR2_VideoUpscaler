@@ -36,6 +36,10 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.28 - Version 2.5.12**
+
+- **🐛 Fix: Color artifacts regression** - Reverted in-place tensor operations in video transform pipeline that caused color artifacts on some images
+
 **2025.11.28 - Version 2.5.11**
 
 - **⚡ Feature: CUDNN attention backend** - Added support for PyTorch 2.3+ CUDNN_ATTENTION backend with automatic fallback for older versions (thanks @eadwu)
