@@ -36,6 +36,21 @@ We're actively working on improvements and new features. To stay informed:
 
 ## 🚀 Updates
 
+**2025.11.28 - Version 2.5.11**
+
+- **⚡ Feature: CUDNN attention backend** - Added support for PyTorch 2.3+ CUDNN_ATTENTION backend with automatic fallback for older versions (thanks @eadwu)
+- **💾 Fix: Memory spike for long videos** - VAE decode now streams directly to pre-allocated tensor, eliminating OOM errors during long video processing
+- **🎨 Fix: LAB color correction artifacts** - Resolved tile boundary artifacts using wavelet reconstruction preprocessing
+- **🎨 Fix: Color reference misalignment** - Fixed color correction frame alignment with temporal overlap
+- **🍎 Fix: MPS detection reliability** - Switched to canonical `torch.backends.mps.is_available()` API for consistent Apple Silicon detection
+- **🖥️ Fix: Mac subprocess error** - CLI now uses direct processing on Mac to avoid MPS allocator failures in child processes
+- **🖥️ Fix: Multi-GPU device assignment** - CUDA_VISIBLE_DEVICES now set before spawn for proper worker inheritance
+- **📊 Fix: BlockSwap logging** - Now shows effective/total blocks (e.g., 32/32) instead of raw requested value
+- **🔧 Feature: Auto bfloat16 detection** - Automatically detects bfloat16 support to prevent CUBLAS errors on older GPUs
+- **📊 Feature: Peak RAM tracking** - Added RAM usage alongside VRAM in debug summary
+- **⚡ Performance: In-place tensor ops** - Reduced memory allocation overhead with in-place operations throughout pipeline
+- **📖 Docs: Multi-GPU clarification** - Clarified frame-level parallelism behavior expectations for multi-GPU setups
+
 **2025.11.13 - Version 2.5.10**
 
 - **🎯 Fix: Deterministic generation** - Identical images with the same seed now produce identical results across different sessions and batch positions
