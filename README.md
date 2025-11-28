@@ -829,26 +829,40 @@ python inference_cli.py media_folder/ \
 
 ### Multi-GPU Processing Explained
 
-The CLI's multi-GPU mode automatically distributes the workload across multiple GPUs with intelligent temporal overlap handling:
+The CLI's multi-GPU mode uses **frame-level parallelism**: the video is split into chunks and each GPU processes its chunk independently through all 4 phases (encode → upscale → decode → postprocess). This is ideal for long videos where you want to reduce total processing time by dividing the workload.
 
 **How it works:**
-1. Video is split into chunks, one per GPU
-2. Each GPU processes its chunk independently
-3. Chunks overlap by `--temporal_overlap` frames
-4. Results are blended together seamlessly using the overlap region
+1. Video frames are split evenly across GPUs (e.g., 100 frames on 2 GPUs → 50 frames each)
+2. Each GPU loads its own copy of the models and processes its chunk independently
+3. When `--temporal_overlap` is set, chunks include overlapping frames for seamless blending
+4. Results are concatenated (and blended at overlap regions) into the final video
 
-**Example for 2 GPUs with temporal_overlap=4:**
+**Example for 100 frames on 2 GPUs with temporal_overlap=4:**
 ```
-GPU 0: Frames 0-50 (includes 4 overlap frames at end)
-GPU 1: Frames 46-100 (includes 4 overlap frames at beginning)
-Result: Frames 0-100 with smooth transition at frame 48
+GPU 0: Frames 0-53 (50 base + 4 overlap at end, processed as independent video)
+GPU 1: Frames 50-99 (50 frames, 4 overlap at start, processed as independent video)
+Result: Frames 0-99 with smooth blending at the transition point
 ```
+
+**Important considerations:**
+- Each GPU processes its chunk as a separate video with its own batch splitting
+- `batch_size` controls batching *within* each GPU's chunk, not across GPUs
+- For short videos (< 100 frames), single GPU is often more efficient due to model loading overhead
+- Multi-GPU doubles VRAM usage (each GPU loads full models) but roughly halves processing time
+
+**When to use multi-GPU:**
+- Long videos (100+ frames) where splitting provides significant time savings
+- When you have multiple GPUs with sufficient VRAM each
+
+**When to use single GPU:**
+- Short videos where model loading overhead outweighs parallel gains
+- When you want all frames processed together for maximum temporal coherence
 
 **Best practices:**
-- Set `--temporal_overlap` to 2-8 frames for smooth blending
+- Set `--temporal_overlap` to 2-4 frames for smooth blending between GPU chunks
 - Higher overlap = smoother transitions but more redundant processing
 - Use `--prepend_frames` to reduce artifacts at video start
-- batch_size should divide evenly into chunk sizes for best results
+- For optimal quality on short videos, use single GPU with `batch_size` matching your shot length
 
 ## ⚠️ Limitations
 
