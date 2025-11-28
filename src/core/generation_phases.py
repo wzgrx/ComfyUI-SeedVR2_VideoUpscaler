@@ -1244,7 +1244,13 @@ def postprocess_all_batches(
                     input_video = optimized_single_video_rearrange(transformed_video)
                     del transformed_video
                     
-                    # Trim input_video to match sample length
+                    # For batches after the first with temporal overlap, the overlap frames
+                    # were blended in Phase 3 and are not part of this slice. Skip them.
+                    actual_overlap = ctx.get('actual_temporal_overlap', 0)
+                    if info_idx > 0 and actual_overlap > 0:
+                        input_video = input_video[actual_overlap:]
+                    
+                    # Trim input_video to match sample length (handles padding differences)
                     if input_video.shape[0] > sample.shape[0]:
                         input_video = input_video[:sample.shape[0]]
                     
