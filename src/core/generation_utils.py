@@ -77,9 +77,9 @@ def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Op
             downsample_only=False,
             max_resolution=max_resolution,
         ),
-        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        Lambda(lambda x: x.clamp_(0.0, 1.0)),
         DivisiblePad((16, 16)),
-        Normalize(0.5, 0.5),
+        Normalize(0.5, 0.5, inplace=True),
         Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w (faster than Rearrange)
     ])
 

@@ -1328,13 +1328,13 @@ def postprocess_all_batches(
                 alpha_channel = sample[..., 3:4]  # (T, H, W, 1)
                 
                 # Normalize only RGB from [-1, 1] to [0, 1]
-                rgb_channels = rgb_channels.clip(-1, 1).mul_(0.5).add_(0.5)
+                rgb_channels.clamp_(-1, 1).mul_(0.5).add_(0.5)
                 
                 # Merge back with unchanged Alpha
                 sample = torch.cat([rgb_channels, alpha_channel], dim=-1)
             else:
                 # RGB only: apply normalization as usual
-                sample = sample.clip(-1, 1).mul_(0.5).add_(0.5)
+                sample.clamp_(-1, 1).mul_(0.5).add_(0.5)
             
             # Draw tile boundaries for debugging (if tile info available)
             for phase, attr in [('encode', 'encode_tile_boundaries'), ('decode', 'decode_tile_boundaries')]:

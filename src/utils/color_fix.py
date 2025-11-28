@@ -178,7 +178,7 @@ def wavelet_decomposition(image: Tensor, levels: int = 5) -> tuple[Tensor, Tenso
     for i in range(levels):
         radius = 2 ** i
         low_freq = wavelet_blur(image, radius)
-        high_freq += (image - low_freq)
+        high_freq.add_(image).sub_(low_freq)
         image = low_freq
     
     return high_freq, low_freq
@@ -237,13 +237,13 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
             align_corners=False
         )
     
-    # Reconstruct: content details + style color
-    result = content_high_freq + style_low_freq
+    # Reconstruct: content details + style color (in-place on content_high_freq)
+    content_high_freq.add_(style_low_freq)
     
-    # Safety clamp for normalized SDR range
+    # Safety clamp for normalized SDR range (in-place)
     # This prevents numerical errors from propagating
     # Note: For HDR support, this would need to be removed
-    return torch.clamp(result, -1.0, 1.0)
+    return content_high_freq.clamp_(-1.0, 1.0)
 
 
 def lab_color_transfer(
