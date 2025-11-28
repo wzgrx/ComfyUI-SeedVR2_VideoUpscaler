@@ -221,7 +221,7 @@ class FP8CompatibleDiT(torch.nn.Module):
             self._convert_rope_freqs(target_dtype=self.compute_dtype)
             self.debug.end_timer("_convert_rope_freqs", "RoPE freqs conversion")
             
-            if hasattr(torch, 'mps') and callable(getattr(torch.mps, 'is_available', None)) and torch.mps.is_available():
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 self.debug.log(f"Also converting NaDiT parameters/buffers for MPS backend", category="setup", force=True)
                 self.debug.start_timer("_force_nadit_precision")
                 self._force_nadit_precision(target_dtype=self.compute_dtype)
@@ -524,7 +524,7 @@ class FP8CompatibleDiT(torch.nn.Module):
             k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
             v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
             
-            if hasattr(torch, 'mps') and callable(getattr(torch.mps, 'is_available', None)) and torch.mps.is_available():
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v,
                     dropout_p=0.0,
