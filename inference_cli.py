@@ -76,23 +76,25 @@ if platform.system() != "Darwin":
     if _pre_args.cuda_device is not None:
         device_list_env = [x.strip() for x in _pre_args.cuda_device.split(',') if x.strip()!='']
         
-        # Temporary torch import for CUDA device validation only
-        # Must happen before setting CUDA_VISIBLE_DEVICES and before main torch import
-        import torch as _torch_check
-        if _torch_check.cuda.is_available():
-            available_count = _torch_check.cuda.device_count()
-            invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
-            if invalid_devices:
-                print(f"❌ [ERROR] Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
-                      f"Available devices: 0-{available_count-1} (total: {available_count})")
+        # Skip validation if CUDA_VISIBLE_DEVICES is already set (worker process)
+        if os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+            # Temporary torch import for CUDA device validation only
+            # Must happen before setting CUDA_VISIBLE_DEVICES and before main torch import
+            import torch as _torch_check
+            if _torch_check.cuda.is_available():
+                available_count = _torch_check.cuda.device_count()
+                invalid_devices = [d for d in device_list_env if not d.isdigit() or int(d) >= available_count]
+                if invalid_devices:
+                    print(f"❌ [ERROR] Invalid CUDA device ID(s): {', '.join(invalid_devices)}. "
+                        f"Available devices: 0-{available_count-1} (total: {available_count})")
+                    sys.exit(1)
+            else:
+                print("❌ [ERROR] CUDA is not available on this system. Cannot use --cuda_device argument.")
                 sys.exit(1)
-        else:
-            print("❌ [ERROR] CUDA is not available on this system. Cannot use --cuda_device argument.")
-            sys.exit(1)
-        
-        # Set CUDA_VISIBLE_DEVICES for single GPU after validation
-        if len(device_list_env) == 1:
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
+            
+            # Set CUDA_VISIBLE_DEVICES for single GPU after validation
+            if len(device_list_env) == 1:
+                os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # Heavy dependency imports after environment configuration
 import torch
